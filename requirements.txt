@@ -1,0 +1,3 @@
+# tinygrad comes from the tinygrad/ submodule (branch zhouyi of github.com/Reonarudo/tinygrad), or the checkout TG points at
+numpy
+tokenizers

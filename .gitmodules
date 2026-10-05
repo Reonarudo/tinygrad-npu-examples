@@ -1,0 +1,5 @@
+[submodule "tinygrad"]
+	path = tinygrad
+	url = https://github.com/Reonarudo/tinygrad
+	branch = zhouyi
+	shallow = true
