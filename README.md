@@ -107,12 +107,20 @@ Model-specific NPU kernels live with their model (e.g. `qwen3.8-27b/qwen38_kerne
 generic backend lives in the submodule: the device under `tinygrad/runtime/`, and the custom ops and generic hand-written
 kernels under `extra/zhouyi/`. The small `zy.py` next to each example resolves them.
 
-## Licences
+## Licence
 
-This repository bundles no third-party code. tinygrad is a git submodule under its own licence (MIT); the NPU driver, the vendor
-toolchain library, libclang and the Python packages are installed by you from their own sources. The model weights are not
-included: each `download.sh` fetches them from Hugging Face, under each model's own licence (Qwen3.8-27B and Ternary Bonsai 2
-27B: Apache-2.0; Ideogram 4: gated, accept its licence on Hugging Face first).
+The code in this repository is free software under the **GNU Affero General Public License v3.0 or later**
+([LICENSE](LICENSE)), with an additional term under its section 7(b) requiring attribution ([NOTICE](NOTICE)):
+
+- You may use, study, modify and share it. If you distribute a modified version, or let others use one over a network (for
+  example by running a modified `bonsai2_serve.py` as a service), you must make its source available under the same licence.
+- Copies and derived works must keep the attribution "Based on tinygrad-npu-examples by Leonardo Marques
+  (https://github.com/Reonarudo/tinygrad-npu-examples)" in their source and wherever they show credits or legal notices.
+
+Not covered by it: tinygrad, a git submodule, and its Zhouyi backend are under tinygrad's MIT licence. This repository bundles
+no third-party code: the NPU driver, the vendor toolchain library, libclang and the Python packages are installed by you from
+their own sources. The model weights are not included: each `download.sh` fetches them from Hugging Face under each model's own
+licence (Qwen3.8-27B and Ternary Bonsai 2 27B: Apache-2.0; Ideogram 4: gated, accept its licence on Hugging Face first).
 
 ## Configuration: Qwen3.8-27B, Bonsai 2 and Ornith
 

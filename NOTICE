@@ -1,0 +1,24 @@
+tinygrad-npu-examples
+Copyright (C) 2026 Leonardo Marques
+https://github.com/Reonarudo/tinygrad-npu-examples
+
+This program is free software: you can redistribute it and/or modify it under the terms of the GNU Affero General Public
+License as published by the Free Software Foundation, version 3 of the License or (at your option) any later version
+(see LICENSE). It is distributed WITHOUT ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS FOR A
+PARTICULAR PURPOSE.
+
+Additional terms under section 7(b) of the GNU AGPL-3.0 (preservation of attribution):
+
+  Any copy, modified version or work based on this program, in source or object form, and any program that offers it to users
+  over a network, must preserve the following attribution, in its source code (for example in a NOTICE or README file) and in
+  any place where it displays credits, an "about" screen or its legal notices:
+
+    Based on tinygrad-npu-examples by Leonardo Marques (https://github.com/Reonarudo/tinygrad-npu-examples).
+
+  Modified versions must also mark that they are modified and must not present themselves as the original (section 7(c)).
+
+Not covered by this licence:
+  - tinygrad/ is a git submodule (https://github.com/Reonarudo/tinygrad, branch zhouyi): tinygrad and its Zhouyi backend are
+    under tinygrad's own MIT licence.
+  - Model weights, tokenizers and checkpoints are not part of this repository: each download.sh fetches them under the model's
+    own licence.
