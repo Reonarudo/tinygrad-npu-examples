@@ -17,8 +17,14 @@ from zy import OA                                                        # noqa:
 import qwen38_ref as R                                                   # noqa: E402
 from qwen38_kernels import ATT_BT, ring_pitch                            # noqa: E402
 import qwen38_kernels as QK                                              # noqa: E402
-from qwen38_npu import Layers, dev, poke, DEV, read_into, memmove_threads, GDN_TOK, KS, Q8MODE, SCALES, TERN_KW   # noqa: E402
+from qwen38_npu import Layers, dev, poke, DEV, read_into, memmove_threads, GDN_TOK, KS, Q8MODE, SCALES, TERN_KW, slot_map_nodrain   # noqa: E402
 from qwen38_tokenize import Tok, chat_text, EOS                         # noqa: E402
+
+def one_job():
+  """A context for the TinyJit call that captures: its kernels in one graph (JIT_BATCH_SIZE=0) and one chain (the zhouyi backend's
+  ZHOUYI_CHAIN_CAP), i.e. one job however many launches; an older backend without the override keeps its ZHOUYI_CHAIN_MAX."""
+  from tinygrad.helpers import Context, ContextVar
+  return Context(**{k: v for k, v in (("JIT_BATCH_SIZE", 0), ("ZHOUYI_CHAIN_CAP", 4096)) if k in ContextVar._cache})
 
 def draft_parts(v):
   """QWEN_DRAFT_PARTS = <n>[,thresh:<x>] -> (n, x or None, the parts policy as the spec logs' header records it: "all" | "thresh:<x>").
@@ -161,8 +167,11 @@ class Model:
     have_mtp = os.path.exists(os.path.join(self.mtp_cache, f"L{R.NL}_small.npz"))
     # QWEN_SPEC_TREE=off (default) | rescue2 | fixed:<j1,j2> (spec_tree.py): the tree verify -- always TREE_M = 8 rows (the 6-row chain
     # + 2 rescue rows, the rank-2 siblings), its own kernels (gdn_tokt / attn_partt / gdn_commit_tree); off leaves every default path as it was
-    self.tree = spec_tree.mode_from_env(os.environ); assert not (self.tree and R.HAD), f"QWEN_SPEC_TREE with QWEN_MODEL={R.MODEL}: gdn_tokt has no fp32-rows output for had_a32 (gdn_tokm_src(rows_out))"
-    spec_default = str(spec_tree.TREE_M) if self.tree else ("6" if R.Q8 else "0")
+    # QWEN_SPEC_TREE=leaf (the rotated-input models): the leaf tree (spec_tree.build_leaf) -- rows up to QWEN_SPEC, the deferred
+    # commit's DeltaNet (gdn_tokl), any row count a pass; rescue2 / fixed: the 8-row bank-path tree (gdn_tokt has no fp32-rows output)
+    self.tree = spec_tree.mode_from_env(os.environ); self.leaf = bool(self.tree) and self.tree[0] == "leaf"
+    assert not self.tree or self.leaf == bool(R.HAD), f"QWEN_SPEC_TREE={os.environ.get('QWEN_SPEC_TREE')} with QWEN_MODEL={R.MODEL}: leaf is the rotated-input models' tree, rescue2 / fixed the others'"
+    spec_default = "4" if self.leaf else str(spec_tree.TREE_M) if self.tree else ("6" if R.Q8 else "0")
     self.MTPL = R.NL if have_mtp and os.environ.get("QWEN_SPEC", spec_default) != "0" and os.environ.get("QWEN_DRAFT", "mtp") == "mtp" else None
     natt = self.NATT + (1 if self.MTPL else 0)                                               # the MTP head is attention index NATT
     self.mtpg = {1: Layers(1, self.mtp_cache, fp8=True)} if self.MTPL and self.mtp_x else {}   # the MTP layer's fp8 geometries (rows -> Layers)
@@ -205,7 +214,7 @@ class Model:
     self.cos_dec, self.sin_dec = {}, {}
     # speculative decoding: M rows (the token + M - 1 drafts) a verify pass; the Q8_0 models prefill through the same geometries
     self.M = int(os.environ.get("QWEN_SPEC", spec_default))
-    if self.tree and self.M != spec_tree.TREE_M:
+    if self.tree and not self.leaf and self.M != spec_tree.TREE_M:
       print(f"   QWEN_SPEC_TREE={os.environ['QWEN_SPEC_TREE']}: the tree verify runs {spec_tree.TREE_M} rows (QWEN_SPEC={self.M} ignored)", flush=True); self.M = spec_tree.TREE_M
     # QWEN_SPEC_LOG=path.jsonl: a line per verify pass (the drafts' probabilities and head features, which were accepted, the
     # geometry, host-side wall times at the existing sync points) appended to the file
@@ -217,10 +226,14 @@ class Model:
     assert 2 <= M <= 12 and self.head == "fp8", "QWEN_SPEC: 2..12 rows (the GEMMs' rows mode), the fp8 head"
     self.vers, self.xbvs = {}, {}; self.ver = self._ver(M)                   # the verify geometries (rows = tokens), made on demand
     K = self.ver.K; SZ = R.NV * R.DK * R.DV
-    # QWEN_GDN_DEFER (default on for a rotated-input model, M <= 4): the DeltaNet commit deferred to the next verify pass (gdn_defer_src):
-    # no per-token banks (1 GB at M = 4), `banks` holds each head's update inputs instead ([NG][NV][M] slots of GD_SLOT floats)
-    self.defer = R.HAD and not self.tree and M <= 4 and os.environ.get("QWEN_GDN_DEFER", "1") == "1"
-    if self.defer: self.banks = K.buf("gdn_kvb", self.NGDN * R.NV * M * QK.GD_SLOT, dtypes.float32)
+    # QWEN_GDN_DEFER (default on for a rotated-input model): the DeltaNet commit deferred to the next verify pass. The chain: gdn_fast_src
+    # (any M <= 8; QWEN_GDN_FAST=off: gdn_defer_src, M <= 4); the leaf tree: gdn_fast_src(tree=True) (M <= 8; QWEN_GDN_FAST=off:
+    # gdn_tokl_src, M <= 5). No per-token banks (1 GB at M = 4): `banks` holds each head's update inputs instead ([NG][NV][M] slots
+    # of GD_SLOT floats; + gdn_fast_scratch, a task's v rows when the fast kernel keeps half rows)
+    fast = QK.gdn_fast() != "off"
+    self.defer = R.HAD and (not self.tree or self.leaf) and M <= (QK.GF_MS if fast else 5 if self.leaf else 4) and os.environ.get("QWEN_GDN_DEFER", "1") == "1"
+    assert self.defer or not self.leaf, f"QWEN_SPEC_TREE=leaf: the deferred DeltaNet commit (QWEN_GDN_DEFER=1), QWEN_SPEC <= {QK.GF_MS if fast else 5}"
+    if self.defer: self.banks = K.buf("gdn_kvb", self.NGDN * R.NV * M * QK.GD_SLOT + (QK.gdn_fast_scratch(M) if fast else 0), dtypes.float32)
     else: self.banks = K.buf("gdn_banks", (M - 1) * self.NGDN * SZ, dtypes.float32)      # the state after tokens 0..M-2, every DeltaNet layer
     self.rawm = K.buf("gdn_raw", self.NGDN * M * self.CP, dtypes.float32)             # the M raw conv rows, every DeltaNet layer: [NG][M][CP]
     self.accb = K.buf("acc_b", 1, dtypes.int32)
@@ -238,8 +251,25 @@ class Model:
     self.geos = sorted({int(g) for g in os.environ.get("QWEN_SPEC_GEOS", "3,4,6").split(",") if 2 <= int(g) <= M} | {M})
     if self.tree:                                                         # the tree verify: every pass TREE_M rows (the chain's 6 + the rescue rows)
       if os.environ.get("QWEN_SPEC_GEOS"): print(f"   QWEN_SPEC_TREE: the verify geometry is {M} rows alone (QWEN_SPEC_GEOS ignored)", flush=True)
-      self.geos = [M]; self.NC = M - spec_tree.TREE_NR; self.kmax = min(self.kmax, self.NC - 1)
+      if self.leaf:                                                       # the leaf tree: every row count 2..M (QWEN_SPEC_GEOS ignored)
+        self.geos = list(range(2, M + 1)); self.NC = M
+        # QWEN_TREE_TC: the drafter drafts on while the chain's path probability p_1 ... p_j >= it (QWEN_DRAFT_TAU unused);
+        # QWEN_TREE_TL: a leaf candidate's least path probability (spec_tree.leaf_pick). Defaults: check/draft_project.py's best at 4-5 rows
+        self.tc, self.tl = float(os.environ.get("QWEN_TREE_TC", "0.4")), float(os.environ.get("QWEN_TREE_TL", "0.05"))
+      else: self.geos = [M]; self.NC = M - spec_tree.TREE_NR; self.kmax = min(self.kmax, self.NC - 1)
       self.treeb = K.buf("tree_b", 2 * M, dtypes.int32); self.pathb = K.buf("path_b", 4 + M, dtypes.int32)   # spec_tree.table / path_words
+      if self.leaf: poke(self.pathb, np.zeros(4 + M, np.int32))           # (gdn_tokl: the previous pass's path, none yet)
+    # QWEN_LAYER_BLOCK=k (default 1; bonsai2_generate: 4): the verify pass's layers k at a time, each block one TinyJit call and so
+    # one job (with ZHOUYI_CHAIN_MAX >= its launches), its k layers in k window slots of their own (2 k slots: the next block's are
+    # mapped while this one runs); the head's parts in one job over the block slots too. Needs every layer pinned zero-copy (no
+    # streamed layer), an even k dividing NL, the chain verify. 1: a job per layer (and per head part), as before.
+    k = int(os.environ.get("QWEN_LAYER_BLOCK", "1")); zc = self.pre.zc
+    ok = k > 1 and k % 2 == 0 and R.NL % k == 0 and bool(zc) and not zc.get("stream") and (not self.tree or self.leaf)
+    if k > 1 and not ok: print(f"   QWEN_LAYER_BLOCK={k}: needs an even k dividing {R.NL}, every layer pinned zero-copy, the chain verify; a job per layer", flush=True)
+    self.blk = k if ok else 1; self.jit_vblk = {}
+    if self.blk > 1:
+      self.pre.block_slots(self.blk)
+      print(f"   layer blocks: {self.blk} layers a job, {2 * self.blk} window slots of {zc['bsize'] / 1e6:.0f} MB", flush=True)
     self.need_feats = bool(self.spec_log)                                 # the head's (top logit, 2nd max) per row: telemetry
     self.fnorm = np.load(os.path.join(self.cache, "outside_small.npz"))["norm"]               # host: the final norm (MTP input)
     if self.MTPL: self._mtp_init()
@@ -250,7 +280,7 @@ class Model:
     (nxt: the accepted tokens; dt: a chained draft), embedded there (embed_tern: the GGUF's PTQ1_0 table, uploaded once), accepted
     there (accept: accb, the next cur) and drafted into (pick_id). The host reads ids (to print them, to choose the next geometry)
     but writes none after the prompt."""
-    assert R.HAD and not self.tree and self.MTPL, "QWEN_NPU_IDS: the ternary embedding (bonsai2-27b), the chain verify, the MTP drafter"
+    assert R.HAD and (not self.tree or self.leaf) and self.MTPL, "QWEN_NPU_IDS: the ternary embedding (bonsai2-27b), the chain verify or the leaf tree, the MTP drafter"
     g = self.W.g; kind, dims, raw = g.raw("token_embd.weight"); assert kind == "PTQ1_0" and dims[0] == R.H, (kind, dims)
     self.e_vocab = int(dims[1]); self.etab = dev(np.array(np.frombuffer(raw, np.uint8)))   # (a copy: the GGUF map is read-only)
     s_ = g.had.signs.get(R.H) if "token_embd.weight" in g.had.inverse else None
@@ -266,6 +296,11 @@ class Model:
     """The small id / row kernels as one JIT submission each (`self.jd`: a dummy input; no kernel reads a JIT input)."""
     if key not in self.jit_ids: self.jit_ids[key] = TinyJit(fn)
     return self.jit_ids[key](self.jd)
+  def _row_move(self, t, src, dst):
+    """Row src of the persistent [rows, H] fp32 buffer t into row dst (host mapping, between jobs: poke's rule)."""
+    from qwen38_npu import sync
+    sync(); raw = t.uop.base.buffer._buf; OA.host_invalidate(t); n = R.H * 4
+    ctypes.memmove(raw.va + dst * n, raw.va + src * n, n)
   def _vemb(self, m):
     L = self.vers[m]; return self._jid(("vemb", m), lambda _: self._embed_dev(L.K, m, L.K.bufs["xiov0"], self.vtok))
   def _vacc(self, m):
@@ -285,34 +320,39 @@ class Model:
       self._embed_dev(Lm.K, 1, self.embrows, self.dtok)
       return Lm.K.call(f"mtp_in|1|{mp}|{row}|0", QK.mtpin_src(1, mp, R.H, R.EPS, row, False), Lm.K.bufs["mtp_in"], self.embrows, Lp.K.bufs["mtp_out"], self.ne1, self.nh1, self.fn1)
     return self._jid(("dchain", mprev, row, mp), f)
-  def mtp_pass_dev(self, r, pos, pick):
-    """mtp_pass with the input rows already on the device (_dcatch / _dchain) and the draft's id picked into vt (pick = (j, row))."""
+  def mtp_pass_dev(self, r, pos, pick, rows_in=None):
+    """mtp_pass with the input rows already on the device (_dcatch / _dchain) and the draft's id picked into vt (pick = (j, row)).
+    `rows_in`: the call that puts them there, made here after the position's poke (a poke waits for a job in flight), so the MTP
+    layer's JIT is prepared while the input rows' job runs."""
     zc = self.pre.zc; m = min(g for g in self.mtp_geos if g >= r); t0 = time.perf_counter()
     poke(self.aix[self.NATT], np.array([self.NATT, pos], np.int32))
-    if self.mtp_x: zc["raw"].slot_map(self.mtp_sid, self.mtp_w[0], 0, self.mtp_w[2]); views = self.mtp_views
+    if rows_in is not None: rows_in()
+    if self.mtp_x: slot_map_nodrain(zc["raw"], self.mtp_sid, self.mtp_w[0], 0, self.mtp_w[2]); views = self.mtp_views   # (in flight: the input rows' job)
     else:
       zc["raw"].slot_map(zc["slots"][0][0], self.mtp_w[0], 0, self.mtp_w[2]); zc.setdefault("slot_src", [None, None])[0] = None
       views = zc["views"][(0, "full")]
     if m not in self.jit_mtp: self.jit_mtp[m] = TinyJit(functools.partial(self.mtp_step, m))
-    out = self.jit_mtp[m](self.aix[self.NATT], *[views[k] for k in self.MTP_LIN])
-    ids, pr = self._head_top_dev(out, self._dheadL(m), self.mtp_norm_w1, self.dhead, self.dhead["parts"][:self.draft_parts], pick=pick)
+    with one_job(): out = self.jit_mtp[m](self.aix[self.NATT], *[views[k] for k in self.MTP_LIN])   # (the capture: one job)
+    ids, pr = self._head_top_dev(out, self._dheadL(m), self.mtp_norm_w1, self.dhead, self.dhead["parts"][:self.draft_parts], pick=pick, x3=pick if self.leaf else False)
     self._draft_feats(r); self.prof["mtp_dev"] = self.prof.get("mtp_dev", 0.0) + time.perf_counter() - t0
     return m, ids, pr
   def mtp_draft_dev(self, m, a, pos, k):
     """mtp_draft on the device's ids: the catch-up on the a accepted tokens (nxt) and the verify pass's hidden rows, then up to
     k - 1 chained drafts while the draft probability stays >= tau. Each draft's id goes into vt on the device; the host reads
     the ids and probabilities only (the geometry of the next pass, the log)."""
-    t0 = time.perf_counter(); mp = min(g for g in self.mtp_geos if g >= a); self._dcatch(m, a, mp)
-    mp, ids, ps = self.mtp_pass_dev(a, pos, (0, a - 1)); d, pr = [int(ids[a - 1])], [float(ps[a - 1])]
+    t0 = time.perf_counter(); mp = min(g for g in self.mtp_geos if g >= a)
+    mp, ids, ps = self.mtp_pass_dev(a, pos, (0, a - 1), rows_in=lambda: self._dcatch(m, a, mp)); d, pr = [int(ids[a - 1])], [float(ps[a - 1])]
     log = self.spec_log is not None; mprev, row = mp, a - 1
     if log: tl, fx, px = [time.perf_counter() - t0], [self.mtp_feats[a - 1]], [self.mtp_ptop[a - 1]]
+    t3 = [self.mtp_t3[a - 1]] if self.leaf else []                       # (the leaf tree: each draft's top-3, its leaves)
     for j in range(1, k):
-      if not (len(pr) < self.kmax and pr[-1] >= self.tau): break
-      t1 = time.perf_counter(); m1 = min(self.mtp_geos); self._dchain(mprev, row, m1)
-      _, ids, ps = self.mtp_pass_dev(1, pos + a - 1 + j, (j, 0)); d.append(int(ids[0])); pr.append(float(ps[0])); mprev, row = m1, 0
+      if not (len(pr) < self.kmax and (float(np.prod(pr)) >= self.tc if self.leaf else pr[-1] >= self.tau)): break
+      t1 = time.perf_counter(); m1 = min(self.mtp_geos)
+      _, ids, ps = self.mtp_pass_dev(1, pos + a - 1 + j, (j, 0), rows_in=lambda: self._dchain(mprev, row, m1)); d.append(int(ids[0])); pr.append(float(ps[0])); mprev, row = m1, 0
+      if self.leaf: t3.append(self.mtp_t3[0])
       if log: tl.append(time.perf_counter() - t1); fx.append(self.mtp_feats[0]); px.append(self.mtp_ptop[0])
-    self.draft_p, self.draft_t3 = pr, []
-    if log: self.draft_rec = dict(td=tl, f=fx, fp=px, catch_rows=a)
+    self.draft_p, self.draft_t3 = pr, t3
+    if log: self.draft_rec = dict(td=tl, f=fx, fp=px, catch_rows=a, **(dict(t3=t3) if self.leaf else {}))
     return d
   def spec_warmup(self):
     """Capture every verify geometry's (and the MTP layer's) JITs up front -- a capture pass costs ~1.2 s more than a replay --
@@ -393,7 +433,7 @@ class Model:
     # a draft pass runs on the smallest geometry that holds its rows: 1 (a chained draft) or a verify geometry (the catch-up on the
     # accepted tokens, <= QWEN_DRAFT_MAX + 1 rows) -- not the widest, whose second row tile costs the compute-bound GEMMs ~1.35x
     # (the tree verify keeps the chain's draft geometries 3 / 4 / 6: a catch-up pass has at most NC = 6 rows, the widest a rescue hit commits)
-    gs = [3, 4, 6] if self.tree else self.geos
+    gs = [3, 4, 6] if self.tree and not self.leaf else self.geos
     self.mtp_geos = sorted({1} | {g for g in gs if g <= self.kmax + 1} | {min(g for g in gs if g >= self.kmax + 1)})
     for g in self.mtp_geos:
       self._ver(g)
@@ -427,7 +467,9 @@ class Model:
       zc["raw"].slot_map(zc["slots"][0][0], self.mtp_w[0], 0, self.mtp_w[2]); zc.setdefault("slot_src", [None, None])[0] = None
       views = zc["views"][(0, "full")]
     if m not in self.jit_mtp: self.jit_mtp[m] = TinyJit(functools.partial(self.mtp_step, m))
-    t1 = time.perf_counter(); out = self.jit_mtp[m](self.aix[self.NATT], *[views[k] for k in self.MTP_LIN]); hx = OA.host_invalidate(out).numpy()[:r].copy()
+    t1 = time.perf_counter()
+    with one_job(): out = self.jit_mtp[m](self.aix[self.NATT], *[views[k] for k in self.MTP_LIN])
+    hx = OA.host_invalidate(out).numpy()[:r].copy()
     t2 = time.perf_counter(); ids, pr = self.head_top(out, self._dheadL(m), self.mtp_norm_w1, self.draft_parts, thresh=self.parts_thresh, row=r - 1, top3=self.head_top3, hp=self.dhead)
     lg = (ids[:r], pr[:r]); t3 = time.perf_counter(); self._draft_feats(r)
     for k_, v in (("mtp_in", t1 - t0), ("mtp_layer", t2 - t1), ("mtp_head", t3 - t2)): pf[k_] = pf.get(k_, 0.0) + v
@@ -458,7 +500,8 @@ class Model:
     t3 = [self.mtp_t3[a - 1]] if self.head_top3 else []                  # each draft's merged top-3 per part read (the log; the tree's rescue rows)
     if log: tl, fx, px = [time.perf_counter() - t0], [self.mtp_feats[a - 1]], [self.mtp_ptop[a - 1]]   # telemetry per draft: wall time, (top logit, 2nd max), the parts' tops
     for j in range(1, k):
-      tp = time.perf_counter(); go = len(pr) < self.kmax and pr[-1] >= self.tau; t1 = time.perf_counter(); self.prof["policy"] = self.prof.get("policy", 0.0) + t1 - tp
+      tp = time.perf_counter(); go = len(pr) < self.kmax and (float(np.prod(pr)) >= self.tc if self.leaf else pr[-1] >= self.tau)   # (leaf: the path probability)
+      t1 = time.perf_counter(); self.prof["policy"] = self.prof.get("policy", 0.0) + t1 - tp
       if not go: break                                                    # the threshold rule: not confident (or kmax drafts)
       hx, (ids, ps) = self.mtp_pass(self.mtp_rows(h[None], [d[-1]], chained=True), pos + a - 1 + j)
       d.append(int(ids[0])); pr.append(float(ps[0])); h = hx[0]
@@ -471,7 +514,11 @@ class Model:
     L = self.vers[m]; slot = dict(zip(self.GDN_LIN, rest[:len(self.GDN_LIN)])); x = self.xbvs[m][par]; idh = L.K.hold("idx_held", idx)
     a_h = L.K.rms_a(x, (self.Win_g, idh), R.H, "a_h")
     ct = L.lin_cts(a_h, slot, self.meta_gdn, ("qkv", "z"))                   # one GEMM when the cache fuses qkv | z
-    if self.tree:                                                         # the tree verify: the rescue rows as one-token waves from their parents' banks
+    if self.leaf:                                                         # the leaf tree: leaves read-only from their parent's state, the deferred commit (QWEN_GDN_FAST: gdn_fast_src(tree=True))
+      a_o = L.K.gdn_tokl(self.Sall, self.Call, idh, self.posb, ct["qkv"][0], ct["z"][0], x, self.Wab, self.Adt, self.Cwt, self.Nw, self.banks, self.rawm, self.pathb, self.treeb,
+                         R.NV, R.NK, R.DK, R.DV, self.C, R.CONV, R.H, self.NGDN, self.M, xoff=ct["qkv"][1], zoff=ct["z"][1])
+      a_o = L.K.rms_a(a_o, None, R.NV * R.DV, "a_o", norm=False)
+    elif self.tree:                                                       # the tree verify: the rescue rows as one-token waves from their parents' banks
       a_o = L.K.gdn_tokt(self.Sall, self.Call, idh, self.posb, ct["qkv"][0], ct["z"][0], x, self.Wab, self.Adt, self.Cwt, self.Nw, self.banks, self.rawm, self.treeb,
                          R.NV, R.NK, R.DK, R.DV, self.C, R.CONV, R.H, self.NGDN, xoff=ct["qkv"][1], zoff=ct["z"][1])
     else:
@@ -481,6 +528,14 @@ class Model:
       if R.HAD: a_o = L.K.rms_a(a_o, None, R.NV * R.DV, "a_o", norm=False)   # o_proj's A from the fp32 rows (had_a32: whole 1024-blocks across heads)
     x = L.K.resid(x, L.lin_ct(a_o, slot, self.meta_gdn, "o"), R.H, "x1")
     return L.mlp(x, slot, self.meta_gdn, (self.Wpost_g, idh), f"xiov{1 - par}").realize()
+  def vblk_step(self, m, types, *args):
+    """A block of layers (types: their LAYER_TYPES; the block starts at an even layer) as one JIT: per layer its index buffer (sidx /
+    aix) then its linears' views, in order; layer j reads xbvs[m][j % 2] and writes the other, as the per-layer steps do."""
+    i = 0; out = None
+    for j, lt in enumerate(types):
+      nl = len(self.ATT_LIN if lt == "full" else self.GDN_LIN)
+      out = (self.vatt_step if lt == "full" else self.vgdn_step)(m, j % 2, *args[i:i + 1 + nl]); i += 1 + nl
+    return out
   def vatt_step(self, m, par, aix, *rest):
     L = self.vers[m]; slot = dict(zip(self.ATT_LIN, rest[:len(self.ATT_LIN)])); x = self.xbvs[m][par]; ah = L.K.hold("aix_held", aix)
     a_h = L.K.rms_a(x, (self.Win_a, ah), R.H, "a_h"); ct = L.lin_cts(a_h, slot, self.meta_att, ("q", "kv"))   # one GEMM when fused
@@ -490,7 +545,7 @@ class Model:
     else: oc = L.K.attn_decm(q_rows, kv_rows, self.QN, self.KN, self.ROPE, self.Kall, self.Vall, ah, R.NH, R.NKV, R.HD, self.TMAX, R.ROT)
     x = L.K.resid(x, L.lin_ct(L.K.rms_a(oc, None, R.NH * R.HD, "a_o", norm=False), slot, self.meta_att, "o"), R.H, "x1")
     return L.mlp(x, slot, self.meta_att, (self.Wpost_a, ah), f"xiov{1 - par}").realize()
-  def _head_part(self, L, i, x, norm_w1, view, top3=False, hp=None, red=None, pick=None):
+  def _head_part(self, L, i, x, norm_w1, view, top3=False, hp=None, red=None, pick=None, x3=False):
     """Head part i on geometry L's rows (under TinyJit: one submission) -> its top-1 partials (`top3`: top-3); part 0 first takes the norm.
     `hp`: the head (parts, GEMM keywords, slot, vocabulary; default the model's own, `mhead`)."""
     hp = self.mhead if hp is None else hp; K = L.K; p_ = hp["parts"][i]
@@ -498,9 +553,10 @@ class Model:
     ct = OA.gemm_gs(a, view, ks=KS, ns=3, nrb=L.nrb, nslices=R.H // (4 * KS), ngroups=p_["groups"], b8=True, bscale=True, q8=Q8MODE, scales=SCALES, piece=L.piece,
                     rows=L.n, out=K.buf(f"ct_head{i}", p_["groups"] * L.nrb * 3 * 192, dtypes.float32), **hp["kw"])
     t = K.head_top(ct, min(p_["groups"] * 48, hp["n"] - p_["c0"]), f"top3_head{i}" if top3 else f"top_head{i}", top3=top3)
+    if x3: K.head_top3_row(ct, min(p_["groups"] * 48, hp["n"] - p_["c0"]), f"top3r_head{i}", pick[1])   # (the leaf tree's drafts: each part's top-3 on the pick row)
     if not red: return t
     o = K.head_reduce(red)                                                # the last part read: the token on the device too
-    if pick is not None: K.call(f"pick_id|{pick[0]}|{pick[1]}", QK.pick_src(*pick), self.vtok, o, self.dtok)   # a draft: into vt
+    if pick is not None and red: K.call(f"pick_id|{pick[0]}|{pick[1]}", QK.pick_src(*pick), self.vtok, o, self.dtok)   # a draft: into vt
     return o
   def head_top(self, x, L, norm_w1=None, parts=None, thresh=None, row=None, top3=False, hp=None):
     """The block-scaled head's top-1 on geometry L's rows of x (after the final norm, or `norm_w1`'s) -> (ids [m], probabilities
@@ -521,19 +577,43 @@ class Model:
     ids, pr, self.head_ptop, feats, self.head_t3 = combine_tops(tops, [p_["c0"] for p_ in hp["parts"][:len(tops)]], top3, getattr(self, "need_feats", False))
     if feats is not None: self.head_feats = feats
     return ids, pr
-  def _head_top_dev(self, x, L, nw, hp, parts, pick=None):
+  def _head_top_dev(self, x, L, nw, hp, parts, pick=None, x3=False):
     """head_top with the token chosen on the device (QWEN_NPU_IDS): the last part's job ends with head_reduce, and only its
     [ids | probabilities] come back. Telemetry (need_feats: QWEN_SPEC_LOG) still reads the partials and checks the ids."""
     zc = self.pre.zc; raw = zc["raw"]; c0s = tuple(p_["c0"] for p_ in parts); m = L.n
+    if getattr(self, "blk", 1) > 1 and hp["sid"] is None and len(parts) <= self.blk and all(p_["n"] <= zc["bsize"] for p_ in parts):
+      # layer blocks: every part in a block slot of parity 0 (the last block, parity 1, may still run) -> one JIT, one job
+      for i, p_ in enumerate(parts): slot_map_nodrain(raw, zc["bslots"][(0, i)][0], p_["wid"], 0, p_["n"])
+      key = ("all", L.n, id(L), id(x), id(nw), id(hp), len(parts), pick, x3)
+      if key not in self.jit_head: self.jit_head[key] = TinyJit(functools.partial(self._head_parts, L, x, nw, hp, len(parts), c0s, pick, x3))
+      with one_job(): o = self.jit_head[key](*[self.pre.blob_view(0, i, p_["n"]) for i, p_ in enumerate(parts)])
+    else:
+      o = self._head_parts_seq(L, x, nw, hp, parts, c0s, pick, x3)
+    return self._head_out(o, L, parts, c0s, x3)
+  def _head_parts(self, L, x, nw, hp, n, c0s, pick, x3, *views):
+    """Head parts 0..n-1 (each in its own slot: views) as one JIT, the last ending with head_reduce (and pick_id)."""
+    o = None
+    for i in range(n): o = self._head_part(L, i, x, nw, views[i], hp=hp, red=c0s if i == n - 1 else None, pick=pick if i == n - 1 or x3 else None, x3=x3)
+    return o
+  def _head_parts_seq(self, L, x, nw, hp, parts, c0s, pick, x3=False):
+    zc = self.pre.zc; raw = zc["raw"]
     for i, p_ in enumerate(parts):
       par = i % 2; raw.slot_map(zc["slots"][par][0] if hp["sid"] is None else hp["sid"], p_["wid"], 0, p_["n"]); red = c0s if i == len(parts) - 1 else None
-      pk = pick if red else None; key = (L.n, id(L), i, id(x), id(nw), False, id(hp), red, pk)
-      if key not in self.jit_head: self.jit_head[key] = TinyJit(functools.partial(self._head_part, L, i, x, nw, hp=hp, red=red, pick=pk))
+      pk = pick if red or x3 else None; key = (L.n, id(L), i, id(x), id(nw), False, id(hp), red, pk, x3)
+      if key not in self.jit_head: self.jit_head[key] = TinyJit(functools.partial(self._head_part, L, i, x, nw, hp=hp, red=red, pick=pk, x3=x3))
       o = self.jit_head[key](p_["views"][par])
-    o = OA.host_invalidate(o).numpy(); ids, pr = o[:m].astype(np.int64), o[m:2 * m].view(np.float32).copy()
+    return o
+  def _head_out(self, o, L, parts, c0s, x3=False):
+    m = L.n; o = OA.host_invalidate(o).numpy(); ids, pr = o[:m].astype(np.int64), o[m:2 * m].view(np.float32).copy()
+    if x3:                                                                # the parts' top-3 partials on the pick row -> head_t3 [m] (that row's; combine_tops' merge)
+      t3s = [OA.host_invalidate(L.K.bufs[f"top3r_head{i}"]).numpy().reshape(-1, 1, 8).copy() for i in range(len(parts))]
+      t3s = [np.concatenate([t[..., :6], np.ones_like(t[..., 6:7]), t[..., 7:]], -1) for t in t3s]   # (no sum of exp: a dummy 1)
+      h3, _, _, _, r3 = combine_tops(t3s, list(c0s), True, False); self.head_t3 = r3 * m
+      assert int(h3[0]) == int(ids[x3[1]]), ("head_top3r's top-1 differs from head_reduce", ids, h3)
     if getattr(self, "need_feats", False):
       tops = [OA.host_invalidate(L.K.bufs[f"top_head{i}"]).numpy().reshape(-1, m, 4).copy() for i in range(len(parts))]
-      hid, _, self.head_ptop, self.head_feats, self.head_t3 = combine_tops(tops, list(c0s), False, True)
+      hid, _, self.head_ptop, self.head_feats, t3_ = combine_tops(tops, list(c0s), False, True)
+      if not x3: self.head_t3 = t3_
       assert np.array_equal(hid, ids), ("head_reduce ids differ from combine_tops", ids, hid)
     else: self.head_ptop = np.zeros((len(parts), m), np.float32)
     return ids, pr
@@ -560,31 +640,49 @@ class Model:
     else: poke(xbv[0], self.W.embed(list(toks)).astype(np.float32))       # rows M.. stay zero (no kernel writes them)
     for i, t in enumerate(self.aix): poke(t, np.array([i, pos], np.int32))
     poke(self.posb, np.array([pos], np.int32))
-    if self.tree: assert M == self.M; poke(self.treeb, spec_tree.table(tree) if tree is not None else spec_tree.chain_table(M))
-    L.prefetch(0)
-    for l in range(R.NL):
-      if l + 1 < R.NL: L.prefetch(l + 1)
-      slot, meta, sm = L.load(l); par = l % 2
-      if R.LAYER_TYPES[l] == "full":
-        self.meta_att = meta
-        if (M, par) not in self.jit_vatt: self.jit_vatt[(M, par)] = TinyJit(functools.partial(self.vatt_step, M, par))
-        self.jit_vatt[(M, par)](self.aix[self.aidx[l]], *[slot[k] for k in self.ATT_LIN])
-      else:
-        self.meta_gdn = meta
-        if (M, par) not in self.jit_vgdn: self.jit_vgdn[(M, par)] = TinyJit(functools.partial(self.vgdn_step, M, par))
-        self.jit_vgdn[(M, par)](self.sidx[self.gidx[l]], *[slot[k] for k in self.GDN_LIN])
+    if self.tree: assert M == self.M or self.leaf; poke(self.treeb, spec_tree.table(tree) if tree is not None else spec_tree.chain_table(M))
+    if self.blk > 1: self._verify_blocks(M, L)
+    else:
+      L.prefetch(0)
+      for l in range(R.NL):
+        if l + 1 < R.NL: L.prefetch(l + 1)
+        slot, meta, sm = L.load(l); par = l % 2
+        if R.LAYER_TYPES[l] == "full":
+          self.meta_att = meta
+          if (M, par) not in self.jit_vatt: self.jit_vatt[(M, par)] = TinyJit(functools.partial(self.vatt_step, M, par))
+          self.jit_vatt[(M, par)](self.aix[self.aidx[l]], *[slot[k] for k in self.ATT_LIN])
+        else:
+          self.meta_gdn = meta
+          if (M, par) not in self.jit_vgdn: self.jit_vgdn[(M, par)] = TinyJit(functools.partial(self.vgdn_step, M, par))
+          self.jit_vgdn[(M, par)](self.sidx[self.gidx[l]], *[slot[k] for k in self.GDN_LIN])
     if not NPU_IDS or self.dump is not None or getattr(self, "_prompt_pass", False): self.v_hidden = OA.host_invalidate(xbv[0]).numpy()[:M].copy()   # the MTP draft head's input
     if head is None: return None                                          # (the last layer, parity 1, wrote xbv[0])
     return self.head_top(xbv[0], L)[0] if head == "top" else self.logits_rows(xbv[0], L=L)
+  def _verify_blocks(self, M, L):
+    """The 64 layers QWEN_LAYER_BLOCK at a time (vblk_step): block b's layers mapped into the slots of block parity b % 2 while block
+    b - 1 runs (the backend's async tail), then the block as one JIT call."""
+    k = self.blk
+    for b in range(R.NL // k):
+      bp = b % 2; types = tuple(R.LAYER_TYPES[b * k + j] for j in range(k)); args = []
+      for j in range(k):
+        l = b * k + j; views, meta = L.map_block(l, bp, j)
+        if types[j] == "full": self.meta_att = meta; args += [self.aix[self.aidx[l]], *[views[n] for n in self.ATT_LIN]]
+        else: self.meta_gdn = meta; args += [self.sidx[self.gidx[l]], *[views[n] for n in self.GDN_LIN]]
+      if (key := (M, bp, types)) not in self.jit_vblk: self.jit_vblk[key] = TinyJit(functools.partial(self.vblk_step, M, types))
+      jit = self.jit_vblk[key]
+      if jit.cnt < 2:                                                     # the capture: the whole block as one graph, one chain
+        with one_job(): jit(*args)
+      else: jit(*args)
   def commit(self, a, pos, m=None, path=None):
     """After verify(toks, pos) accepted a of its M tokens: the DeltaNet states and rings as after toks[:a] (posb still = pos).
     QWEN_SPEC_TREE: `path` = the committed rows (spec_tree.accept; None = the chain's first a): the state from the path's last
     row's bank, the ring from the path's raw rows, a committed rescue row's K / V rows moved to its position (gdn_commit_tree)."""
     m = self.M if m is None else m
-    if self.tree:
-      poke(self.pathb, spec_tree.path_words(list(range(a)) if path is None else path, m, self.NC))
+    if self.tree:                                                         # (leaf: pathb is also the next pass's pending path, gdn_tokl)
+      nc = getattr(self, "pass_nc", m) if self.leaf and path is not None else (m if self.leaf else self.NC)
+      poke(self.pathb, spec_tree.path_words(list(range(a)) if path is None else path, self.M if self.leaf else m, nc))
       self.vers[m].K.gdn_commit_tree(self.Sall, self.banks, self.Call, self.rawm, self.Kall, self.Vall, self.pathb, self.posb,
-                                     R.NV, R.DK, R.DV, self.C, R.CONV, m, self.NGDN, self.NATT, self.TMAX, R.NKV, R.HD)
+                                     R.NV, R.DK, R.DV, self.C, R.CONV, m, self.NGDN, self.NATT, self.TMAX, R.NKV, R.HD, defer=self.leaf)
       return
     if not NPU_IDS or getattr(self, "_prompt_pass", False): poke(self.accb, np.array([a], np.int32))   # QWEN_NPU_IDS: accept wrote it (not for a prompt pass)
     self.vers[m].K.gdn_commit(self.Sall, self.banks, self.Call, self.rawm, self.accb, self.posb, R.NV, R.DK, R.DV, self.C, R.CONV, m, self.NGDN, ring_only=self.defer)
@@ -597,7 +695,7 @@ class Model:
     flog = open(self.spec_log, "a") if self.spec_log and mtp else None
     if flog:
       flog.write(json.dumps({"run": dict(self.spec_meta, model=R.MODEL, M=self.M, geos=self.geos, kmax=self.kmax, tau=self.tau,
-        policy="threshold", draft_parts=self.draft_parts, parts_policy=self.parts_policy, head_top3=self.head_top3,
+        policy=f"leaf tc {self.tc} tl {self.tl}" if self.leaf else "threshold", draft_parts=self.draft_parts, parts_policy=self.parts_policy, head_top3=self.head_top3,
         tree=os.environ.get("QWEN_SPEC_TREE", "off"),
         head_c0=[p_["c0"] for p_ in self.dhead["parts"]], pos0=pos,
         **(dict(drafter=dict(cache=self.mtp_cache, embed=self.mtp_emb, head=self.mtp_head)) if self.mtp_x else {}), max_new=max_new, time=time.time(),
@@ -616,14 +714,20 @@ class Model:
       if mtp: d = dnext
       else: d = list(drafter(cur, pos, out))[:self.M - 1]; d += [cur] * (self.M - 1 - len(d))
       nd = len(d); tree = None
-      if self.tree:                                                       # the tree: the chain (padded to NC rows) + the rescue rows from the drafts' top-3
+      if self.leaf:                                                       # the leaf tree: the chain + the leaves (best path probability) in the rows left
+        tree = spec_tree.build_leaf(cur, d[:nd], self.draft_t3, self.draft_p, self.M, self.tl); m = tree.M; toks = tree.toks; self.pass_nc = 1 + nd
+      elif self.tree:                                                     # the tree: the chain (padded to NC rows) + the rescue rows from the drafts' top-3
         tree = spec_tree.build(cur, d[:nd], self.draft_t3, self.tree, self.M, spec_tree.TREE_NR); m = self.M; toks = tree.toks; d = toks[1:self.NC]
       else:
         m = min(g for g in self.geos if g >= 1 + nd); d = d + [d[-1]] * (m - 1 - nd); toks = [cur] + d   # padded to a kept geometry
       if pos + m > self.TMAX: break
+      if self.leaf and NPU_IDS: poke(self.vtok, np.array((toks + [toks[-1]] * 16)[:16], np.int32))   # the leaf tree: vt = the tree's rows (the leaves are host picks)
       t0v = t0 = time.perf_counter(); g = self.verify(toks, pos, tree=tree); tv = time.perf_counter() - t0
       if tree is not None:                                                # the longest root path the model agrees with (spec_tree.accept)
-        path, new, rej = spec_tree.accept(tree, g); a = len(new); ac = (rej or self.NC) - 1   # ac: chain drafts accepted
+        path, new, rej = spec_tree.accept(tree, g); a = len(new); ac = (rej or (self.pass_nc if self.leaf else self.NC)) - 1   # ac: chain drafts accepted
+        if self.leaf and NPU_IDS:                                         # the drafter's catch-up inputs: nxt = the new tokens, the path's hidden rows
+          poke(self.nxtb, np.array((new + [new[-1]] * 16)[:16], np.int32))
+          if path[-1] != a - 1: self._row_move(self.xbvs[m][0], path[-1], a - 1)   # (a leaf's row into the path's last position)
       else:
         a = 1
         while a < m and d[a - 1] == int(g[a - 1]): a += 1
@@ -644,7 +748,7 @@ class Model:
         t0 = time.perf_counter(); dnext = self.mtp_draft_dev(m, a, pos, self.kmax) if NPU_IDS else self.mtp_draft(self.v_hidden[path], new, pos, self.kmax)
         st["t_draft"] = st.get("t_draft", 0.0) + time.perf_counter() - t0
       if tree is not None:
-        hit = path[-1] >= self.NC; st.setdefault("rescue_hits", 0); st["rescue_hits"] += int(hit)
+        hit = path[-1] >= (self.pass_nc if self.leaf else self.NC); st.setdefault("rescue_hits", 0); st["rescue_hits"] += int(hit)
         trec = dict(rescue=[(r, j, k, tree.toks[r]) for r, j, k in tree.rescue], path=path, hit=int(path[-1]) if hit else -1)
       if flog:                                                            # (pass i's drafts were drawn at the end of pass i - 1)
         if "t3" in drec: drec["r3"] = [top3_rank(drec["t3"][j], int(g[j])) for j in range(nd)]   # the model's token's rank in draft j's top-3 (-1: absent)
@@ -747,6 +851,7 @@ class Model:
     self.Sall.assign(Tensor.zeros(self.Sall.shape[0], device=DEV, dtype=dtypes.float32)).realize()
   def prefill(self, ids, nlayers=None):
     if getattr(self, "defer", False): poke(self.accb, np.zeros(1, np.int32))   # no update pending for the next verify pass (gdn_defer_src)
+    if getattr(self, "leaf", False) and self.M: poke(self.pathb, np.zeros(4 + self.M, np.int32))   # (the leaf tree's gdn_tokl: its pending path)
     if R.Q8 or os.environ.get("QWEN_PREFILL") == "chunked": return self.prefill_chunked(ids)
     nlayers = R.NL if nlayers is None else nlayers
     n = len(ids); L = self.pre; assert n <= self.TMAX; self.ids_prompt = list(ids)

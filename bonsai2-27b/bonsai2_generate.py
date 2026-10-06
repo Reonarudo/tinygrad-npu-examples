@@ -20,7 +20,10 @@ os.environ.setdefault("QWEN_DIR", os.environ.get("BONSAI_GGUF", "/mnt/ssd/bonsai
 os.environ.setdefault("QWEN_TOK", os.environ["QWEN_NPU"])
 os.environ.setdefault("QWEN_NPU_IDS", "1")                 # the decode loop's token ids chosen, embedded, accepted and drafted on the NPU
 os.environ.setdefault("ZHOUYI_CHAIN_MAX", "16")           # a layer's launches as one job (8: two); -16 ms a 4-row verify pass
-os.environ.setdefault("QWEN_SPEC", "4")                 # verify geometries up to 4 rows: the ternary GEMM's second row tile (5+ rows) costs +0.34 s
+os.environ.setdefault("QWEN_LAYER_BLOCK", "4")            # the verify pass's layers 4 at a time, a block one job (and the head one job)
+os.environ.setdefault("QWEN_SPEC", "4")                 # verify geometries up to 4 rows: a 5th row still costs ~+80 ms a pass (rows 6-8 ~+15 each)
+os.environ.setdefault("QWEN_SPEC_TREE", "leaf")         # spare rows take the drafts' rank-2/3 candidates (+3.9 % on 10 prompts, exact)
+os.environ.setdefault("QWEN_TREE_TC", "0.5")             # the chain drafts on while its path probability >= 0.5
 os.environ.setdefault("QWEN_SPEC_GEOS", "2,3,4")
 os.environ.setdefault("QWEN_DRAFT_MAX", "3")
 os.environ.setdefault("QWEN_MTP_EMBED", "bonsai")        # the drafted token's embedding: Bonsai's (the GGUF row)

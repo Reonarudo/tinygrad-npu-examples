@@ -4,6 +4,9 @@ on the NPU. One process: prefill + `--n` plain greedy steps (decode, 1 row) -> t
 Model.spec_generate's loop (verify + commit) with ORACLE drafts -- g's continuation, every third pass with its last draft replaced
 by a wrong token (so passes reject too and commit() keeps a shorter prefix) -- the geometry cycling through QWEN_SPEC_GEOS.
 Every token the verify passes emit is a verify row's argmax: the run is exact iff the ids equal g.
+QWEN_SPEC_TREE=leaf (the leaf tree's kernels: gdn_tokl, attn_partt, gdn_commit_tree(defer); geometries 2..QWEN_SPEC): every other
+pass is a TREE -- the chain's draft at depth k wrong, a leaf at depth k holding the right token (and, room permitting, a wrong leaf
+before it), so the pass commits the path through the leaf (spec_tree.accept, its K / V rows moved, its update slot pending).
 
     QWEN_SPEC=8 QWEN_SPEC_GEOS=3,4,6,8 python3 check/verify_oracle.py [--ids 760,...] [--n 40]
 """
@@ -14,6 +17,7 @@ os.environ.setdefault("QWEN_SPEC", "8"); os.environ.setdefault("QWEN_SPEC_GEOS",
 os.environ.setdefault("QWEN_DRAFT", "none")                               # oracle drafts: no MTP drafter loaded
 HERE = os.path.dirname(os.path.abspath(__file__)); sys.path.insert(0, os.path.join(HERE, "..", "..", "qwen3.8-27b"))
 import qwen38_generate as G                                              # noqa: E402
+import spec_tree as ST                                                   # noqa: E402
 
 def main():
   ap = argparse.ArgumentParser(); ap.add_argument("--ids", default="760,6511,314,9338,369,11751,13,561,6511,314,9564,369")
@@ -30,6 +34,17 @@ def main():
   t0 = time.perf_counter()
   while len(out) < a.n:                                                  # Model.spec_generate's loop, the geometry chosen per pass
     m = M.geos[i % len(M.geos)]; d = list(g[len(out):len(out) + m - 1]); d += [d[-1] if d else cur] * (m - 1 - len(d))
+    if getattr(M, "leaf", False) and i % 2 == 1 and m >= 3:              # a tree: chain of m - 1 - nl rows, the right token on a leaf
+      nl = 1 if (m == 3 or i % 4 == 1) else 2; nc = m - nl; k = 1 + (i // 4) % (nc - 1)   # the wrong chain draft's depth k (1 .. nc - 1)
+      ch = list(d[:nc - 1]); right = ch[k - 1]; ch[k - 1] = (right + 7) % 1000
+      parent = [-1] + list(range(nc - 1)); toks = [cur] + ch; resc = []
+      if nl == 2: toks.append((right + 13) % 1000); parent.append(k - 1); resc.append((len(toks) - 1, k, 2))   # a wrong leaf first
+      toks.append(right); parent.append(k - 1); resc.append((len(toks) - 1, k, 1))
+      tree = ST.Tree(toks, parent, resc); M.pass_nc = nc
+      v = [int(t) for t in M.verify(toks, pos, tree=tree)]
+      path, new, _ = ST.accept(tree, v); a_ = len(new); assert path[-1] >= nc or len(path) < k + 1, (path, k)
+      M.commit(a_, pos, m, path); out += new; cur, pos = out[-1], pos + a_
+      rows.append((m, a_, "leaf" if path[-1] >= nc else "chain")); acc += a_ - 1; i += 1; continue
     if i % 3 == 2: d[-1] = (d[-1] + 1) % 1000                             # a wrong last draft: the pass rejects it
     v = [int(t) for t in M.verify([cur] + d, pos)]
     a_ = 1

@@ -22,6 +22,8 @@ unless the request sets "chat_template_kwargs": {"enable_thinking": true} (or "e
 import argparse, json, os, queue, threading, time, uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 os.environ.setdefault("QWEN_PREFILL", "chunked")
+os.environ.setdefault("QWEN_SPEC", "6")                   # the server runs the verify path: speculative decoding up to 6 rows unless set
+                                                          # (bonsai2_serve / ornith set their own defaults before this import)
 import numpy as np                                                        # noqa: E402
 import qwen38_generate as G                                               # noqa: E402
 from qwen38_tokenize import Tok, chat_messages, EOS                       # noqa: E402

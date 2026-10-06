@@ -64,8 +64,8 @@ the prompt through the 64 layers, then decodes greedily until `<|im_end|>` / `<|
 prompt without the template, `--ids 1,2,...` gives the prompt as token ids, `--tmax` sets the K/V cache length (default 512), and
 `--out x.npz` keeps the generated ids and each step's top-8 logits.
 
-To serve the model over the OpenAI and Ollama APIs, `qwen38_serve.py` takes the same environment (it needs the verify path,
-`QWEN_SPEC` >= 2): `QWEN_SPEC=6 python3 qwen38_serve.py --host 0.0.0.0 --port 8000`. Its endpoints, the service set-up and the
+To serve the model over the OpenAI and Ollama APIs, `qwen38_serve.py` takes the same environment (speculative
+decoding is on by default, `QWEN_SPEC=6`): `python3 qwen38_serve.py --host 0.0.0.0 --port 8000`. Its endpoints, the service set-up and the
 clients are described in [bonsai2-27b/README.md](../bonsai2-27b/README.md#serve-openai--and-ollama-compatible-api).
 
 ## Speculative decoding (`QWEN_SPEC=6`)

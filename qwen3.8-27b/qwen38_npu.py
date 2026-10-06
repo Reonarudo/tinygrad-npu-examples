@@ -29,7 +29,15 @@ SCALES = "dup" if R.Q8 else _scales_marker(os.environ.get("QWEN_NPU", "/mnt/ssd/
 # TERN (a ternary cache, e.g. bonsai2_pack.py's, marked by a file `tern`): every stream is gemm_fp16.pack_b_group_tern's (2-bit codes,
 # the single-layout scale table) and the GEMMs run gemm_gs(tern=True); the keyword is passed only then (older backends lack it)
 TERN = not R.Q8 and os.path.exists(os.path.join(os.path.expanduser(os.environ.get("QWEN_NPU", "/mnt/ssd/qwen3.8-27b-npu-s1")), "tern"))
-TERN_KW = {"tern": True} if TERN else {}
+# TSCALE (a ternary cache's scale tables): "f32" (bonsai2_pack.py's single-layout fp32 s x 2^18, 64 B a strip and slice) or "f16"
+# (fp16 s x 2^15, 32 B: 2.125 bits a weight, C bit-identical; bonsai2_repack_f16.py's / bonsai2_pack.py --tscale f16's cache, marked by
+# a file `tscale` holding the word). Passed to gemm_gs(tscale=) only for f16 (older backends lack the keyword).
+def _tscale_marker(cache):
+  f = os.path.join(os.path.expanduser(cache), "tscale")
+  return open(f).read().split()[0] if os.path.exists(f) else "f32"
+TSCALE = _tscale_marker(os.environ.get("QWEN_NPU", "/mnt/ssd/qwen3.8-27b-npu-s1")) if TERN else "f32"
+assert TSCALE in ("f32", "f16"), f"`tscale` marker {TSCALE!r}: f32 | f16"
+TERN_KW = ({"tern": True, "tscale": "f16"} if TSCALE == "f16" else {"tern": True}) if TERN else {}
 if TERN: assert SCALES == "single", "a ternary cache holds the single-layout scale table (its `scales` marker)"
 
 def had_signs(cache):
@@ -66,11 +74,20 @@ def memmove_threads(dst, src, size, nt=4):
   for t in ths: t.join()
 
 def dev(a, dt=None): return Tensor(np.ascontiguousarray(a), device=DEV, **({} if dt is None else {"dtype": dt})).realize()
+def sync():
+  """Wait for a job the backend left in flight (zhouyi's async graph tail; a no-op on a backend without one)."""
+  from tinygrad import Device
+  Device[DEV].synchronize()
+def slot_map_nodrain(raw, sid, wid, off, n):
+  """SLOT_MAP without waiting for a job left in flight: only for a slot that job does not read (the layer loop's slot l % 2: the
+  in-flight job is layer l - 1's, on the other slot). An older backend has no `drain` keyword (and no async tail)."""
+  try: raw.slot_map(sid, wid, off, n, drain=False)
+  except TypeError: raw.slot_map(sid, wid, off, n)
 def poke(t, a):
   """The host array `a` into the start of the realised device tensor `t`'s buffer by a memmove into its host mapping -- what an
   assign of a host tensor ends in (the allocator's _copyin) without scheduling a copy and waiting for it (~1.5 ms a round trip).
-  Only between jobs: every job here is submitted and waited for, so no kernel is reading the buffer meanwhile."""
-  a = np.ascontiguousarray(a); b = t.uop.base.buffer; b.ensure_allocated(); raw = b._buf
+  Only between jobs: a job left in flight is waited for first (`sync`), so no kernel is reading the buffer meanwhile."""
+  sync(); a = np.ascontiguousarray(a); b = t.uop.base.buffer; b.ensure_allocated(); raw = b._buf
   assert a.nbytes <= b.nbytes and raw.va, (a.nbytes, b.nbytes)
   ctypes.memmove(raw.va, a.ctypes.data, a.nbytes)
 def rup(x, m): return -(-x // m) * m
@@ -84,6 +101,7 @@ class Layers:
     # layout, or the kernels would read the other layout's codes as scales -- silently (nothing downstream checks it)
     assert R.Q8 or _scales_marker(cache) == SCALES, f"{cache}: `scales` marker {_scales_marker(cache)!r} but SCALES={SCALES!r} (set QWEN_NPU to this cache)"
     assert R.Q8 or os.path.exists(os.path.join(cache, "tern")) == (TERN and not fp8), f"{cache}: its `tern` marker disagrees with TERN={TERN} (set QWEN_NPU to this cache)"
+    assert fp8 or not TERN or _tscale_marker(cache) == TSCALE, f"{cache}: `tscale` marker {_tscale_marker(cache)!r} but TSCALE={TSCALE!r} (set QWEN_NPU to this cache)"
     self.tern_kw = {} if fp8 else TERN_KW; self.had = R.HAD and not fp8
     self.nrb = rup(rup(n, 12) // 12, 2); self.R = 12 * self.nrb
     self.slots = [{}, {}]                                                 # two slots of device buffers per linear name
@@ -202,11 +220,40 @@ class Layers:
         for k_, sz in sizes.items(): read_into(os.path.join(self.cache, f"L{l}_{k_}.bin"), memoryview(mm)[offs[k_]:offs[k_] + sz], sz)
         zc["st_layer"][i] = l
       wid = zc["staging"][i][0]; src[l % 2] = i
-    zc["raw"].slot_map(zc["slots"][l % 2][0], wid, 0, zc["packs"][l][2])
+    # no drain: slot l % 2 was last read by layer l - 2, which has run (a job left in flight is layer l - 1's, on the other slot;
+    # the prefetch thread starts only after a sync); and a thread must not drain
+    slot_map_nodrain(zc["raw"], zc["slots"][l % 2][0], wid, 0, zc["packs"][l][2])
+  # ---- layer blocks (QWEN_LAYER_BLOCK, Model.verify): k consecutive layers as ONE TinyJit call (one job), so each of the 2 x k
+  # positions (block parity, layer in block) has a window slot of its own; position (bp, 0) is the plain path's slot bp. The
+  # layers' linears are views into their position's slot, fixed per (position, layer type): the JIT sees the same buffers.
+  def block_slots(self, k):
+    """The 2 k block slots (allocated once, shared with the other geometries through `zc`) -> {(bp, j): (sid, pa)}."""
+    zc = self.zc
+    if zc.get("bslots") is None or len(zc["bslots"]) != 2 * k:
+      big = max(p_[2] for p_ in zc["packs"].values()); raw = zc["raw"]
+      zc["bslots"] = {(bp, j): (zc["slots"][bp] if j == 0 else raw.slot_alloc(big)) for bp in range(2) for j in range(k)}
+      zc["bviews"], zc["bsize"] = {}, big
+    return zc["bslots"]
+  def block_views(self, bp, j, lt):
+    zc = self.zc; key = (bp, j, lt)
+    if key not in zc["bviews"]:
+      sizes, offs, _ = zc["packs"][R.LAYER_TYPES.index(lt)]; pa = zc["bslots"][(bp, j)][1]
+      zc["bviews"][key] = {k_: Tensor.from_blob(pa + offs[k_], (sz,), dtype=dtypes.uint8, device=DEV) for k_, sz in sizes.items()}
+    return zc["bviews"][key]
+  def blob_view(self, bp, j, n):
+    """A uint8 view of n bytes at block slot (bp, j)'s start (e.g. a head part mapped there), cached."""
+    zc = self.zc; key = ("blob", bp, j, n)
+    if key not in zc["bviews"]: zc["bviews"][key] = Tensor.from_blob(zc["bslots"][(bp, j)][1], (n,), dtype=dtypes.uint8, device=DEV)
+    return zc["bviews"][key]
+  def map_block(self, l, bp, j):
+    """Layer l (pinned zero-copy) into block slot (bp, j), without waiting for a job left in flight: the caller's in-flight job
+    is the other block parity's (this slot's last reader, two blocks back, has run) -> (its linears' views, meta)."""
+    zc = self.zc; slot_map_nodrain(zc["raw"], zc["bslots"][(bp, j)][0], zc["wbufs"][l][0], 0, zc["packs"][l][2])
+    return self.block_views(bp, j, R.LAYER_TYPES[l]), self._meta(l)[0]
   def _load_zc(self, l):
     zc = self.zc; prev = (l - 1) % R.NL
     for i, sl in enumerate(zc["st_layer"]):                                     # layer l - 1 has run: its staging buffer is free
-      if sl == prev: self._stage_fill(i)
+      if sl == prev: sync(); self._stage_fill(i)                               # (its job may still be in flight: wait for it)
     if l in self._inflight: self._inflight.pop(l).join()
     else: self._map_zc(l)
     return zc["views"][(l % 2, R.LAYER_TYPES[l])]
@@ -259,6 +306,7 @@ class Layers:
     # a layer pinned zero-copy only needs its slot mapped (one ioctl): a thread for it cost more than it hid (bonsai2-27b, 4-row
     # verify: -10 ms a pass without it). QWEN_PREFETCH=1: the thread anyway. Streamed layers keep it
     if self.zc and l in self.zc["wbufs"] and os.environ.get("QWEN_PREFETCH") != "1": return
+    sync()                                                                         # slot l % 2's last reader (layer l - 2) may still be in flight
     t = threading.Thread(target=self._map_zc if self.zc else self._copy, args=(l,), daemon=True); t.start(); self._inflight[l] = t
   def load(self, l):
     if self.zc: slot = self._load_zc(l)

@@ -14,16 +14,19 @@ import bonsai2_pack as P                                                 # (sets
 import qwen38_ref as R
 from qwen38_pack import LINEARS, SMALL, FUSED
 
+TB = 64                                                                  # a strip's scale table: fp32 64 B, or 32 B in an fp16-table cache (`tscale` f16)
+
 def check_stream(path, npad, K, t, sc):
   c, s = P.unpack_stream(open(path, "rb").read(), npad, K); N = t.shape[0]
   ok = dict(codes=bool(np.array_equal(c[:N].astype(np.int16) - 1, t.astype(np.int16))), scales=bool(np.array_equal(s[:N], sc)),
-            pad=bool((c[N:] == 1).all() and (s[N:] == 0).all()), size=os.path.getsize(path) == (npad // 48) * (K // 128) * (P.NS * P.KS * 16 + P.NS * 64))
+            pad=bool((c[N:] == 1).all() and (s[N:] == 0).all()), size=os.path.getsize(path) == (npad // 48) * (K // 128) * (P.NS * P.KS * 16 + P.NS * TB))
   return ok
 
 def main():
   ap = argparse.ArgumentParser(); ap.add_argument("--cache", required=True)
   ap.add_argument("--gguf", default=os.environ.get("BONSAI_GGUF", "/mnt/ssd/bonsai2/Ternary-Bonsai-2-27B-PTQ1_0.gguf"))
   ap.add_argument("--layers", default="0-3"); ap.add_argument("--head", action="store_true"); a = ap.parse_args()
+  global TB; ft = os.path.join(a.cache, "tscale"); TB = 32 if os.path.exists(ft) and open(ft).read().split()[0] == "f16" else 64
   W = P.Weights(a.gguf); sg = P.signs(W); allok = True
   def report(what, ok):
     nonlocal allok; good = all(ok.values()); allok &= good

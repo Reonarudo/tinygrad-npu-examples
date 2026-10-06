@@ -9,8 +9,8 @@ layer, the embedding and the output head stored as **ternary weights**: each wei
 and its GGUF are PrismML's, under the Apache-2.0 license; see their [model card](https://huggingface.co/prism-ml/Ternary-Bonsai-2-27B-gguf),
 [website](https://prismml.com) and [whitepaper](https://github.com/PrismML-Eng/Bonsai-demo/blob/main/bonsai-2-27b-whitepaper.pdf).
 
-**Status: it generates.** Plain greedy decoding runs at 1.52 tok/s. With speculative decoding (the default) it runs at
-**~4.3 tok/s**, and ~5.6 tok/s on code, with the same tokens as plain greedy decoding.
+**Status: it generates.** Plain greedy decoding runs at 2.0 tok/s. With speculative decoding (the default) it runs at
+**~5.6 tok/s**, and ~6.7 tok/s on code, with the same tokens as plain greedy decoding.
 
 ![Bonsai 2 27B served from the board, asked through the Ollama CLI on a Mac](serve-demo.gif)
 
@@ -38,7 +38,7 @@ The backend's requirements, listed in the [root README](../README.md#requirement
 - the vendor's AIPU toolchain library,
 - Python 3.12 or newer with `numpy` and `tokenizers` (`pip install numpy tokenizers`).
 
-On top of that: **~15 GB of disk** (5.9 GB GGUF, 0.5 GB of Qwen3.8-27B files, 8.7 GB packed cache) and **~10 GB of free RAM**
+On top of that: **~15 GB of disk** (5.9 GB GGUF, 0.5 GB of Qwen3.8-27B files, 8.2 GB packed cache) and **~10 GB of free RAM**
 (the packed layers are held in RAM; the board has 29 GB).
 
 The paths below (`/mnt/ssd/...`) are examples and the scripts' defaults: set `BONSAI_DIR`, `BONSAI_GGUF` and `QWEN_NPU` to your
@@ -77,6 +77,16 @@ python3 bonsai2_pack.py --mtp /mnt/ssd/bonsai2/qwen3.8-27b-mtp   # the drafter a
 `--mtp` packs Qwen3.8-27B's multi-token-prediction (MTP) layer into the subfolder `$QWEN_NPU/mtp`, where the generator looks for
 it, and copies the tokenizer into the cache. The MTP layer stays in FP8 (block-scaled E4M3), so it has its own folder with its
 own format markers.
+
+The scale tables are stored as fp16 (2.125 bits a weight instead of 2.25 for fp32, 5.6 % fewer bytes a pass; the GEMM's output
+is bit-identical, so the tokens are the same). `--tscale f32` packs the older fp32 tables. A cache packed with fp32 tables can be
+converted into a new folder (no GGUF read, ~15 s on the board; the tool stops if any scale is not exact in fp16):
+
+```sh
+python3 bonsai2_repack_f16.py --src /mnt/ssd/bonsai2-npu --out /mnt/ssd/bonsai2-npu-f16   # then QWEN_NPU=/mnt/ssd/bonsai2-npu-f16
+```
+
+The cache's `tscale` file selects the format; a cache without it is read as fp32.
 
 ## Run
 
@@ -231,7 +241,7 @@ for chunk in stream:
 - **Prompt speed.** The prompt goes through the verify path, 4 tokens a pass, at ~7 tok/s, so a long chat history delays the first
   token (each request processes the whole conversation again). Its tokens can differ from the one-pass prefill's where two
   logits nearly tie; on the Fibonacci prompt the 120 tokens equal plain greedy decoding's.
-- **Generation speed** depends on how predictable the text is: ~5.6 tok/s on code, ~3 tok/s on free prose.
+- **Generation speed** depends on how predictable the text is: ~6.7 tok/s on code, ~4.3 tok/s on free prose.
 - **Thinking** is off unless the request turns it on: `"chat_template_kwargs": {"enable_thinking": true}` (OpenAI) or
   `"think": true` (Ollama).
 
@@ -241,20 +251,23 @@ Measured on the board with the NPU clocks at their defaults, the host pinned to 
 default) and holding the 0 µs CPU-latency request ([above](#the-cpu-latency-request)), 120 new tokens each, wall time after the
 first token, the prefill excluded. Every speculative run returned exactly the plain greedy tokens.
 
-| prompt | plain | speculative, default drafter |
+| prompt | plain (40 tokens) | speculative, defaults |
 | --- | ---: | ---: |
-| Fibonacci in Python | 1.52 | 5.58 |
-| a short story's opening | | 3.09 |
-| a train journey's length, step by step | | 5.25 |
-| **the three together** | | **4.33** |
+| Fibonacci in Python | 2.03 | 6.71 |
+| a short story's opening | | 4.28 |
+| a train journey's length, step by step | | 6.28 |
+| **the three together** | | **5.58** |
+
+Over ten varied prompts the defaults average 5.34 tok/s.
 
 Code and step-by-step reasoning draft best; free prose drafts worst.
 
 ## Speculative decoding
 
-The GGUF has no draft model, so the drafter is Qwen3.8-27B's MTP layer (see "How it works"). Each pass verifies the current token
-plus up to 3 drafts; the drafter keeps drafting while its probability is at least `QWEN_DRAFT_TAU`. Every emitted token is the
-verify pass's own argmax, so the output is the same as plain greedy decoding.
+The GGUF has no draft model, so the drafter is Qwen3.8-27B's MTP layer (see "How it works"). Each pass verifies up to 4 rows: the
+current token, the drafter's chain (it keeps drafting while the chain's probability is at least `QWEN_TREE_TC`), and in the rows
+left, the drafts' second and third candidates as extra leaves, which cost no extra draft pass. Every emitted token is the verify
+pass's own argmax, so the output is the same as plain greedy decoding.
 
 ### Settings
 
@@ -271,9 +284,11 @@ verify pass's own argmax, so the output is the same as plain greedy decoding.
 | `QWEN_MTP_EMBED` | `bonsai` | the drafted token's embedding: Bonsai's, or `qwen`: Qwen3.8-27B's table, from `QWEN_MTP_DIR` |
 | `QWEN_MTP_DIR` | unset | Qwen3.8-27B-FP8's folder (its `outside.safetensors`), needed only with `QWEN_MTP_EMBED=qwen` |
 | `QWEN_SPEC` | `4` | rows of a verify pass at most (the token + up to 3 drafts); `0` decodes plainly |
-| `QWEN_SPEC_GEOS` | `2,3,4` | the verify pass sizes prepared at start-up |
+| `QWEN_SPEC_GEOS` | `2,3,4` | the verify pass sizes prepared at start-up (with the leaf tree: every size from 2 to `QWEN_SPEC`) |
 | `QWEN_DRAFT_MAX` | `3` | drafts a pass at most |
-| `QWEN_DRAFT_TAU` | `0.2` (`0.4` with the Qwen head) | keep drafting while the draft head's probability is at least this |
+| `QWEN_SPEC_TREE` | `leaf` | the verify rows the chain leaves free take the drafts' 2nd / 3rd candidates; `off`: the chain only |
+| `QWEN_TREE_TC` | `0.5` | with the leaf tree: keep drafting while the chain's probability is at least this |
+| `QWEN_DRAFT_TAU` | `0.2` (`0.4` with the Qwen head) | without the leaf tree (`QWEN_SPEC_TREE=off`): keep drafting while the draft head's probability is at least this |
 | `QWEN_DRAFT_PARTS` | `2` (`2,thresh:20` with the Qwen head) | the draft head reads the first 2 of the head's 4 parts (token ids < 124 416) |
 | `QWEN_CPUS`, `QWEN_CPU_LATENCY` | `auto`, `0` | the host's CPU pinning and the CPU-latency request ([above](#the-cpu-latency-request)) |
 
@@ -319,10 +334,10 @@ QWEN_SPEC=8 QWEN_SPEC_GEOS=3,4,6,8 python3 check/verify_oracle.py
 
 ## How it works
 
-- **The ternary GEMM.** The backend's `gemm_gs(tern=True)` streams each weight as a 2-bit code with one fp32 scale per row and
+- **The ternary GEMM.** The backend's `gemm_gs(tern=True)` streams each weight as a 2-bit code with one fp16 scale per row and
   128-wide K block. The GGUF's `PTQ1_0` block is 128 weights along K with one scale, so it maps onto one K slice of the GEMM and
   its scale is stored as is. The kernel expands the codes to fp16 before multiplying; at 1 to 4 rows it keeps up with the
-  weight stream. A verify pass through the 64 layers costs 0.44-0.48 s at 2 to 4 rows.
+  weight stream. A verify pass through the 64 layers costs 0.37-0.39 s at 2 to 4 rows.
 - **The Hadamard producers.** Bonsai stores each weight as W' = W diag(s) H, with H a 1024-point Walsh-Hadamard transform
   and s fixed +-1 signs per input width, so each linear's input must be rotated the same way. The kernels that already write
   each GEMM's fp16 input (after the RMSNorms, after SwiGLU, after attention) run the 10 butterfly stages of the transform in
@@ -334,9 +349,12 @@ QWEN_SPEC=8 QWEN_SPEC_GEOS=3,4,6,8 python3 check/verify_oracle.py
   coordinates (the rotation sits only inside the linears), so Qwen3.8-27B's MTP layer can be fed Bonsai's final hidden state
   without any change of basis. It runs on the NPU in FP8, in its own memory slot, and drafts through Bonsai's own ternary head.
   74 % of first drafts are accepted, and 64-69 % of the second and third.
-- **The 5-row step.** The ternary GEMM works in tiles of 4 rows. A verify pass of 2, 3 or 4 rows costs 0.44-0.48 s (less than a
-  plain decode step's 0.66 s, because the decode path's kernels differ). A 5th row starts a second tile and adds 0.24 s. So the
-  drafter stops at 3 drafts: deeper drafts would be accepted ~62 % of the time, which does not pay for the second tile.
+- **The leaf tree, and the 5-row step.** A verify pass of 2, 3 or 4 rows costs 0.37-0.39 s (less than a plain decode step's
+  0.49 s, because the decode path's kernels differ). The drafter drafts while its chain's probability stays >= 0.5
+  (`QWEN_TREE_TC`), and the rows left of the 4 take the drafts' second and third candidates, which need no extra draft pass
+  (`QWEN_SPEC_TREE=leaf`, the default: 2.63 tokens a pass instead of 2.57). The ternary GEMM works in tiles of 4 rows, and a
+  5th row costs ~+80 ms a pass (rows 6-8 then ~+10 ms each), more than the deeper drafts or extra leaves win back, so the
+  default stays at 4 rows.
 
 ## Files
 
@@ -344,6 +362,7 @@ QWEN_SPEC=8 QWEN_SPEC_GEOS=3,4,6,8 python3 check/verify_oracle.py
 | --- | --- |
 | `download.sh` | the GGUF, and the Qwen3.8-27B MTP weights and tokenizer |
 | `bonsai2_pack.py` | the GGUF -> the NPU cache (ternary streams, the Hadamard signs, the head in parts); `--mtp`: the drafter |
+| `bonsai2_repack_f16.py` | an fp32-table cache -> a new cache with fp16 scale tables (exact, or it stops) |
 | `bonsai2_generate.py` | generation on the NPU (`qwen3.8-27b/qwen38_generate.py` with `QWEN_MODEL=bonsai2-27b` and the defaults above) |
 | `bonsai2_serve.py` | the OpenAI- and Ollama-compatible server (`qwen3.8-27b/qwen38_serve.py` with these defaults) |
 | `bonsai2_gguf.py`, `bonsai2_weights.py` | the GGUF reader, the `PTQ1_0` decoder and the Hadamard contract; the GGUF under the HF tensor names |

@@ -6,7 +6,10 @@ lm_head_tern.npz).
 
 Weight format: every linear (and the head) as gemm_fp16.pack_b_group_tern's stream -- the trits as 2-bit codes, the PTQ1_0
 block scale d (one per row and 128-wide K block = one K-slice of the ks-32 GEMM) in the single-layout fp32 table; markers `tern`
-(the format) and `scales` (single) in the cache, which the runtime reads (qwen38_npu.TERN / SCALES).
+(the format) and `scales` (single) in the cache, which the runtime reads (qwen38_npu.TERN / SCALES). `--tscale f16` stores the
+table as fp16 s x 2^15 instead (gemm_fp16.pack_b_group_tern(tscale="f16"): 32 B a strip and slice instead of 64, 2.125 bits a weight,
+the GEMM's C bit-identical; a backend whose gemm_gs takes tscale=), marked by a file `tscale` holding f16
+(qwen38_npu.TSCALE); bonsai2_repack_f16.py converts an existing fp32-table cache the same way.
 
 The Hadamard contract (bonsai2_gguf.py): every stored weight is W' = W diag(s) Hb, fed Hb (s * x). The device applies Hb in the A
 producers (qwen38_kernels.had_a32: the unnormalised transform), so the cache carries:
@@ -48,18 +51,26 @@ FOLD = np.float32(2.0 ** -5)                                              # 1 / 
 HEAD_PARTS = 4                                                            # as the fp8 head: 1296 groups (62 208 columns) a part, the last shorter
 assert R.HAD and R.HEAD == "lm_head_tern"
 
+TSCALE = "f16"                                                            # the scale table's format (--tscale): f16 (default) | f32
+def tkw(): return {"tscale": "f16"} if TSCALE == "f16" else {}              # pack_b_group_tern's keyword (older backends lack it)
+
 def stream(t, scale):
   """ternary [N, K] (int8) + scale [N, K / 128] (fp32) -> the whole gemm_gs(tern) stream (all groups), N padded to the group size."""
   ngroups = -(-t.shape[0] // (16 * NS))
-  return np.concatenate([G.pack_b_group_tern(t, scale, g, NS, KS) for g in range(ngroups)]), 16 * NS * ngroups
+  return np.concatenate([G.pack_b_group_tern(t, scale, g, NS, KS, **tkw()) for g in range(ngroups)]), 16 * NS * ngroups
 
 def unpack_stream(buf, npad, K):
-  """The inverse of stream(): bytes -> (codes c = w + 1, uint8 [npad, K]; the fp32 scales as stored, [npad, K / 128])."""
-  ng, nsl = npad // (16 * NS), K // QK; cb, tb = NS * KS * 16, NS * 64
+  """The inverse of stream(): bytes -> (codes c = w + 1, uint8 [npad, K]; the scales as stored, fp32 [npad, K / 128]). Either
+  table format (the record size tells: fp32 s x 2^18, 64 B a strip, or fp16 s x 2^15, 32 B: lane 2i = column i, 2i + 1 = column 8 + i)."""
+  ng, nsl = npad // (16 * NS), K // QK; cb = NS * KS * 16; tb = len(buf) // (ng * nsl) - cb
+  assert tb in (NS * 64, NS * 32) and len(buf) == ng * nsl * (cb + tb), (len(buf), npad, K)
   b = np.frombuffer(buf, np.uint8).reshape(ng, nsl, cb + tb)
   codes = b[..., :cb].reshape(ng, nsl, NS, KS // 2, 2, 16)
   j = np.stack([(codes >> (6 - 2 * jj)) & 3 for jj in range(4)], 5)       # [g][slice][s][q][h][j][16 = n k]
   c = j.reshape(ng, nsl, NS, KS // 2, 2, 4, 4, 4).transpose(0, 2, 5, 6, 1, 3, 4, 7).reshape(npad, K)   # [g][s][j][n] x [slice][q][h][k]
+  if tb == NS * 32:                                                       # fp16 s x 2^15: [s][i][half] -> column 8 half + i
+    h = np.ascontiguousarray(b[..., cb:]).view(np.float16).reshape(ng, nsl, NS, 8, 2).transpose(0, 1, 2, 4, 3).reshape(ng, nsl, 16 * NS)
+    return c, (h.astype(np.float32) * np.float32(2.0 ** -15)).transpose(0, 2, 1).reshape(npad, nsl)
   sc = np.ascontiguousarray(b[..., cb:]).view(np.float32).reshape(ng, nsl, 16 * NS).transpose(0, 2, 1).reshape(npad, nsl)
   return c, sc / np.float32(2.0 ** 18)
 
@@ -99,7 +110,7 @@ def pack_head(W, out):
       for c0 in range(g0, g1, 64):                                          # 64 groups (3072 rows) at a time
         c1 = min(g1, c0 + 64); r0, r1 = c0 * gs, min(c1 * gs, N)
         t, d = W.g.ptq(name, slice(r0, r1)); sc = (d.astype(np.float32) * FOLD).astype(np.float32)
-        fh.write(np.concatenate([G.pack_b_group_tern(t, sc, g, NS, KS) for g in range(c1 - c0)]).tobytes())
+        fh.write(np.concatenate([G.pack_b_group_tern(t, sc, g, NS, KS, **tkw()) for g in range(c1 - c0)]).tobytes())
     os.replace(f + ".tmp", f); parts.append((g0, g1))
   np.savez(os.path.join(out, f"{R.HEAD}.npz"), parts=np.array(parts, np.int64), n=np.array([N, K]))
   np.savez(os.path.join(out, "outside_small.npz"), norm=W.f32("model.language_model.norm.weight"), lm_head_n=np.array([N, gs * ngroups, K]))
@@ -108,8 +119,11 @@ def markers(out, W):
   """The cache's format markers and the Hadamard signs (written first; a cache holding another format refuses)."""
   have = [f for f in os.listdir(out) if f.endswith(".bin")]
   assert not have or os.path.exists(os.path.join(out, "tern")), f"{out} holds another format's streams: pack into a fresh --out"
+  ft = os.path.join(out, "tscale"); was = open(ft).read().split()[0] if os.path.exists(ft) else "f32"
+  assert not have or was == TSCALE, f"{out} holds {was}-table streams, not --tscale {TSCALE}: pack into a fresh --out"
   open(os.path.join(out, "tern"), "w").write("gemm_fp16.pack_b_group_tern (ks 32, ns 3), gemm_gs(tern=True); bonsai2_pack.py\n")
   open(os.path.join(out, "scales"), "w").write("single\nthe ternary stream's single-layout scale table (gemm_gs scales='single')\n")
+  if TSCALE == "f16": open(ft, "w").write("f16\nthe ternary scale tables as fp16 s x 2^15 (gemm_fp16.pack_b_group_tern(tscale='f16'), gemm_gs(tscale='f16')); bonsai2_pack.py --tscale f16\n")
   h = W.g.had
   np.savez(os.path.join(out, "hadamard.npz"), block=np.array(h.block), fold_norm=np.array(1), **{f"s{w}": v for w, v in signs(W).items()})
 
@@ -133,8 +147,10 @@ def main():
   ap.add_argument("--out", default=os.environ.get("QWEN_NPU", "/mnt/ssd/bonsai2-npu")); ap.add_argument("--layers", default="0-63")
   ap.add_argument("--head", action="store_true", help="the final norm and the head only")
   ap.add_argument("--fuse", action="store_true", help="the fused q | k|v and qkv | z stream files alongside (qwen38_pack.fuse_all; no GGUF read)")
+  ap.add_argument("--tscale", default=TSCALE, choices=("f32", "f16"), help="the ternary scale table: fp16 s x 2^15 (default) or fp32 s x 2^18 (the older format)")
   ap.add_argument("--mtp", metavar="DIR", help="the drafter: Qwen3.8-27B-FP8's MTP layer (DIR/mtp.safetensors) into <out>/mtp, DIR/tokenizer.json into <out>")
   a = ap.parse_args(); os.makedirs(a.out, exist_ok=True); lo, hi = (int(v) for v in a.layers.split("-"))
+  global TSCALE; TSCALE = a.tscale
   if a.fuse: fuse_all(a.out, range(lo, hi + 1)); return
   if a.mtp:
     t0 = time.perf_counter(); pack_drafter(a.mtp, a.out); print(f"   the drafter (Qwen3.8-27B's MTP layer) packed into {os.path.join(a.out, 'mtp')} in {time.perf_counter() - t0:.0f} s", flush=True); return

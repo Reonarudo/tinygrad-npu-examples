@@ -11,6 +11,7 @@ import numpy as np
 sys.path.insert(0, os.path.expanduser(os.environ.get("TG", os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "tinygrad"))))
 from tinygrad import Tensor, dtypes                                      # noqa: E402
 from zy import OA, vec_f16 as V                                          # noqa: E402
+import gdn_asm                                                           # noqa: E402  (gdn_fast_src's sweeps)
 
 NT, DEV = 12, "ZHOUYI"
 TILE = "#define F8(a, b) __builtin_shufflevector((a), (b), 0, 1, 2, 3, 4, 5, 6, 7)\n"
@@ -488,6 +489,19 @@ __kernel void head_top(__global float* restrict out, __global float* restrict ct
   }}
 }}"""
 
+def head_top3_row_src(nc, nrb, row):
+  """head_top3 for ONE row (`row` of the C tiles' row block 0) and without the sum of exp (lane 6 = 0): the leaf tree's draft
+  candidates (the top-1 and its probability come from head_topd / head_reduce in the same job). out fp32 [NT][1][8]."""
+  src = head_top_src(nc, nrb, 1, top3=True)
+  sm = "    float8 s = BC(0.0f);\n"; a = src.index(sm); b = src.index("\n", src.index("s += exp2_d4", a)) + 1
+  src = src[:a] + src[b:]
+  edits = [("__kernel void head_top3(", "__kernel void head_top3r("), ("int ro = (m / 4) * 64 + (m % 4) * 4;", f"int ro = {(row // 4) * 64 + (row % 4) * 4};"),
+           ("o[6] = hsum8(s);", "o[6] = 0.0f;")]
+  for x, y in edits:
+    assert src.count(x) == 1, x
+    src = src.replace(x, y)
+  return src
+
 def embed_tern_desc(K):
   """slot 0: one HAD_B block of a PTQ1_0 row (8 blocks of 28 bytes); 1: the block's signs / an output block (HAD_B fp32); 2: the ids (64 B)."""
   return V._desc_slots((HAD_B // 128 * 28,), (HAD_B * 4,), (64,))
@@ -613,35 +627,43 @@ __kernel void head_reduce(__global int* restrict out, {", ".join(f"__global floa
   }}
 }}"""
 
-HT_CG = 6                                                                  # head_topd: C groups a DMA chunk
+HT_CG = 6                                                                  # head_topd: C groups a DMA chunk (m <= 4: row quad 0)
+HT_CG2 = 5                                                                 # head_topd, m 5..8: row quads 0 and 1 (2 x 13824 B at nrb 2)
 
-def head_topd_desc(nc, nrb):
-  """slot 0 / 1: HT_CG groups' row-quad-0 pieces of row block 0 (256 B each, pitch 768: the other row block's pieces ride along)
-  full / the last chunk of the task with the most groups (other tasks' last chunks use slot 2.. by their size)."""
-  n = lambda g: ((g - 1) * 3 * nrb + 3) * 256
-  return V._desc_slots(*[(n(g), 256, 768, 256) for g in range(1, HT_CG + 1)])
+def head_topd_desc(nc, nrb, nq=1):
+  """slot g - 1: a chunk of g groups' (g = 1 .. HT_CG) row-quad-0 pieces of row block 0 (256 B each, pitch 768: the other row
+  block's pieces ride along; the last group's stop at row block 0), the chunk size the slot index. `nq` = 2 (m 5..8): row quads 0
+  and 1 (512 B pieces at pitch 768, packed 512 apart in LSRAM), g = 1 .. HT_CG2."""
+  if nq == 1:
+    n = lambda g: ((g - 1) * 3 * nrb + 3) * 256
+    return V._desc_slots(*[(n(g), 256, 768, 256) for g in range(1, HT_CG + 1)])
+  assert nq == 2
+  return V._desc_slots(*[(((g - 1) * 3 * nrb + 3) * 512, 512, 768, 512) for g in range(1, HT_CG2 + 1)])
 
 def head_topd_src(nc, nrb, m):
-  """head_top (top-1, m <= 4 rows) with the C tiles streamed through LSRAM by DMA: a task owns whole groups [g0, g1) (columns in
+  """head_top (top-1, m <= 8 rows) with the C tiles streamed through LSRAM by DMA: a task owns whole groups [g0, g1) (columns in
   order, so the first column on ties is still its own first and the tasks' order is the columns'); per chunk of HT_CG groups the
   rows' maxima and sums of exp are folded in online (the sum rescaled when the max rises). out as head_top's: [NT][m][4] =
-  (max, column, sum of exp(v - max), 0). args: out, ct, desc (head_topd_desc)."""
-  assert 1 <= m <= 4; ng = -(-nc // 48); SB = 3 * nrb; CH = ((HT_CG - 1) * SB + 3) * 256; assert 2 * CH <= 32768 - 64
+  (max, column, sum of exp(v - max), 0). m <= 4: row quad 0 of each strip (HT_CG groups a chunk); m 5..8: row quads 0 and 1
+  (HT_CG2, desc head_topd_desc(nc, nrb, 2)). args: out, ct, desc (head_topd_desc)."""
+  assert 1 <= m <= 8; ng = -(-nc // 48); SB = 3 * nrb
+  cg, PF, RO = (HT_CG, 64, "r * 4") if m <= 4 else (HT_CG2, 128, "(r / 4) * 64 + (r % 4) * 4")   # m > 4: rows 4.. in row quad 1
+  CH = ((cg - 1) * SB + 3) * PF * 4; assert 2 * CH <= 32768 - 64
   lanes = " else ".join(f"if (v[{j}] == vm) am[r] = c + {j};" for j in range(8))
   return V.FULL_H + TILE + EXP + f"""
 __kernel void head_topd(__global float* restrict out, __global float* restrict ct, __global int* restrict desc, const int core_id) {{
-  int g0 = core_id * {ng} / {NT}, g1 = (core_id + 1) * {ng} / {NT}; int nch = (g1 - g0 + {HT_CG - 1}) / {HT_CG};
+  int g0 = core_id * {ng} / {NT}, g1 = (core_id + 1) * {ng} / {NT}; int nch = (g1 - g0 + {cg - 1}) / {cg};
   float mx[{m}], ssum[{m}]; int am[{m}]; for (int r = 0; r < {m}; r++) {{ mx[r] = -3.0e38f; ssum[r] = 0.0f; am[r] = 0; }}
-  #define ISSUE(k, buf) {{ int ga = g0 + (k) * {HT_CG}; int gn = g1 - ga < {HT_CG} ? g1 - ga : {HT_CG}; DMA_FILL(buf, DESC(desc, gn - 1), (buf) * {CH}, (int)(ct + ga * {SB * 192})); }}
+  #define ISSUE(k, buf) {{ int ga = g0 + (k) * {cg}; int gn = g1 - ga < {cg} ? g1 - ga : {cg}; DMA_FILL(buf, DESC(desc, gn - 1), (buf) * {CH}, (int)(ct + ga * {SB * 192})); }}
   if (nch > 0) ISSUE(0, 0);
   for (int k = 0; k < nch; k++) {{
     int p = k & 1; if (k + 1 < nch) {{ if (p == 0) ISSUE(k + 1, 1) else ISSUE(k + 1, 0) }}
     if (p == 0) DMA_WAIT(0); else DMA_WAIT(1);
-    __global float* B = LSF(p * {CH}); int ga = g0 + k * {HT_CG}; int gn = g1 - ga < {HT_CG} ? g1 - ga : {HT_CG};
+    __global float* B = LSF(p * {CH}); int ga = g0 + k * {cg}; int gn = g1 - ga < {cg} ? g1 - ga : {cg};
     for (int r = 0; r < {m}; r++) {{
       float cm = -3.0e38f; int ca = 0;
       for (int gg = 0; gg < gn; gg++) for (int sq = 0; sq < 6; sq++) {{      /* 8 columns: sub-tile sq / 2, column quads 2 (sq % 2), +1 */
-        int c = (ga + gg) * 48 + sq * 8; __global float* q = B + (gg * {SB} + sq / 2) * 64 + (sq % 2) * 32 + r * 4;
+        int c = (ga + gg) * 48 + sq * 8; __global float* q = B + (gg * {SB} + sq / 2) * {PF} + (sq % 2) * 32 + {RO};
         float8 v = F8(*(__global float4*)q, *(__global float4*)(q + 16));
         if (c + 8 > {nc}) {{ for (int j = 0; j < 8; j++) if (c + j >= {nc}) v[j] = -3.0e38f; }}
         float vm = hmax8(v); if (vm > cm) {{ cm = vm; ca = c; }}
@@ -649,7 +671,7 @@ __kernel void head_topd(__global float* restrict out, __global float* restrict c
       if (cm > mx[r]) {{                                                  /* the chunk's max beats the row's: its column, the rescale */
         for (int gg = 0; gg < gn; gg++) for (int sq = 0; sq < 6; sq++) {{
           int c = (ga + gg) * 48 + sq * 8; if (c != ca) continue;
-          __global float* q = B + (gg * {SB} + sq / 2) * 64 + (sq % 2) * 32 + r * 4; float8 v = F8(*(__global float4*)q, *(__global float4*)(q + 16));
+          __global float* q = B + (gg * {SB} + sq / 2) * {PF} + (sq % 2) * 32 + {RO}; float8 v = F8(*(__global float4*)q, *(__global float4*)(q + 16));
           if (c + 8 > {nc}) {{ for (int j = 0; j < 8; j++) if (c + j >= {nc}) v[j] = -3.0e38f; }}
           float vm = cm; {lanes}
         }}
@@ -657,7 +679,7 @@ __kernel void head_topd(__global float* restrict out, __global float* restrict c
       }}
       float8 s8 = BC(0.0f);
       for (int gg = 0; gg < gn; gg++) for (int sq = 0; sq < 6; sq++) {{
-        int c = (ga + gg) * 48 + sq * 8; __global float* q = B + (gg * {SB} + sq / 2) * 64 + (sq % 2) * 32 + r * 4;
+        int c = (ga + gg) * 48 + sq * 8; __global float* q = B + (gg * {SB} + sq / 2) * {PF} + (sq % 2) * 32 + {RO};
         float8 v = F8(*(__global float4*)q, *(__global float4*)(q + 16));
         if (c + 8 > {nc}) {{ for (int j = 0; j < 8; j++) if (c + j >= {nc}) v[j] = -3.0e38f; }}
         s8 += exp2_d4((v - BC(mx[r])) * BC(1.4426950408889634f));
@@ -1826,11 +1848,663 @@ __kernel void {"gdn_tokt" if tree else "gdn_tokm"}(__global half* restrict out, 
   #undef WOF{chr(10) + "  #undef WDEP" if tree else ""}
 }}"""
 
+def _defer_src5(src, NV, M, MS):
+  """gdn_defer_src with its row limit at LSRAM's (M <= MS <= 5; the function's own text, its one `<= 4` assert widened -- the
+  slots fit: PV0 + 5 GD_SLOT floats = 32 064 B at M = 5), so the leaf tree can verify 5 rows on the deferred commit."""
+  import inspect
+  s = inspect.getsource(gdn_defer_src); a = "assert M <= MS <= 4 and"; assert s.count(a) == 1, "gdn_defer_src's row limit moved"
+  ns = {}; exec(compile(s.replace(a, "assert M <= MS <= 5 and"), __file__, "exec"), globals(), ns)
+  return ns["gdn_defer_src"](src, NV, M, MS)
+
+def gdn_tokl_src(NV, NK, DK, DV, C, CONV, H, nrb, eps, M, MS, NG, W=16):
+  """The LEAF TREE's DeltaNet (QWEN_SPEC_TREE=leaf, spec_tree.build_leaf; the kernel `gdn_tokl`): gdn_tokm(rows_out) with the
+  deferred commit (gdn_defer_src), for a verify pass whose rows 0..nc-1 are the chain (the pass's token and its drafts) and rows
+  nc..M-1 LEAVES -- another candidate for a chain position j (1 <= j <= nc - 1: a sibling of chain row j, parent chain row j - 1),
+  never a parent. Two more runtime inputs: `tree` (spec_tree.table: int32 [2 M], depth first; the chain rows have depth[r] = r,
+  nc is the first row that does not) and, in place of the deferred kernel's accp, `accp` = spec_tree.path_words of the PREVIOUS
+  pass ([a, last, kv src, kv dst, its committed rows ...]): its a pending updates are the update slots of the committed rows in
+  order, so a path ending on a leaf needs no copy -- the leaf's slot is applied in its place. Edits to the deferred source:
+  - the conv window of every row by its depth (depth d: the raw rows d-3..d-1 of its ancestors, the ring for positions < pos):
+    the same terms in the same order as the chain's window for a chain row;
+  - the chain loop runs nc rows; after chain row t's update, each leaf of depth t + 1 takes its output from the block's state
+    (the state after rows 0..t), read only: kq = k^T S, qs = q^T S, o = d qs + (q.k) (v - d kq) beta -- the chain's
+    q^T (d S + k (v - d k^T S) beta) without writing S (no copy, no LSRAM); its update inputs (k, v, beta, decay) go to its slot
+    as every row's;
+  - the pending updates from slot path[i] instead of slot i.
+  Under spec_tree.chain_table and a chain path ([a, .., 0..a-1]) the sums are the deferred kernel's in the same order:
+  bit-identical (the simulator gate). M <= 5 (the deferred kernel's LSRAM, MS slots of GD_SLOT floats); the a leaf's output is
+  the chain formula's in another order (fp32 rounding, ~1e-7 relative)."""
+  assert 2 <= M <= MS <= 5 and W == 16 and gdn_prep() == "dma", "the leaf tree: 2..5 rows on the deferred, DMA-prepared chain kernel"
+  base = gdn_tokm_src(NV, NK, DK, DV, C, CONV, H, nrb, eps, M, NG, rows_out=True)
+  src = gdn_defer_src(base, NV, M, MS) if MS <= 4 else _defer_src5(base, NV, M, MS)
+  GD = GD_SLOT; dps = ", ".join(f"dp{r}" for r in range(M))
+  # the conv: every row's window by its depth
+  a_ = src.index("static inline __attribute__((always_inline)) void conv_seg("); b_ = src.index("static inline __attribute__((always_inline)) void l2n(")
+  conv = (f"static inline __attribute__((always_inline)) void conv_seg(__global float* restrict ct, __global float* restrict A, __global float* restrict Rw, int pos, int off,\n"
+          f"                                                           __global float* restrict out, {', '.join(f'int d{r}' for r in range(M))}) {{\n"
+          f"  for (int i = 0; i < {DK}; i += 8) {{" + "".join(f" *(__global float8*)(Rw + {t * DK} + i) = LD8R(ct, off + i, {t});" for t in range(M)) + " }\n")
+  for t in range(M):
+    conv += "  {" + "".join(f" int q{tt} = d{t} - {CONV - 1 - tt}, p{tt} = pos + q{tt}; __global float* W{tt} = q{tt} >= 0 ? Rw + q{tt} * {DK} : A + ({CONV} + (p{tt} >= 0 ? p{tt} : 0) % {CONV}) * {DK};"
+                            for tt in range(CONV - 1)) + "\n"
+    conv += (f"    for (int i = 0; i < {DK}; i += 8) {{ float8 acc = *(__global float8*)((Rw + {t * DK}) + i) * *(__global float8*)(A + {(CONV - 1) * DK} + i);"
+             + "".join(f" if (p{tt} >= 0) acc += *(__global float8*)(W{tt} + i) * *(__global float8*)(A + {tt * DK} + i);" for tt in range(CONV - 1))
+             + f" *(__global float8*)(out + {t * DK} + i) = sw(acc, BC(1.0f)); }} }}\n")
+  src = src[:a_] + conv + "}\n" + src[b_:]
+  call = f"conv_seg(x, LSF(a), OT(0), pos, off, QKV + (v ? {2 * M} : s * {M}) * {DK});"
+  pend0 = "    if (ap > 0) {"; pend1 = "      if (p == 0) { DMA_DRAIN(2, DESC(desc, 0), 0, (int)UBASE(u)); DMA_WAIT(2); }"
+  i0 = src.index(pend0); i1 = src.index(pend1, i0); blk = src[i0:i1]
+  lp = "      for (int t = 0; t < ap; t++) {\n"; assert blk.count(lp) == 1 and blk.count(f"t * {GD}") == 5, blk
+  blk = blk.replace(lp, lp + f"        int sl = accp[4 + t] * {GD};                              /* tree: the committed path's t-th row's slot */\n").replace(f"t * {GD}", "sl")
+  src = src[:i0] + blk + src[i1:]
+  leaf = "".join(f"""      if ({r} >= nc && dp{r} == t + 1) {{                              /* tree: leaf row {r} (parent chain row t), from the state after row t, read only */
+        __global float* kl = KT({r}); __global float* ql = QT({r});
+        float8 kq0 = BC(0.0f), kq1 = BC(0.0f), qq0 = BC(0.0f), qq1 = BC(0.0f), qk8 = BC(0.0f);
+        for (int i = 0; i < {DK}; i++) {{
+          float8 kb = BC(kl[i]), qb = BC(ql[i]); float8 s0 = *(__global float8*)(B + i * {W}), s1 = *(__global float8*)(B + i * {W} + 8);
+          kq0 += kb * s0; kq1 += kb * s1; qq0 += qb * s0; qq1 += qb * s1;
+        }}
+        for (int i = 0; i < {DK}; i += 8) qk8 += *(__global float8*)(kl + i) * *(__global float8*)(ql + i);
+        float8 db = BC(dd[{r}][h - h0]), bt = BC(bb[{r}][h - h0]), qk = BC(hsum8(qk8));
+        float8 dl0 = (*(__global float8*)(VT({r}) + j0) - kq0 * db) * bt, dl1 = (*(__global float8*)(VT({r}) + j0 + 8) - kq1 * db) * bt;
+        *(__global float8*)(OT({r}) + j0) = qq0 * db + qk * dl0; *(__global float8*)(OT({r}) + j0 + 8) = qq1 * db + qk * dl1;
+      }}
+""" for r in range(1, M))
+  ost = "      *(__global float8*)(OT(t) + j0) = o0; *(__global float8*)(OT(t) + j0 + 8) = o1;\n"
+  edits = [("__kernel void gdn_tokm(", "__kernel void gdn_tokl("),
+           ("__global int* restrict accp, const int core_id) {\n  int L = idx[0], pos = posb[0], ap = accp[0];",
+            "__global int* restrict accp, __global int* restrict tree, const int core_id) {\n  int L = idx[0], pos = posb[0], ap = accp[0];\n"
+            f"  int {', '.join(f'dp{r} = tree[{r}]' for r in range(M))}, nc = {M};" + "".join(f" if (dp{r} != {r}) nc = {r};" for r in reversed(range(1, M)))
+            + "   /* tree: the rows' depths; nc = the chain rows */"),
+           (call, call[:-2] + f", {dps});"),
+           (f"    for (int t = 0; t < {M}; t++) {{\n      __global float* ks = KT(t); __global float* qs = QT(t);\n",
+            "    for (int t = 0; t < nc; t++) {                                  /* tree: the chain rows */\n      __global float* ks = KT(t); __global float* qs = QT(t);\n"),
+           (ost, ost + leaf)]
+  for x, y in edits:
+    assert src.count(x) == 1, x
+    src = src.replace(x, y)
+  return src
+
+def attn_part_tree_src(NH, NKV, HD, TMAX, ROT, eps, M, BT=None):
+  """attn_part (M <= 7 rows) for a tree verify pass (the kernel `attn_partt`; M > 7: attn_part_rg_src(tree=True)): a 12th argument
+  `tree` (spec_tree.table: int32 [2 M] = depth[r], anc[r]): row r's query and new k are rotated at position pos + depth[r]
+  (its k / v still go to the cache at pos + r: gdn_commit_tree moves a committed leaf's to pos + depth), and row r attends the
+  new row t only when bit t - pos of anc[r] is set. Under spec_tree.chain_table it is attn_part's arithmetic: bit-identical."""
+  assert M <= 7
+  src = attn_part_src(NH, NKV, HD, TMAX, ROT, eps, M, ATT_BT if BT is None else BT)
+  edits = [("__kernel void attn_part(", "__kernel void attn_partt("),
+           ("__global int* restrict desc, const int core_id) {", "__global int* restrict desc, __global int* restrict tree, const int core_id) {"),
+           (f"rope + (pos + r) * {2 * ROT}", f"rope + (pos + tree[r]) * {2 * ROT}", 2),
+           (f"rope + t * {2 * ROT}", f"rope + (pos + tree[t - pos]) * {2 * ROT}", 1),
+           ("if (t <= pos + r)", f"if ((tree[{M} + r] >> (t - pos)) & 1)", 2)]
+  for x, y, *n in edits:
+    assert src.count(x) == (n[0] if n else 1), x
+    src = src.replace(x, y)
+  return src
+
+GF_MS = 8                                                                   # gdn_fast_src: the most pending (deferred) updates a kernel takes
+
+def gdn_fast():
+  """QWEN_GDN_FAST: the deferred-commit verify kernel -- "asm" (default: gdn_fast_src, the hand-scheduled sweeps), "c" (gdn_fast_src
+  with the C sweeps), "off" (gdn_defer_src, M <= 4 only; the bank path above)."""
+  v = os.environ.get("QWEN_GDN_FAST", "asm").strip(); assert v in ("asm", "c", "off"), f"QWEN_GDN_FAST={v!r}: asm | c | off"
+  return v
+
+def gdn_fast_cfg(M, MS):
+  """gdn_fast_src's LSRAM plan for M new tokens and MS pending-update slots -> dict(DB, VG, offsets): DB 1 = two state buffers
+  (the next block's fill under this block's sweeps), 0 = one; VG = v column groups (1: every token's v row resident for the whole
+  head; 2: half a row, the halves loaded per group of NB / 2 blocks -- the new tokens' v rows parked in a DDR scratch). The first
+  of (DB 1 VG 1), (1, 2), (0, 1), (0, 2) that fits 32 KiB - 64 (rows of 512 B: k (MS + M), q (M), v (MS + M) / VG, o (M); the
+  per-token beta / decay pairs at 64 B a token)."""
+  T = MS + M
+  for DB, VG in ((1, 1), (1, 2), (0, 1), (0, 2)):
+    o = {"KA": (1 + DB) * 8192}; o["QA"] = o["KA"] + T * 512; o["VA"] = o["QA"] + M * 512; o["OA"] = o["VA"] + T * 512 // VG
+    o["BD"] = o["OA"] + M * 512; o["END"] = o["BD"] + T * 64
+    if o["END"] <= 32768 - 64 and (VG == 1 or MS >= M): return dict(DB=DB, VG=VG, **o)
+  raise AssertionError(f"gdn_fast_src: M {M} MS {MS} does not fit LSRAM")
+
+def gdn_fast_kbd(M, HPT, KB=128, H=5120):
+  """gdn_fast_src's a|b DMA chunk (columns): 2 KB when both double-buffered chunks fit LSRAM (half the requests of KB), else KB."""
+  return 2 * KB if 2 * (M + 2 * HPT) * 2 * KB * 4 <= 32768 - 64 and H % (2 * KB) == 0 else KB
+
+def gdn_fast_desc(DK, DV, H, HPT, M, MS, C, CONV=4, KB=128, W=16, NV=48):
+  """gdn_fast_src's DMA slots: 0 a state block; 1 a chunk of the M input rows; 2 a chunk of a task's a|b rows (chunks of
+  gdn_fast_kbd columns); 3 the CONV rows of a
+  128-channel segment (taps or ring); 4 the M raw rows of a segment; 5 / 6 / 7 the MS pending slots' k / v / beta-decay rows in
+  (DDR pitch GD_SLOT floats); 8 / 9 / 10 the M new k / v / beta-decay rows out (the same pitch); VG 2: 11 the M v rows to / from
+  the scratch (contiguous), 12 half the pending v rows (one column group), 13 half the new v rows from the scratch; 14 / 15 the MS
+  pending / M new slots whole (one request each, when they fit the staging buffer); 16 a head's M output rows out (DDR pitch NV DV); 17 / 18 a 128-channel segment's C tiles, row quad 0 (14 / 17 virtual
+  strips of 768 B, the first 256 B of each: gdn_fast_src's CTD)."""
+  G = GD_SLOT * 4; KBD = gdn_fast_kbd(M, HPT, KB, H)
+  sl = [(DK * W * 4, W * 4, DV * 4, W * 4), (M * KBD * 4, KBD * 4, H * 4, KBD * 4), (2 * HPT * KBD * 4, KBD * 4, H * 4, KBD * 4),
+        (CONV * DK * 4, DK * 4, ring_pitch(C) * 4, DK * 4), (M * DK * 4, DK * 4, ring_pitch(C) * 4, DK * 4),
+        (MS * 512, 512, G, 512), (MS * 512, 512, G, 512), (MS * 64, 64, G, 64), (M * 512, 512, G, 512), (M * 512, 512, G, 512), (M * 64, 64, G, 64),
+        (M * 512,), (MS * 256, 256, G, 256), (M * 256, 256, 512, 256), (MS * G,), (M * G,), (M * DV * 4, DV * 4, NV * DV * 4, DV * 4), (14 * 256, 256, 768, 256), (17 * 256, 256, 768, 256)]
+  return V._desc_slots(*sl)
+
+def gdn_fast_scratch(M):
+  """floats of the VG 2 scratch after the [NG][NV][MS] slots in `banks`: a task's M new v rows."""
+  return NT * M * 128
+
+def gdn_sweeps_c(DK=128, W=16, tree=False):
+  """gdn_fast_src's sweeps in C (sw_k0 / sw_p / sw_n / sw_nl: plain k / q rows, the compiler's schedule): the reference the asm
+  sweeps (gdn_asm.sweep_c) are checked against, and the kernel's sweeps with QWEN_GDN_ASM=0. `tree` (gdn_fast_src(tree=True)):
+  also sw_nb (sw_n storing s: a leaves' parent) and sw_lf (a leaf's read-only sums; st: the state decayed and stored too)."""
+  # the sweeps (C; `B` the block, k / q rows by pointer, two float8 halves a row). ROW opens a row, END closes it.
+  ROW = f"  for (int i = 0; i < {DK}; i++) {{ float8 b0 = *(__global float8*)(B + i * {W}), b1 = *(__global float8*)(B + i * {W} + 8);"
+  ST2 = lambda a, b: f" *(__global float8*)(B + i * {W}) = {a}; *(__global float8*)(B + i * {W} + 8) = {b};"
+  return f"""#define OPQ(v) __asm__("" : "+t"(v))                                     /* an opaque value: no fma contraction across it */
+/* K0: d = S dn (stored); kv += kn d */
+static inline __attribute__((always_inline)) void sw_k0(__global float* restrict B, __global float* restrict kn, float8 dn, float8* kv) {{
+  float8 kv0 = BC(0.0f), kv1 = BC(0.0f);
+{ROW} float8 nb = BC(kn[i]); float8 d0 = b0 * dn, d1 = b1 * dn;{ST2("d0", "d1")} kv0 += nb * d0; kv1 += nb * d1; }}
+  kv[0] = kv0; kv[1] = kv1;
+}}
+/* P (pb = 0): s = S + k dl; d = s dn (stored); kv += kn d.  PB (pb = 1): s stored instead (the committed state) */
+static inline __attribute__((always_inline)) void sw_p(__global float* restrict B, __global float* restrict kc, __global float* restrict kn, float8 dl0, float8 dl1, float8 dn, float8* kv, int pb) {{
+  float8 kv0 = BC(0.0f), kv1 = BC(0.0f);
+  if (pb) {{
+{ROW} float8 kb = BC(kc[i]), nb = BC(kn[i]); float8 s0 = b0 + kb * dl0, s1 = b1 + kb * dl1;{ST2("s0", "s1")} float8 d0 = s0 * dn, d1 = s1 * dn; kv0 += nb * d0; kv1 += nb * d1; }}
+  }} else {{
+{ROW} float8 kb = BC(kc[i]), nb = BC(kn[i]); float8 s0 = b0 + kb * dl0, s1 = b1 + kb * dl1; float8 d0 = s0 * dn, d1 = s1 * dn;{ST2("d0", "d1")} kv0 += nb * d0; kv1 += nb * d1; }}
+  }}
+  kv[0] = kv0; kv[1] = kv1;
+}}
+/* N (n1 = 0): s = S + k dl; o += q s; d = s dn (stored); kv += kn d.  N1 (n1 = 1): S stored undecayed: s = (S dc) + k dl */
+static inline __attribute__((always_inline)) void sw_n(__global float* restrict B, __global float* restrict kc, __global float* restrict qc, __global float* restrict kn,
+                                                       float8 dl0, float8 dl1, float8 dc, float8 dn, float8* kv, float8* o, int n1) {{
+  float8 kv0 = BC(0.0f), kv1 = BC(0.0f), o0 = BC(0.0f), o1 = BC(0.0f);
+  if (n1) {{
+{ROW} float8 kb = BC(kc[i]), qb = BC(qc[i]), nb = BC(kn[i]); float8 c0 = b0 * dc, c1 = b1 * dc; OPQ(c0); OPQ(c1);
+      float8 s0 = c0 + kb * dl0, s1 = c1 + kb * dl1; o0 += qb * s0; o1 += qb * s1; float8 d0 = s0 * dn, d1 = s1 * dn;{ST2("d0", "d1")} kv0 += nb * d0; kv1 += nb * d1; }}
+  }} else {{
+{ROW} float8 kb = BC(kc[i]), qb = BC(qc[i]), nb = BC(kn[i]); float8 s0 = b0 + kb * dl0, s1 = b1 + kb * dl1; o0 += qb * s0; o1 += qb * s1;
+      float8 d0 = s0 * dn, d1 = s1 * dn;{ST2("d0", "d1")} kv0 += nb * d0; kv1 += nb * d1; }}
+  }}
+  kv[0] = kv0; kv[1] = kv1; o[0] = o0; o[1] = o1;
+}}
+/* NL: s = S + k dl; o += q s (no store) */
+static inline __attribute__((always_inline)) void sw_nl(__global float* restrict B, __global float* restrict kc, __global float* restrict qc, float8 dl0, float8 dl1, float8* o) {{
+  float8 o0 = BC(0.0f), o1 = BC(0.0f);
+{ROW} float8 kb = BC(kc[i]), qb = BC(qc[i]); float8 s0 = b0 + kb * dl0, s1 = b1 + kb * dl1; o0 += qb * s0; o1 += qb * s1; }}
+  o[0] = o0; o[1] = o1;
+}}
+""" + ("" if not tree else f"""/* the leaf tree. NB (n1 = 0) / N1B (n1 = 1): sw_n with s stored instead of d (a leaves' parent: they read the state after it) */
+static inline __attribute__((always_inline)) void sw_nb(__global float* restrict B, __global float* restrict kc, __global float* restrict qc, __global float* restrict kn,
+                                                        float8 dl0, float8 dl1, float8 dc, float8 dn, float8* kv, float8* o, int n1) {{
+  float8 kv0 = BC(0.0f), kv1 = BC(0.0f), o0 = BC(0.0f), o1 = BC(0.0f);
+  if (n1) {{
+{ROW} float8 kb = BC(kc[i]), qb = BC(qc[i]), nb = BC(kn[i]); float8 c0 = b0 * dc, c1 = b1 * dc; OPQ(c0); OPQ(c1);
+      float8 s0 = c0 + kb * dl0, s1 = c1 + kb * dl1;{ST2("s0", "s1")} o0 += qb * s0; o1 += qb * s1; float8 d0 = s0 * dn, d1 = s1 * dn; kv0 += nb * d0; kv1 += nb * d1; }}
+  }} else {{
+{ROW} float8 kb = BC(kc[i]), qb = BC(qc[i]), nb = BC(kn[i]); float8 s0 = b0 + kb * dl0, s1 = b1 + kb * dl1;{ST2("s0", "s1")} o0 += qb * s0; o1 += qb * s1;
+      float8 d0 = s0 * dn, d1 = s1 * dn; kv0 += nb * d0; kv1 += nb * d1; }}
+  }}
+  kv[0] = kv0; kv[1] = kv1; o[0] = o0; o[1] = o1;
+}}
+/* LF (st = 0): a leaf's kq += kl S, qq += ql S (read only; kq -> kv, qq -> o).  LFD (st = 1): also d = S dn -> stored */
+static inline __attribute__((always_inline)) void sw_lf(__global float* restrict B, __global float* restrict kl, __global float* restrict ql, float8 dn, float8* kv, float8* o, int st) {{
+  float8 kq0 = BC(0.0f), kq1 = BC(0.0f), qq0 = BC(0.0f), qq1 = BC(0.0f);
+  if (st) {{
+{ROW} float8 kb = BC(kl[i]), qb = BC(ql[i]); kq0 += kb * b0; kq1 += kb * b1; qq0 += qb * b0; qq1 += qb * b1; float8 d0 = b0 * dn, d1 = b1 * dn;{ST2("d0", "d1")} }}
+  }} else {{
+{ROW} float8 kb = BC(kl[i]), qb = BC(ql[i]); kq0 += kb * b0; kq1 += kb * b1; qq0 += qb * b0; qq1 += qb * b1; }}
+  }}
+  kv[0] = kq0; kv[1] = kq1; o[0] = qq0; o[1] = qq1;
+}}
+""")
+
+def _gf_tree_chain(asm, M, MS, drain):
+  """gdn_fast_src(tree=True)'s chain over a state block: the previous path's pending updates (records PV(0..ap-1); asm: the KP
+  columns 0..ap-1, copied in path order), then the chain rows 0..nc-1. A chain row t with leaves (rows r >= nc of depth t + 1)
+  stores its state undecayed (NB; N1B when it also takes the decay first, as N1) and each leaf reads it: LF (kq = kl.S, qq = ql.S),
+  the last one LFD (the same, and S * decay(t + 1) stored: what N would have stored), its output then gdn_tokl_src's
+  o = qq d + (q.k) (v - kq d) beta. The chain rows' arithmetic is the chain kernel's (bit-identical under the chain table); a leaf
+  of the last chain row does not occur (spec_tree.build_leaf: a leaf is a sibling of a chain row >= 1)."""
+  P = (lambda f, *a: f"sa_{f}(B, " + ", ".join(a) + ", kv, o)") if asm else None
+  LEAF = f"""          {{ float8 db = BC(BDR({MS} + r)[1]), bt = BC(BDR({MS} + r)[0]), qk = BC(qkt[r]);   /* gdn_tokl_src's leaf output */
+            float8 dl0 = (*(__global float8*)(VR({MS} + r) + jv) - kv[0] * db) * bt, dl1 = (*(__global float8*)(VR({MS} + r) + jv + 8) - kv[1] * db) * bt;
+            *(__global float8*)(OR(r) + j0) = o[0] * db + qk * dl0; *(__global float8*)(OR(r) + j0 + 8) = o[1] * db + qk * dl1; }}
+"""
+  if asm:
+    pend = f"""      sa_K0p(B, KPV(0), BC(BDR(PV(0))[1]), kv, o);
+      for (int t = 0; t + 1 < ap; t++) {{ float8 d0 = DL(PV(t), 0), d1 = DL(PV(t), 1); sa_P(B, KPV(t), d0, d1, BC(BDR(PV(t + 1))[1]), kv, o); NOHWL(t); }}
+      {{ float8 d0 = DL(PV(ap - 1), 0), d1 = DL(PV(ap - 1), 1); sa_PB(B, KPV(ap - 1), KQ(0), d0, d1, BC(BDR({MS})[1]), kv, o); }}
+"""
+    k0n = f"sa_K0n(B, KQ(0), BC(BDR({MS})[1]), kv, o);"
+    row = f"""      if (lst < 0) {{ if (dk_) sa_N1(B, KQ(t), d0, d1, BC(BDR({MS} + t)[1]), dn, kv, o); else sa_N(B, KQ(t), d0, d1, dn, kv, o); }}
+      else         {{ if (dk_) sa_N1B(B, KQ(t), d0, d1, BC(BDR({MS} + t)[1]), dn, kv, o); else sa_NB(B, KQ(t), d0, d1, dn, kv, o); }}
+"""
+    leaf = "if (r == lst) sa_LFD(B, KQ(r), dn, kv, o); else sa_LF(B, KQ(r), kv, o);"
+    last = f"sa_NL(B, KQ(nc - 1), d0, d1, kv, o);"
+  else:
+    pend = f"""      sw_k0(B, KR(PV(0)), BC(BDR(PV(0))[1]), kv);
+      for (int t = 0; t + 1 < ap; t++) {{ float8 d0 = DL(PV(t), 0), d1 = DL(PV(t), 1); sw_p(B, KR(PV(t)), KR(PV(t + 1)), d0, d1, BC(BDR(PV(t + 1))[1]), kv, 0); }}
+      {{ float8 d0 = DL(PV(ap - 1), 0), d1 = DL(PV(ap - 1), 1); sw_p(B, KR(PV(ap - 1)), KR({MS}), d0, d1, BC(BDR({MS})[1]), kv, 1); }}
+"""
+    k0n = f"sw_k0(B, KR({MS}), BC(BDR({MS})[1]), kv);"
+    row = f"""      float8 dc = dk_ ? BC(BDR({MS} + t)[1]) : BC(0.0f);
+      if (lst < 0) sw_n(B, KR({MS} + t), QR(t), KR({MS} + t + 1), d0, d1, dc, dn, kv, o, dk_);
+      else         sw_nb(B, KR({MS} + t), QR(t), KR({MS} + t + 1), d0, d1, dc, dn, kv, o, dk_);
+"""
+    leaf = f"sw_lf(B, KR({MS} + r), QR(r), dn, kv, o, r == lst);"
+    last = f"sw_nl(B, KR({MS} + nc - 1), QR(nc - 1), d0, d1, o);"
+  return f"""    /* the leaf tree's chain ({"asm" if asm else "C"}): the previous path's pending updates, then chain rows 0..nc-1, each chain row's leaves after it */
+    int dk_ = 0;                                                      /* the block holds a state not yet decayed (N1 / N1B next) */
+    if (ap > 0) {{
+{pend}     {drain}
+      dk_ = 1;
+    }} else {k0n}
+    for (int t = 0; t + 1 < nc; t++) {{
+      int lst = -1; for (int r = nc; r < {M}; r++) if (dpa[r] == t + 1) lst = r;   /* the last leaf of chain row t (-1: none) */
+      float8 d0 = DL({MS} + t, 0), d1 = DL({MS} + t, 1), dn = BC(BDR({MS} + t + 1)[1]);
+{row}      *(__global float8*)(OR(t) + j0) = o[0]; *(__global float8*)(OR(t) + j0 + 8) = o[1]; dk_ = 0;
+      if (lst >= 0) {{
+        float8 kn0 = kv[0], kn1 = kv[1];                                /* (chain row t + 1's k.S, under the leaves' sums) */
+        for (int r = nc; r <= lst; r++) {{
+          NOHWL(r);
+          if (dpa[r] != t + 1) continue;
+          {leaf}
+{LEAF}        }}
+        kv[0] = kn0; kv[1] = kn1;
+      }}
+      NOHWL(t);
+    }}
+    {{ float8 d0 = DL({MS} + nc - 1, 0), d1 = DL({MS} + nc - 1, 1); {last}
+      *(__global float8*)(OR(nc - 1) + j0) = o[0]; *(__global float8*)(OR(nc - 1) + j0 + 8) = o[1]; }}
+"""
+
+def gdn_fast_src(NV, NK, DK, DV, C, CONV, H, nrb, eps, M, NG, MS, W=16, KB=128, sweeps="asm", diag=(), tree=False):
+  """The DeltaNet verify kernel with the commit deferred (gdn_defer_src's contract), restructured around FUSED SWEEPS: a state
+  block (DK x W fp32, in LSRAM) takes a token's update and the next token's decay + k.S in ONE pass over its rows, so T tokens
+  cost T + 1 passes instead of 2 T, and the previous pass's ap = accp[0] accepted updates and the M new tokens run as one chain:
+    K0  first token: d = S * decay -> stored; kv += k d
+    P   pending token u (u < ap - 1): s = S + k delta (S stored decayed); d = s * decay(u + 1) -> stored; kv(u + 1) += k(u + 1) d
+    PB  the last pending update: s -> stored (the committed state: drained to Sall, waited); kv(new 0) += k(new 0) (s * decay)
+    N1  new token 0 after PB: s = (S * decay) + k delta; o += q s; d = s * decay(1) -> stored; kv(1) += k(1) d
+    N   new token t: s = S + k delta; o += q s; d -> stored; kv(t + 1) += ...
+    NL  the last new token: s = S + k delta; o += q s (nothing stored: the new tokens' states are never written back)
+  Every element sees the old kernel's operations in its order (S * decay a rounded multiply, then fma(k, delta, .); the k.S and q.S
+  sums sequential over the rows from +0), so the committed state and every output are the old kernel's bits. M <= 8, MS <= GF_MS.
+  Per head the update inputs of the M new tokens (k, v, beta, decay: GD_SLOT floats a (head, token) slot, as gdn_defer_src) go
+  to `banks` [NG][NV][MS] for the next pass; the previous pass's are read first. args: gdn_defer_src's.
+  `sweeps` "asm" (default): the sweeps as hand-scheduled bundles (gdn_asm.sweep_c; the k / q rows in its KQN / KP layouts, built
+  at each head's start); "c": the C sweeps (gdn_sweeps_c, plain rows) -- the same arithmetic, the compiler's schedule.
+  `diag` (timing only, wrong results; GDN_TOKM_DIAG): "noab" no a|b loop, "noconv" no conv / norms, "nosweep" no sweeps,
+  "noout" no output rows, "nocopy" no C-tile rows into the conv's staging, "nosilu" the conv's SiLU left out, "conv2" each segment's conv twice, "dmaquiet" the conv with no DMA in flight, "notouch" no C-tile line touches, "outnoz" / "outnosw" the output rows without z / without the SiLU; "phases": the cycle counter (ctrl0 209) summed per phase, int32 [16] a task into o_rows' last row
+  (a padding row; its reads cost ~450 cycles each, so the totals carry them).
+  `tree` (QWEN_SPEC_TREE=leaf): the LEAF TREE's kernel `gdn_tokl` -- gdn_tokl_src's contract, arguments and results (+ `tree` =
+  spec_tree.table; accp = the previous pass's spec_tree.path_words): rows 0..nc-1 the chain, rows nc..M-1 leaves (depth d: a
+  sibling of chain row d, 1 <= d <= nc - 1). Every row's conv window by its depth; the pending updates are the records of the
+  previous path's rows (asm: copied into the KP / v / beta-decay rows in path order; C: indexed through it); the chain rows run as
+  above (_gf_tree_chain) except that a chain row with leaves stores its state undecayed (NB / N1B) and each leaf reads it (LF, the
+  last LFD storing the decayed state the next chain row expects), its output gdn_tokl_src's read-only formula. Under
+  spec_tree.chain_table and chain paths every result is gdn_fast_src's bit for bit; under trees gdn_tokl_src's (outputs, slots,
+  raw rows, the state written back): checked on the vendor simulator. tree=False: the source
+  is byte-identical to the chain kernel's.
+  """
+  D = set(diag); PH = "phases" in D
+  # tree (the leaf tree, QWEN_SPEC_TREE=leaf): the kernel `gdn_tokl` (gdn_tokl_src's contract and arguments) -- see the docstring
+  TR = bool(tree); DPX = (lambda e: f"dpt[{e}]") if TR else (lambda e: e); DPA = ", dpa" if TR else ""
+  QKT = lambda k, q: "" if not TR else (f"        for (int t = 0; t < {M}; t++) {{ float8 qk8 = BC(0.0f); for (int i = 0; i < {DK}; i += 8) qk8 += *(__global float8*)({k} + i) * "
+                                        f"*(__global float8*)({q} + i); qkt[t] = hsum8(qk8); }}   /* tree: q.k (a leaf's output), as gdn_tokl_src's */\n")
+  TREE0 = "" if not TR else f"""  /* tree: the rows' depths (dpa; nc = the chain rows: the first row r >= 1 whose depth is not r), the previous path's rows (pth: the
+     pending updates' records), q.k of the rows (qkt) */
+  int dpa[{M}], pth[{MS}], nc = {M}; float qkt[{M}];
+  for (int r = 0; r < {M}; r++) dpa[r] = tree[r];
+  for (int r = {M - 1}; r >= 1; r--) if (dpa[r] != r) nc = r;
+  for (int t = 0; t < {MS}; t++) pth[t] = t < ap ? accp[4 + t] : t;
+"""
+  # integer index math without `div` / `mod` (the scalar unit's divide is not a fast op): non-negative operands, powers of two by
+  # shift / mask, 3 by an exact multiply-shift (x < 2^15)
+  def IDIV(x, d):
+    if d & (d - 1) == 0: return f"((int)((unsigned)({x}) >> {d.bit_length() - 1}))"
+    assert d == 3; return f"((int)(((unsigned)({x}) * 43691u) >> 17))"
+  IMOD = lambda x, d: f"((int)((unsigned)({x}) & {d - 1}))" if d & (d - 1) == 0 else f"(({x}) - 3 * {IDIV(x, 3)})"
+  T = lambda k, t0="t_": f" ph{k} += CYC() - {t0};" if PH else ""          # phase k += now - t0
+  T0 = lambda v="t_": f" int {v} = CYC();" if PH else ""
+  REP = NV // NK; QO, KO, VO = 0, NK * DK, 2 * NK * DK; CP = ring_pitch(C); assert VO + NV * DV == C and DK == DV == 128 and W == 16
+  HPT, NB, BLK = gdn_hpt(NV), DV // W, DK * W * 4; NTU = -(-NV // HPT); LH = NV - (NTU - 1) * HPT
+  assert H % KB == 0 and 2 <= M <= 8 and M <= MS <= GF_MS
+  assert all(d & (d - 1) == 0 or d == 3 for d in (NB, REP, CONV))           # (IDIV / IMOD)
+  cf = gdn_fast_cfg(M, MS); DB, VG = cf["DB"], cf["VG"]; KA0, QA0, VA0, OA0, BD0 = cf["KA"], cf["QA"], cf["VA"], cf["OA"], cf["BD"]
+  VW = DV // VG; NBG = NB // VG                                             # v row floats resident; blocks a column group
+  SZ, SL = NV * DK * DV, MS * GD_SLOT
+  KBD = gdn_fast_kbd(M, HPT, KB, H); NSB = KBD // KB                      # a|b: DMA chunks of KBD columns, the sums in KB-column sub-chunks (as before)
+  XSZ, WSZ, NCH = M * KBD * 4, 2 * HPT * KBD * 4, H // KBD; XB, WB0 = 0, 2 * M * KBD * 4
+  assert WB0 + 2 * WSZ <= 32768 - 64
+  SEG = CONV * DK * 4; AREA = 2 * SEG; assert 2 * AREA <= BLK and M * 512 <= cf["BD"] - OA0
+  wacc = "".join(f" a{r} += xv * *(__global float8*)(WB + {r * KBD} + i);" for r in range(2 * HPT))
+  X = lambda r: f"R{r}" if r < CONV - 1 else f"(Rw + {(r - CONV + 1) * DK})"
+  # the C tiles' rows by 32-byte loads: 8 channels x a row quad are two 4 x 4 tiles, 128 contiguous bytes (LD8R's two 16-byte loads a
+  # token missed the cache one at a time); token t = lanes of u(4q + 0..3), q its row quad: the same values (data movement only)
+  QL = lambda q: f" float8 u{4 * q} = *(__global float8*)(tp + {64 * q}), u{4 * q + 1} = *(__global float8*)(tp + {64 * q + 8}), u{4 * q + 2} = *(__global float8*)(tp + {64 * q + 16}), u{4 * q + 3} = *(__global float8*)(tp + {64 * q + 24});"
+  TS = lambda t: (f"__builtin_shufflevector(u{4 * (t // 4) + (t % 4) // 2}, u{4 * (t // 4) + 2 + (t % 4) // 2}, " +
+                  ("0, 1, 2, 3, 8, 9, 10, 11)" if t % 2 == 0 else "4, 5, 6, 7, 12, 13, 14, 15)"))
+  TQ = lambda t: (QL(t // 4) if t % 4 == 0 else "") + f" *(__global float8*)(Rw + {t * DK} + i) = {TS(t)};"
+  CSEG = (f"""static inline __attribute__((always_inline)) void conv_seg(__global float* restrict ct, __global float* restrict A, __global float* restrict Rw, int pos, int off,
+                                                           __global float* restrict out{", int* restrict dpt" if TR else ""}{", int* restrict cs" if PH else ""}) {{
+{"  int c0_ = CYC();" if PH else ""}
+  {"" if "nocopy" in D or "notouch" in D else "NOUNROLL for (int i = 0; i < %d; i += 32) { __global float* tp = ct + CTA(off + i); __global float* tq = ct + CTA(off + i + 16);%s }" % (DK, "".join(f" TOUCH8(tp + {64 * q}, tq + {64 * q});" for q in range(-(-M // 4))))}
+{"  int c1_ = CYC(); cs[0] += c1_ - c0_;" if PH else ""}
+  NOUNROLL for (int i = 0; i < {0 if "nocopy" in D else DK}; i += 8) {{ __global float* tp = ct + CTA(off + i);""" + "".join(TQ(t) for t in range(M)) + " }\n" + ("  int c2_ = CYC(); cs[1] += c2_ - c1_;\n" if PH else "")
+      # one token's window and SiLU a loop (a body under the 32-bundle loop buffer: a body of M tokens is fetch-bound at 4 TECs);
+      # the window rows and the sums as gdn_tokm_src's (tap CONV - 1 first; a ring row of a position < 0 left out)
+      + "".join(f"  int p{r} = pos - {CONV - 1 - r}; __global float* R{r} = A + ({CONV} + {IMOD(f'(p{r} >= 0 ? p{r} : 0)', CONV)}) * {DK};\n" for r in range(CONV - 1))
+      # the conv proper: tokens in pairs (two independent SiLU chains a loop body: the chain is ~20 dependent ops) while every window
+      # term is present (pos >= CONV - 1), else one token a loop with the terms' guards; the sums as gdn_tokm_src's either way
+      + "".join(f"  #define XW{tt}(t) ((t) + {tt} < {CONV - 1} ? (" + " : ".join(f"(t) + {tt} == {r} ? R{r}" for r in range(CONV - 2)) + f" : R{CONV - 2}) : Rw + ((t) + {tt - (CONV - 1)}) * {DK})\n" for tt in range(CONV - 1))
+      + f"""  int t0 = 0;
+  if (pos >= {CONV - 1}) {{
+    for (; t0 + 1 < {M}; t0 += 2) {{
+      NOHWL(t0);
+""" + "".join(f"      __global float* x{tt}a = XW{tt}({DPX('t0')}); __global float* x{tt}b = XW{tt}({DPX('t0 + 1')});\n" for tt in range(CONV - 1))
+      + f"""      __global float* xra = Rw + t0 * {DK}; __global float* xrb = xra + {DK}; __global float* oa = out + t0 * {DK}; __global float* ob = oa + {DK};
+      NOUNROLL for (int i = 0; i < {DK}; i += 8) {{
+        float8 acc = *(__global float8*)(xra + i) * *(__global float8*)(A + {(CONV - 1) * DK} + i);""" + "".join(f" acc += *(__global float8*)(x{tt}a + i) * *(__global float8*)(A + {tt * DK} + i);" for tt in range(CONV - 1)) + f"""
+        float8 acb = *(__global float8*)(xrb + i) * *(__global float8*)(A + {(CONV - 1) * DK} + i);""" + "".join(f" acb += *(__global float8*)(x{tt}b + i) * *(__global float8*)(A + {tt * DK} + i);" for tt in range(CONV - 1)) + """
+        *(__global float8*)(oa + i) = """ + ("acc" if "nosilu" in D else "sw(acc, BC(1.0f))") + "; *(__global float8*)(ob + i) = " + ("acb" if "nosilu" in D else "sw(acb, BC(1.0f))") + """;
+      }
+    }
+  }
+""" + f"""  for (int t = t0; t < {M}; t++) {{
+    NOHWL(t);
+""" + "".join(f"    __global float* x{tt} = XW{tt}({DPX('t')});\n" for tt in range(CONV - 1))
+      + "".join(f"    int c{tt} = {DPX('t')} + {tt} >= {CONV - 1} || pos + {DPX('t')} + {tt - (CONV - 1)} >= 0;\n" for tt in range(CONV - 1))
+      + f"""    __global float* xr = Rw + t * {DK}; __global float* o = out + t * {DK};
+    if ({" && ".join(f"c{tt}" for tt in range(CONV - 1))})
+      NOUNROLL for (int i = 0; i < {DK}; i += 8) {{ float8 acc = *(__global float8*)(xr + i) * *(__global float8*)(A + {(CONV - 1) * DK} + i);""" + "".join(f" acc += *(__global float8*)(x{tt} + i) * *(__global float8*)(A + {tt * DK} + i);" for tt in range(CONV - 1)) + " *(__global float8*)(o + i) = " + ("acc" if "nosilu" in D else "sw(acc, BC(1.0f))") + """; }
+    else
+      NOUNROLL for (int i = 0; i < """ + str(DK) + """; i += 8) { float8 acc = *(__global float8*)(xr + i) * *(__global float8*)(A + """ + str((CONV - 1) * DK) + """ + i);""" + "".join(f" if (c{tt}) acc += *(__global float8*)(x{tt} + i) * *(__global float8*)(A + {tt * DK} + i);" for tt in range(CONV - 1)) + " *(__global float8*)(o + i) = " + ("acc" if "nosilu" in D else "sw(acc, BC(1.0f))") + """; }
+  }
+""" + "".join(f"  #undef XW{tt}\n" for tt in range(CONV - 1)) + ("  cs[2] += CYC() - c2_;\n" if PH else "") + """}
+""")
+  ASM = sweeps == "asm"; assert sweeps in ("asm", "c")
+  ci = CSEG.index("  int p0 = pos - "); CBODY = CSEG[ci:CSEG.rindex("}")]                       # the conv's compute part (after the copy)
+  CSEG2 = "" if not (ASM and DB and VG == 1 and M <= 4) else (
+    f"""static inline __attribute__((always_inline)) void conv_cm(__global float* restrict A, __global float* restrict Rw, int pos, __global float* restrict out{", int* restrict dpt" if TR else ""}{", int* restrict cs" if PH else ""}) {{
+{"  int c2_ = CYC();" if PH else ""}
+""" + CBODY + f"""}}
+/* CTD: a segment's raw rows (row quad 0) from its virtual strips in LSRAM (SB: virtual strip v0 of channel `off` first) */
+static inline __attribute__((always_inline)) void conv_cpl(__global float* restrict SB, __global float* restrict Rw, int off) {{
+  int s0_ = off >> 4, v0_ = 6 * {IDIV("s0_", 3)} + (s0_ - 3 * {IDIV("s0_", 3)});
+  NOUNROLL for (int i = 0; i < {DK}; i += 8) {{
+    int sg_ = s0_ + (i >> 4); __global float* tp = SB + (6 * {IDIV("sg_", 3)} + (sg_ - 3 * {IDIV("sg_", 3)}) - v0_) * 64 + ((i >> 3) & 1) * 32;""" + "".join(TQ(t) for t in range(M)) + """
+  }
+}
+""")
+  # CTD (asm, two state buffers, whole v rows, M <= 4): the C tiles' row quad 0 of a 128-channel segment by ONE DMA -- the 8 strips
+  # read as uniformly spaced "virtual strips" (both row blocks' strips, 768 B apart: the other block's come along) into the current
+  # state buffer, free during a head's start (its block-0 fill is issued after the start) and at the head's end (z)
+  CTD = ASM and DB and VG == 1 and M <= 4
+  SWEEPS = "".join(gdn_asm.sweep_c(k, M, MS) for k in ("K0p", "K0n", "P", "PB", "N1", "N", "NL") + (("NB", "N1B", "LF", "LFD") if TR else ())) if ASM else gdn_sweeps_c(DK, W, tree=TR)
+  if "nosweep" in D: SWEEPS += "".join(f"#define {n}(...) ((void)0)\n" for n in ("sa_K0p", "sa_K0n", "sa_P", "sa_PB", "sa_N1", "sa_N", "sa_NL", "sw_k0", "sw_p", "sw_n", "sw_nl"))
+  KQN0, KP0 = KA0, KA0 + M * 1024                                          # asm: [4-row group][new token] (k | q), [8-row group][pending slot] k
+  CHAIN = (f"""    /* the chain (asm): pending 0..ap-1 (KP slots), then new 0..M-1 (KQN); one call site a sweep (text) */
+    int t1 = 0;
+    if (ap > 0) {{
+      sa_K0p(B, KPV(0), BC(BDR(0)[1]), kv, o);
+      for (int t = 0; t + 1 < ap; t++) {{ float8 d0 = DL(t, 0), d1 = DL(t, 1); sa_P(B, KPV(t), d0, d1, BC(BDR(t + 1)[1]), kv, o); NOHWL(t); }}
+      {{ float8 d0 = DL(ap - 1, 0), d1 = DL(ap - 1, 1); sa_PB(B, KPV(ap - 1), KQ(0), d0, d1, BC(BDR({MS})[1]), kv, o); }}
+     {T0("td_")} if (p == 0) {{ DMA_DRAIN(2, DESC(desc, 0), 0, (int)UBASE(u)); DMA_WAIT(2); }} else {{ DMA_DRAIN(3, DESC(desc, 0), {BLK}, (int)UBASE(u)); DMA_WAIT(3); }}{T(4, "td_")}
+      {{ float8 d0 = DL({MS}, 0), d1 = DL({MS}, 1); sa_N1(B, KQ(0), d0, d1, BC(BDR({MS})[1]), BC(BDR({MS} + 1)[1]), kv, o); }}
+      *(__global float8*)(OR(0) + j0) = o[0]; *(__global float8*)(OR(0) + j0 + 8) = o[1]; t1 = 1;
+    }} else sa_K0n(B, KQ(0), BC(BDR({MS})[1]), kv, o);
+    for (int t = t1; t + 1 < {M}; t++) {{
+      float8 d0 = DL({MS} + t, 0), d1 = DL({MS} + t, 1); sa_N(B, KQ(t), d0, d1, BC(BDR({MS} + t + 1)[1]), kv, o);
+      *(__global float8*)(OR(t) + j0) = o[0]; *(__global float8*)(OR(t) + j0 + 8) = o[1]; NOHWL(t);
+    }}
+    {{ float8 d0 = DL({MS + M - 1}, 0), d1 = DL({MS + M - 1}, 1); sa_NL(B, KQ({M - 1}), d0, d1, kv, o);
+      *(__global float8*)(OR({M - 1}) + j0) = o[0]; *(__global float8*)(OR({M - 1}) + j0 + 8) = o[1]; }}
+""" if ASM else f"""    /* the chain: pending 0..ap-1 (rows KR(0..ap-1)), then new 0..M-1 (KR(MS + t), QR(t)) */
+    if (ap > 0) {{
+      sw_k0(B, KR(0), BC(BDR(0)[1]), kv);
+      for (int t = 0; t + 1 < ap; t++) {{ float8 d0 = DL(t, 0), d1 = DL(t, 1); sw_p(B, KR(t), KR(t + 1), d0, d1, BC(BDR(t + 1)[1]), kv, 0); }}
+      {{ float8 d0 = DL(ap - 1, 0), d1 = DL(ap - 1, 1); sw_p(B, KR(ap - 1), KR({MS}), d0, d1, BC(BDR({MS})[1]), kv, 1); }}
+      if (p == 0) {{ DMA_DRAIN(2, DESC(desc, 0), 0, (int)UBASE(u)); DMA_WAIT(2); }} else {{ DMA_DRAIN(3, DESC(desc, 0), {BLK}, (int)UBASE(u)); DMA_WAIT(3); }}
+      {{ float8 d0 = DL({MS}, 0), d1 = DL({MS}, 1); sw_n(B, KR({MS}), QR(0), KR({MS} + 1), d0, d1, BC(BDR({MS})[1]), BC(BDR({MS} + 1)[1]), kv, o, 1); }}
+    }} else {{
+      sw_k0(B, KR({MS}), BC(BDR({MS})[1]), kv);
+      {{ float8 d0 = DL({MS}, 0), d1 = DL({MS}, 1); sw_n(B, KR({MS}), QR(0), KR({MS} + 1), d0, d1, BC(0.0f), BC(BDR({MS} + 1)[1]), kv, o, 0); }}
+    }}
+    *(__global float8*)(OR(0) + j0) = o[0]; *(__global float8*)(OR(0) + j0 + 8) = o[1];
+    for (int t = 1; t + 1 < {M}; t++) {{
+      float8 d0 = DL({MS} + t, 0), d1 = DL({MS} + t, 1); sw_n(B, KR({MS} + t), QR(t), KR({MS} + t + 1), d0, d1, BC(0.0f), BC(BDR({MS} + t + 1)[1]), kv, o, 0);
+      *(__global float8*)(OR(t) + j0) = o[0]; *(__global float8*)(OR(t) + j0 + 8) = o[1];
+    }}
+    {{ float8 d0 = DL({MS + M - 1}, 0), d1 = DL({MS + M - 1}, 1); sw_nl(B, KR({MS + M - 1}), QR({M - 1}), d0, d1, o);
+      *(__global float8*)(OR({M - 1}) + j0) = o[0]; *(__global float8*)(OR({M - 1}) + j0 + 8) = o[1]; }}
+""")
+  if TR: CHAIN = _gf_tree_chain(ASM, M, MS, f"{T0('td_')} if (p == 0) {{ DMA_DRAIN(2, DESC(desc, 0), 0, (int)UBASE(u)); DMA_WAIT(2); }} else {{ DMA_DRAIN(3, DESC(desc, 0), {BLK}, (int)UBASE(u)); DMA_WAIT(3); }}{T(4, 'td_')}")
+  STG = "(1 - p) * %d" % BLK if DB else "0"                                 # the prep's staging: the idle state buffer (DB) / the one buffer
+  VNEW = f"LSF({VA0 + MS * VW * 4})" if VG == 1 else f"LSF({VA0})"          # where the v segment's conv lands (VG 2: a temp, then the scratch)
+  PREP_C = f"""    if (jb == 0) {{                                                    /* head start: the pending updates' inputs in, q / k / v of the M new tokens */
+      int fa = 1 - p, fb = 2 + p, fc = 3 - p, sb = {STG}, qk = h == h0 || {IMOD("h", REP)} == 0, ns = qk ? 3 : 1;
+      DMA_WAIT(fa); DMA_WAIT(fb); DMA_WAIT(fc);
+      DMA_FILL(fa, DESC(desc, 5), {KA0}, (int)sl); {"DMA_FILL(fb, DESC(desc, 6), %d, (int)(sl + 128));" % VA0 if VG == 1 else ""} DMA_FILL(fc, DESC(desc, 7), {BD0}, (int)(sl + 256));
+      DMA_WAIT(fa); DMA_WAIT(fb); DMA_WAIT(fc);
+      int on = qk ? {QO} + j * {DK} : {VO} + h * {DV};
+      DMA_FILL(fa, DESC(desc, 3), sb, (int)(cwt + on)); DMA_FILL(fb, DESC(desc, 3), sb + {SEG}, (int)(Cr + on));
+      for (int s = 0; s < ns; s++) {{                                 /* segments: q, k, v (qk) or v */
+        int a = sb + (s & 1) * {AREA}, off = on, v = s == ns - 1;
+        DMA_WAIT(fa); DMA_WAIT(fb); DMA_WAIT(fc);
+        if (s + 1 < ns) {{
+          int an = sb + ((s + 1) & 1) * {AREA}; on = s == 0 ? {KO} + j * {DK} : {VO} + h * {DV};
+          DMA_FILL(fa, DESC(desc, 3), an, (int)(cwt + on)); DMA_FILL(fb, DESC(desc, 3), an + {SEG}, (int)(Cr + on));
+        }}
+        conv_seg(x, LSF(a), LSF({OA0}), pos, off, v ? {VNEW} : s == 0 ? QR(0) : KR({MS}){DPA}{", cs_" if PH else ""});
+        if (v || {IMOD("h", REP)} == 0) DMA_DRAIN(fc, DESC(desc, 4), {OA0}, (int)(raw + off));
+      }}
+      if (qk) for (int t = 0; t < {M}; t++) {{ l2n(QR(t), {1.0 / DK ** 0.5!r}f); l2n(KR({MS} + t), 1.0f); }}
+{"      if (qk) " + QKT("KR(%d + t)" % MS, "QR(t)").lstrip() if TR else ""}      for (int t = 0; t < {M}; t++) {{ BDR({MS} + t)[0] = bb[t][h - h0]; BDR({MS} + t)[1] = dd[t][h - h0]; }}
+      DMA_WAIT(fc);                                                   /* (the raw rows' last drain: the o rows are free from here) */
+      /* this pass's update inputs of head h out ({"v rows to the scratch; the slots' v at the head's end" if VG == 2 else "k, v, beta / decay"}) */
+      DMA_DRAIN(fa, DESC(desc, 8), {KA0 + MS * 512}, (int)sl); DMA_DRAIN(fc, DESC(desc, 10), {BD0 + MS * 64}, (int)(sl + 256));
+      {"DMA_DRAIN(fb, DESC(desc, 9), %d, (int)(sl + 128));" % (VA0 + MS * 512) if VG == 1 else "DMA_DRAIN(fb, DESC(desc, 11), %d, (int)(banks + %d + core_id * %d));" % (VA0, NG * NV * SL, M * 128)}
+      DMA_WAIT(fa); DMA_WAIT(fb); DMA_WAIT(fc);
+    }}
+"""
+  MERGE = VG == 1 and MS * GD_SLOT * 4 <= BLK and M * GD_SLOT * 4 <= BLK   # the pending / new records in one request each (they fit the staging)
+  PREP_ASM = f"""    if (jb == 0) {{                                                    /* head start (asm layouts): q / k / v of the M new tokens, the pending updates' inputs */
+      int fa = 1 - p, fb = 2 + p, fc = 3 - p, sb = {STG}, qk = h == h0 || {IMOD("h", REP)} == 0, ns = qk ? 3 : 1;
+     {T0("t8_")} DMA_WAIT(fa); DMA_WAIT(fb); DMA_WAIT(fc);{T(8, "t8_")}
+{"" if MERGE else f"""      {"DMA_FILL(fb, DESC(desc, 6), %d, (int)(sl + 128));" % VA0 if VG == 1 else ""} DMA_FILL(fc, DESC(desc, 7), {BD0}, (int)(sl + 256));   /* pending v (VG 1), beta / decay */
+      DMA_WAIT(fb); DMA_WAIT(fc);
+"""}      int on = {VO} + h * {DV};
+      DMA_FILL(fa, DESC(desc, 3), sb, (int)(cwt + on)); DMA_FILL(fb, DESC(desc, 3), sb + {SEG}, (int)(Cr + on));{" CTS(p, p * %d, x, on);   /* CTD: the segment's C tiles into this block's (not yet filled) buffer */" % BLK if CTD else ""}
+      for (int s = 0; s < ns; s++) {{                                 /* segments: v, then (qk) q into the KP rows, k into the staging's free area */
+        int a = sb + (s & 1) * {AREA}, off = on;
+       {T0("t9_")} DMA_WAIT(fa); DMA_WAIT(fb); DMA_WAIT(fc);{" DMA_WAIT(p);" if CTD else ""}{T(9, "t9_")}{chr(10) + "        conv_cpl(LSF(p * %d), LSF(%d), off); if (s == ns - 1) DMA_FILL(p, DESC(desc, 0), p * %d, (int)UBASE(u));   /* the buffer is free: the head's block 0 */" % (BLK, OA0, BLK) if CTD else ""}
+        if (s + 1 < ns) {{
+          int an = sb + ((s + 1) & 1) * {AREA}; on = s == 0 ? {QO} + j * {DK} : {KO} + j * {DK};
+          DMA_FILL(fa, DESC(desc, 3), an, (int)(cwt + on)); DMA_FILL(fb, DESC(desc, 3), an + {SEG}, (int)(Cr + on));{" CTS(p, p * %d, x, on);" % BLK if CTD else ""}
+        }}{f"{chr(10)}       {T0('tq_')} DMA_WAIT(fa); DMA_WAIT(fb); DMA_WAIT(fc);{T(9, 'tq_')}   /* diag dmaquiet: no DMA in flight under the conv */" if "dmaquiet" in D else ""}
+       {T0("ta_")} {"" if "noconv" in D else (" __asm__ volatile(\"\" ::: \"memory\"); " if "conv2" in D else "").join([("conv_cm(LSF(a), LSF(%d), pos, s == 0 ? %s : s == 1 ? LSF(%d) : LSF(sb + %d)%s%s);" % (OA0, VNEW, KP0, AREA, DPA, ", cs_" if PH else "")) if CTD else ("conv_seg(x, LSF(a), LSF(%d), pos, off, s == 0 ? %s : s == 1 ? LSF(%d) : LSF(sb + %d)%s%s);" % (OA0, VNEW, KP0, AREA, DPA, ", cs_" if PH else ""))] * (2 if "conv2" in D else 1))}
+{T(10, "ta_")}
+        if (s == 0 || {IMOD("h", REP)} == 0) DMA_DRAIN(fc, DESC(desc, 4), {OA0}, (int)(raw + off));
+      }}
+     {T0("tb_")}
+      if ({"0" if "noconv" in D else "qk"}) {{                                                        /* q / k normed as gdn_tokm_src's (one loop, literal scales), then KQN */
+        __global float* qt = LSF({KP0}); __global float* kt = LSF(sb + {AREA});
+        NOUNROLL for (int t = 0; t < {M}; t++) {{ l2n(qt + t * {DK}, {1.0 / DK ** 0.5!r}f); l2n(kt + t * {DK}, 1.0f); }}
+{QKT("kt + t * %d" % DK, "qt + t * %d" % DK)}        for (int t = 0; t < {M}; t++) NOUNROLL for (int c = 0; c < {DK // 8}; c++) {{
+          float8 k8 = *(__global float8*)(kt + t * {DK} + 8 * c), q8 = *(__global float8*)(qt + t * {DK} + 8 * c); __global float* v0 = KQ(t) + 2 * c * {M * 8};
+          *(__global float8*)v0 = __builtin_shufflevector(k8, q8, 0, 1, 2, 3, 8, 9, 10, 11); *(__global float8*)(v0 + {M * 8}) = __builtin_shufflevector(k8, q8, 4, 5, 6, 7, 12, 13, 14, 15);
+        }}
+      }}
+{T(11, "tb_")}
+      for (int t = 0; t < {M}; t++) {{ BDR({MS} + t)[0] = bb[t][h - h0]; BDR({MS} + t)[1] = dd[t][h - h0]; }}
+     {T0("tc2_")}
+{f"""      DMA_FILL(fa, DESC(desc, 14), sb, (int)sl);                    /* the MS pending records (k | v | beta, decay) in one request (the staging is free now) */
+      DMA_WAIT(fc);                                                   /* (the raw rows' last drain) */
+      DMA_WAIT(fa);
+      for (int u = 0; u < {MS}; u++) {{                                /* -> KP [8-row group][slot], the v rows, beta / decay */
+        __global float* rc = LSF(sb) + {"pth[u]" if TR else "u"} * {GD_SLOT};
+        NOUNROLL for (int g = 0; g < {DK // 8}; g++) {{ *(__global float8*)(KPV(u) + g * {MS * 8}) = *(__global float8*)(rc + 8 * g); *(__global float8*)(VR(u) + 8 * g) = *(__global float8*)(rc + {DK} + 8 * g); }}
+        *(__global float8*)BDR(u) = *(__global float8*)(rc + {2 * DK}); *(__global float8*)(BDR(u) + 8) = *(__global float8*)(rc + {2 * DK} + 8);
+      }}
+      for (int t = 0; t < {M}; t++) {{                                  /* this pass's M records (k out of KQN | v | beta, decay), drained in one request */
+        __global float* rc = LSF(sb) + t * {GD_SLOT};
+        NOUNROLL for (int c = 0; c < {DK // 8}; c++) {{
+          __global float* v0 = KQ(t) + 2 * c * {M * 8};
+          *(__global float8*)(rc + 8 * c) = __builtin_shufflevector(*(__global float8*)v0, *(__global float8*)(v0 + {M * 8}), 0, 1, 2, 3, 8, 9, 10, 11);
+          *(__global float8*)(rc + {DK} + 8 * c) = *(__global float8*)(VR({MS} + t) + 8 * c);
+        }}
+        *(__global float8*)(rc + {2 * DK}) = *(__global float8*)BDR({MS} + t); *(__global float8*)(rc + {2 * DK} + 8) = *(__global float8*)(BDR({MS} + t) + 8);
+      }}
+      DMA_DRAIN(fa, DESC(desc, 15), sb, (int)sl);
+""" if MERGE else f"""      DMA_FILL(fa, DESC(desc, 5), sb, (int)sl);                     /* the pending k rows (the staging is free now) */
+      DMA_WAIT(fc);                                                   /* (the raw rows' last drain: the o rows are free from here) */
+      for (int t = 0; t < {M}; t++) for (int c = 0; c < {DK // 8}; c++) {{   /* the new k rows back out of KQN, for the slots */
+        __global float* v0 = KQ(t) + 2 * c * {M * 8};
+        *(__global float8*)(OR(t) + 8 * c) = __builtin_shufflevector(*(__global float8*)v0, *(__global float8*)(v0 + {M * 8}), 0, 1, 2, 3, 8, 9, 10, 11);
+      }}
+      DMA_WAIT(fa);
+      for (int u = 0; u < {MS}; u++) for (int g = 0; g < {DK // 8}; g++)   /* the pending k rows -> KP [8-row group][slot] */
+        *(__global float8*)(KPV(u) + g * {MS * 8}) = *(__global float8*)(LSF(sb) + {"pth[u]" if TR else "u"} * {DK} + 8 * g);
+      /* this pass's update inputs of head h out ({"v rows to the scratch; the slots' v at the head's end" if VG == 2 else "k, v, beta / decay"}) */
+      DMA_DRAIN(fa, DESC(desc, 8), {OA0}, (int)sl); DMA_DRAIN(fc, DESC(desc, 10), {BD0 + MS * 64}, (int)(sl + 256));
+      {"DMA_DRAIN(fb, DESC(desc, 9), %d, (int)(sl + 128));" % (VA0 + MS * 512) if VG == 1 else "DMA_DRAIN(fb, DESC(desc, 11), %d, (int)(banks + %d + core_id * %d));" % (VA0, NG * NV * SL, M * 128)}
+"""}      DMA_WAIT(fa); DMA_WAIT(fb); DMA_WAIT(fc);{T(12, "tc2_")}
+    }}
+"""
+  src = V.FULL_H + TILE + EXP + f"""
+#define CTX(c) ((int)((unsigned)(c) >> 4))                                /* (c a channel >= 0) */
+#define CTG(c) ((int)(((unsigned)CTX(c) * 43691u) >> 17))                  /* c / 48 = (c >> 4) / 3, exact for c >> 4 < 2^15 */
+#define CTA(c) ((CTG(c) * {nrb * 3} + (CTX(c) - 3 * CTG(c))) * 192 + ((int)((unsigned)(c) >> 2) & 3) * 16)   /* no div / mod */
+#define LD8R(ct, c, r) F8(*(__global float4*)((ct) + CTA(c) + ((int)((unsigned)(r) >> 2)) * 64 + 4 * ((r) & 3)), *(__global float4*)((ct) + CTA(c) + ((int)((unsigned)(r) >> 2)) * 64 + 16 + 4 * ((r) & 3)))
+static inline __attribute__((always_inline)) float ex1(float t) {{ return hsum8(exp2_d4(BC(t * 1.4426950408889634f))) * 0.125f; }}
+static inline __attribute__((always_inline)) float softplus1(float t) {{
+  float at = t < 0.0f ? -t : t; float y = ex1(-at); float s = y / (2.0f + y), s2 = s * s;
+  float l = 2.0f * s * (1.0f + s2 * ({1/3!r}f + s2 * (0.2f + s2 * ({1/7!r}f + s2 * ({1/9!r}f + s2 * ({1/11!r}f + s2 * {1/13!r}f))))));
+  return (t > 0.0f ? t : 0.0f) + l;
+}}
+#define NOHWL(i) __asm__ volatile("" : "+r"(i))                        /* an opaque loop counter: the compiler makes no hardware loop of it */
+#define CYC() ({{ int c_; __asm__ volatile("mfctrl0 %0, 209" : "=r"(c_)); c_; }})   /* the TEC's cycle counter (diag "phases") */
+#define NOUNROLL _Pragma("clang loop unroll(disable)")                 /* small text: code run once a head is fetched cold (~90 cycles a bundle) */
+/* touch a DDR line (a vector load kept by `volatile`, its value unused): a burst of these keeps ~4 line misses in flight, where a
+   load consumed at once waits for its line alone (~270 ns) -- the C tiles' rows are read cold once a head. TOUCH4: a 16-channel strip's row quad, 4 lines, 4 registers (a load into a register
+   whose previous load is still outstanding waits for it) */
+#define TOUCH4(p) __asm__ volatile("{{\\n ld t28, [%0+0]\\n ld t29, [%0+64]\\n}}\\n{{\\n ld t30, [%0+128]\\n ld t31, [%0+192]\\n}}\\n" :: "r"(p) : "t28", "t29", "t30", "t31")
+#define TOUCH8(p, q) __asm__ volatile("{{\\n ld t24, [%0+0]\\n ld t25, [%0+64]\\n}}\\n{{\\n ld t26, [%0+128]\\n ld t27, [%0+192]\\n}}\\n{{\\n ld t28, [%1+0]\\n ld t29, [%1+64]\\n}}\\n{{\\n ld t30, [%1+128]\\n ld t31, [%1+192]\\n}}\\n" :: "r"(p), "r"(q) : "t24", "t25", "t26", "t27", "t28", "t29", "t30", "t31")
+{CSEG}{CSEG2}static inline __attribute__((always_inline)) void l2n(__global float* restrict v, float scale) {{
+  float8 s = BC(0.0f); NOUNROLL for (int i = 0; i < {DK}; i += 8) {{ float8 a = *(__global float8*)(v + i); s += a * a; }}
+  float8 inv = BC(scale / __builtin_sqrtf(hsum8(s) + 1e-6f)); NOUNROLL for (int i = 0; i < {DK}; i += 8) *(__global float8*)(v + i) = *(__global float8*)(v + i) * inv;
+}}
+
+{SWEEPS}__kernel void {"gdn_tokl" if TR else "gdn_tokm"}(__global float* restrict out, __global float* restrict Sall, __global float* restrict Call, __global int* restrict idx,
+                       __global int* restrict posb, __global float* restrict x, __global float* restrict z, __global float* restrict xin,
+                       __global float* restrict wab, __global float* restrict adt, __global float* restrict cwt, __global float* restrict nw,
+                       __global int* restrict desc, __global float* restrict banks, __global float* restrict rawm, __global int* restrict accp, {"__global int* restrict tree, " if TR else ""}const int core_id) {{
+{"  if (core_id >= %d) return;                                       /* NTU tasks own the heads */\n" % NTU if NTU < NT else ""}  int L = idx[0], pos = posb[0], ap = accp[0]; __global float* S = Sall + L * {SZ}; __global float* Cr = Call + L * {CONV * CP};
+{TREE0}{"  int ph0 = 0, ph1 = 0, ph2 = 0, ph3 = 0, ph4 = 0, ph5 = 0, ph6 = 0, ph7 = 0, ph8 = 0, ph9 = 0, ph10 = 0, ph11 = 0, ph12 = 0; int cs_[3] = {0, 0, 0}; int tk0 = CYC();" + chr(10) if PH else ""}
+  cwt += L * {CONV * CP}; nw += L * {DV}; adt += L * {2 * NV}; int h0 = core_id * {HPT}, nh = core_id == {NTU - 1} ? {LH} : {HPT};
+  __global float* raw = rawm + L * {M * CP};
+  /* ---- a | b of the task's heads for the M rows (gdn_tokm_src's, unchanged) */
+  __global float* wt = wab + L * {NTU * 2 * HPT * H} + core_id * {2 * HPT * H};
+  float acc[{M}][{2 * HPT}], sq[{M}];
+  for (int r = 0; r < {M}; r++) {{ sq[r] = 0.0f; for (int q = 0; q < {2 * HPT}; q++) acc[r][q] = 0.0f; }}
+  {"" if "noab" in D else "DMA_FILL(2, DESC(desc, 1), %d, (int)xin); DMA_FILL(0, DESC(desc, 2), %d, (int)wt);" % (XB, WB0)}
+  for (int c = 0; c < {0 if "noab" in D else NCH}; c++) {{
+    int p = c & 1;
+    if (c + 1 < {NCH}) {{
+      if (p == 0) {{ DMA_FILL(3, DESC(desc, 1), {XB + XSZ}, (int)(xin + (c + 1) * {KBD})); DMA_FILL(1, DESC(desc, 2), {WB0 + WSZ}, (int)(wt + (c + 1) * {KBD})); }}
+      else        {{ DMA_FILL(2, DESC(desc, 1), {XB}, (int)(xin + (c + 1) * {KBD})); DMA_FILL(0, DESC(desc, 2), {WB0}, (int)(wt + (c + 1) * {KBD})); }}
+    }}
+    if (p == 0) {{ DMA_WAIT(0); DMA_WAIT(2); }} else {{ DMA_WAIT(1); DMA_WAIT(3); }}
+    for (int cc = 0; cc < {NSB}; cc++)                                /* the KB-column sub-chunks, in order */
+    for (int r = 0; r < {M}; r++) {{
+      __global float* WB = LSF({WB0} + p * {WSZ}) + cc * {KB};
+      __global float* xc = LSF({XB} + p * {XSZ}) + r * {KBD} + cc * {KB};
+      float8 sq8 = BC(0.0f), {", ".join(f"a{r_} = BC(0.0f)" for r_ in range(2 * HPT))};
+      NOUNROLL for (int i = 0; i < {KB}; i += 8) {{ float8 xv = *(__global float8*)(xc + i); sq8 += xv * xv;{wacc} }}
+      sq[r] += hsum8(sq8); {" ".join(f"acc[r][{q}] += hsum8(a{q});" for q in range(2 * HPT))}
+    }}
+  }}
+  float bb[{M}][{HPT}], dd[{M}][{HPT}];
+  for (int r = 0; r < {M}; r++) {{
+    float inv = 1.0f / __builtin_sqrtf(sq[r] * {1.0 / H!r}f + {eps!r}f);
+    for (int q = 0; q < nh; q++) {{
+      bb[r][q] = 1.0f / (1.0f + ex1(-acc[r][{HPT} + q] * inv));
+      dd[r][q] = ex1(adt[h0 + q] * softplus1(acc[r][q] * inv + adt[{NV} + h0 + q]));
+    }}
+  }}
+{"  ph0 += CYC() - tk0;                                               /* phase 0: the a|b rows */" + chr(10) if PH else ""}  /* ---- the delta rule. LSRAM: state buffer(s) | k rows [MS pending | M new] | q rows [M] | v rows [MS | M] ({VW} floats) | o rows [M] | beta, decay [MS | M] (16 floats a token) */
+  #define KR(t) (LSF({KA0}) + (t) * {DK})
+  #define QR(t) (LSF({QA0}) + (t) * {DK})
+  #define VR(t) (LSF({VA0}) + (t) * {VW})
+  #define OR(t) (LSF({OA0}) + (t) * {DK})
+  #define BDR(t) (LSF({BD0}) + (t) * 16)
+  #define KQ(t) (LSF({KQN0}) + (t) * 8)
+  #define KPV(u) (LSF({KP0}) + (u) * 8)
+{"  #define PV(t) " + ("(t)" if ASM and MERGE else "pth[t]") + "                                            /* tree: pending update t's record (the previous path's t-th row) */" + chr(10) if TR else ""}  int u0 = core_id * {HPT * NB}, nu = nh * {NB};
+  #define UBASE(u) (S + {IDIV("(u)", NB)} * {DK * DV} + {IMOD("(u)", NB)} * {W})
+  #define ZR(c, t) ({{ int zs_ = ((int)((unsigned)(h * {DV} + (c)) >> 4)), zv_ = 6 * {IDIV("zs_", 3)} + (zs_ - 3 * {IDIV("zs_", 3)}), z0s_ = ((int)((unsigned)(h * {DV}) >> 4)), z0_ = 6 * {IDIV("z0s_", 3)} + (z0s_ - 3 * {IDIV("z0s_", 3)}); __global float* zp_ = LSF(p * {BLK}) + (zv_ - z0_) * 64 + (((c) >> 3) & 1) * 32 + 4 * (t); F8(*(__global float4*)zp_, *(__global float4*)(zp_ + 16)); }})
+  #define CTS(flag, ls, base, c) {{ int s0_ = ((int)((unsigned)(c) >> 4)), g0_ = {IDIV("s0_", 3)}, r0_ = s0_ - 3 * g0_; DMA_FILL(flag, DESC(desc, r0_ == 2 ? 18 : 17), ls, (int)((base) + (6 * g0_ + r0_) * 192)); }}
+  {"DMA_FILL(0, DESC(desc, 0), 0, (int)UBASE(u0));" if DB and not CTD else ""}
+  for (int e = 0; e < nu; e++) {{
+    NOHWL(e);                                                         /* (no hardware loop around the sweeps' own) */
+    int u = u0 + e, p = {"e & 1" if DB else "0"}, h = {IDIV("u", NB)}, jb = {IMOD("u", NB)}, j0 = jb * {W}, j = {IDIV("h", REP)};
+    __global float* sl = banks + (L * {NV} + h) * {SL};                 /* head h's update slots */
+{"    int tp_ = jb == 0 ? CYC() : 0;" + chr(10) if PH else ""}{PREP_ASM if ASM else PREP_C}{"    if (jb == 0) ph1 += CYC() - tp_;                                 /* phase 1: the heads' starts */" + chr(10) if PH else ""}{"" if VG == 1 else f'''    if ({IMOD("jb", NBG)} == 0) {{                                              /* VG 2: column group jb / {NBG}'s halves of the v rows */
+      int g = {IDIV("jb", NBG)}, fa = 1 - p, fb = 2 + p;
+      DMA_WAIT(fa); DMA_WAIT(fb);
+      DMA_FILL(fa, DESC(desc, 12), {VA0}, (int)(sl + 128 + g * {VW})); DMA_FILL(fb, DESC(desc, 13), {VA0 + MS * VW * 4}, (int)(banks + {NG * NV * SL} + core_id * {M * 128} + g * {VW}));
+      DMA_WAIT(fa); DMA_WAIT(fb);
+    }}
+'''}    {f'''    if (e + 1 < nu{" && %s != 0" % IMOD("u + 1", NB) if CTD else ""}) {{
+      if (p == 0) {{ DMA_WAIT(3); DMA_FILL(1, DESC(desc, 0), {BLK}, (int)UBASE(u + 1)); }}
+      else        {{ DMA_WAIT(2); DMA_FILL(0, DESC(desc, 0), 0, (int)UBASE(u + 1)); }}
+    }}
+    {T0("tw_")} if (p == 0) DMA_WAIT(0); else DMA_WAIT(1);{T(2, "tw_")}''' if DB else T0("tw_") + " DMA_WAIT(2); DMA_FILL(0, DESC(desc, 0), 0, (int)UBASE(u)); DMA_WAIT(0);" + T(2, "tw_")}
+    __global float* B = LSF(p * {BLK});
+    int jv = {IMOD("j0", VW)};                                                 /* the block's columns within the resident v rows */
+    float8 kv[2], o[2];
+    #define DL(t, i) ((*(__global float8*)(VR(t) + jv + 8 * (i)) - kv[i]) * BC(BDR(t)[0]))
+{T0("tc_")}
+{CHAIN}{T(3, "tc_") + chr(10) if PH else ""}    #undef DL
+    if (jb == {NB - 1}) {{                                          /* the M tokens' o = rmsnorm(o) * nw * silu(z) -> rows 0..M-1 (fp32) */
+     {T0("to_")}
+      float invt[{M}];
+      for (int t = 0; t < {M}; t++) {{
+        float8 ss = BC(0.0f); NOUNROLL for (int c = 0; c < {DV}; c += 8) {{ float8 ov = *(__global float8*)(OR(t) + c); ss += ov * ov; }}
+        invt[t] = 1.0f / __builtin_sqrtf(hsum8(ss) * {1.0 / DV!r}f + {eps!r}f);
+      }}
+      {"CTS(p, p * %d, z, h * %d); DMA_WAIT(p);   /* CTD: the head's z tiles into the done block's buffer */" % (BLK, DV) if CTD and "noout" not in D else ""}
+      {"" if "noout" in D or "notouch" in D or CTD else "NOUNROLL for (int c = 0; c < %d; c += 32) { __global float* tp = z + CTA(h * %d + c); __global float* tq = z + CTA(h * %d + c + 16);%s }" % (DV, DV, DV, "".join(f" TOUCH8(tp + {64 * q}, tq + {64 * q});" for q in range(-(-M // 4))))}
+      int tq = 0;
+      for (; tq + 1 < {0 if "noout" in D else M}; tq += 2) {{          /* token pairs: two SiLU chains a body; the expression of gdn_tokm_src's */
+        NOHWL(tq); __global float* oa = OR(tq); __global float* ob = OR(tq + 1); __global float* sa = LSF({VA0}) + tq * {DV}; __global float* sbr = sa + {DV};
+        NOUNROLL for (int c = 0; c < {DV}; c += 8) {{
+          *(__global float8*)(sa + c) = *(__global float8*)(oa + c) * BC(invt[tq]) * *(__global float8*)(nw + c) * {"BC(1.0f)" if "outnosw" in D else ("sw(BC(0.5f), BC(1.0f))" if "outnoz" in D else ("sw(ZR(c, tq), BC(1.0f))" if CTD else "sw(LD8R(z, h * %d + c, tq), BC(1.0f))" % DV))};
+          *(__global float8*)(sbr + c) = *(__global float8*)(ob + c) * BC(invt[tq + 1]) * *(__global float8*)(nw + c) * {"BC(1.0f)" if "outnosw" in D else ("sw(BC(0.5f), BC(1.0f))" if "outnoz" in D else ("sw(ZR(c, tq + 1), BC(1.0f))" if CTD else "sw(LD8R(z, h * %d + c, tq + 1), BC(1.0f))" % DV))};
+        }}
+      }}
+      for (int t = tq; t < {0 if "noout" in D else M}; t++) {{          /* (an odd last token) */
+        NOHWL(t); __global float* orow = OR(t); __global float* srow = LSF({VA0}) + t * {DV};
+        NOUNROLL for (int c = 0; c < {DV}; c += 8) *(__global float8*)(srow + c) = *(__global float8*)(orow + c) * BC(invt[t]) * *(__global float8*)(nw + c) * {"BC(1.0f)" if "outnosw" in D else ("sw(BC(0.5f), BC(1.0f))" if "outnoz" in D else ("sw(ZR(c, t), BC(1.0f))" if CTD else "sw(LD8R(z, h * %d + c, t), BC(1.0f))" % DV))};
+      }}
+      {{ int fo = 3 - p; DMA_WAIT(fo); DMA_DRAIN(fo, DESC(desc, 16), {VA0}, (int)(out + h * {DV})); }}{T(5, "to_")}   /* the M rows (staged in the head's dead v rows) by one request; waited by the next head's start */
+{"" if VG == 1 else f'''      {{                                                              /* VG 2: the new v rows from the scratch to the slots (through the done block's buffer) */
+        int fa = 1 - p;
+        DMA_WAIT(fa); DMA_FILL(fa, DESC(desc, 11), p * {BLK}, (int)(banks + {NG * NV * SL} + core_id * {M * 128})); DMA_WAIT(fa);
+        DMA_DRAIN(fa, DESC(desc, 9), p * {BLK}, (int)(sl + 128)); DMA_WAIT(fa);
+      }}
+'''}    }}
+  }}
+  DMA_WAIT(0); DMA_WAIT(1); DMA_WAIT(2); DMA_WAIT(3);       /* per flag, not DMA_WAIT_ALL (DCache.md §8b) */
+{f"""  ph6 = CYC() - tk0; ph7 = nu;
+  {{ __global int* dbg = (__global int*)(out + {(nrb * 12 - 1) * NV * DV}) + core_id * 16;   /* phases: o_rows' last (padding) row */
+    dbg[0] = ph0; dbg[1] = ph1; dbg[2] = ph2; dbg[3] = ph3; dbg[4] = ph4; dbg[5] = ph5; dbg[6] = ph6; dbg[7] = ph7;
+    dbg[8] = ph8; dbg[9] = ph9; dbg[10] = ph10; dbg[11] = ph11; dbg[12] = ph12; dbg[13] = cs_[0]; dbg[14] = cs_[1]; dbg[15] = cs_[2]; }}
+""" if PH else ""}  #undef UBASE
+}}"""
+  return src
+
 def gdn_commit_desc(CH=8192): return V._desc_slots((CH,))
 
 def gdn_commit_tree_desc(KVB, CH=8192): return V._desc_slots((CH,), (KVB,))   # slot 1: one K (or V) cache row of a layer
 
-def gdn_commit_tree_src(NV, DK, DV, C, CONV, M, NG, NATT, TMAX, NKV, HD, CH=8192):
+def gdn_commit_tree_src(NV, DK, DV, C, CONV, M, NG, NATT, TMAX, NKV, HD, CH=8192, defer=False):
   """gdn_commit for a tree verify pass (QWEN_SPEC_TREE, spec_tree.py): the committed path's rows in `pathb` (spec_tree.path_words:
   [a, last row, kv source row, kv destination row, the path's rows 0..a-1, padding]). Every DeltaNet layer's state becomes the
   state after the path (bank `last`, unless last == M - 1: gdn_tokt left that row's state in Sall) and the ring takes the
@@ -1838,7 +2512,8 @@ def gdn_commit_tree_src(NV, DK, DV, C, CONV, M, NG, NATT, TMAX, NKV, HD, CH=8192
   moves that row's K / V cache rows (written by attn_part at pos + row) to the position they belong to, pos + kv destination,
   in every attention layer's cache (not the MTP layer's: index NATT); DMA through LSRAM like the state. Tasks: layers.
   Under a chain path ([0..a-1], kv source -1) it does what gdn_commit does. args: Sall (out), banks, Call, rawm, Kall, Vall,
-  pathb (int32 [4 + M]), posb, desc (gdn_commit_tree_desc)."""
+  pathb (int32 [4 + M]), posb, desc (gdn_commit_tree_desc).
+  `defer` (the leaf tree, gdn_tokl): no state copy -- the next verify pass applies the path's updates from their slots (pathb)."""
   SZ, CP, KVR = NV * DK * DV, ring_pitch(C), NKV * HD; assert (SZ * 4) % CH == 0 and (C * 4) % CH == 0 and 4 * KVR <= CH
   return V.FULL_H + f"""
 static inline __attribute__((always_inline)) void copy_ch(__global float* restrict dst, __global float* restrict src, int n, __global int* restrict desc) {{
@@ -1855,8 +2530,7 @@ __kernel void gdn_commit_tree(__global float* restrict Sall, __global float* res
                               __global int* restrict desc, const int core_id) {{
   int a = pathb[0], last = pathb[1], ksrc = pathb[2], kdst = pathb[3], pos = posb[0];
   for (int L = core_id; L < {NG}; L += {NT}) {{
-    if (last < {M - 1}) copy_ch(Sall + L * {SZ}, banks + (last * {NG} + L) * {SZ}, {SZ * 4 // CH}, desc);
-    for (int i = 0; i < a; i++) copy_ch(Call + (L * {CONV} + (pos + i) % {CONV}) * {CP}, rawm + (L * {M} + pathb[4 + i]) * {CP}, {C * 4 // CH}, desc);
+{"" if defer else f"    if (last < {M - 1}) copy_ch(Sall + L * {SZ}, banks + (last * {NG} + L) * {SZ}, {SZ * 4 // CH}, desc);" + chr(10)}    for (int i = 0; i < a; i++) copy_ch(Call + (L * {CONV} + (pos + i) % {CONV}) * {CP}, rawm + (L * {M} + pathb[4 + i]) * {CP}, {C * 4 // CH}, desc);
   }}
   if (ksrc >= 0) for (int L = core_id; L < {NATT}; L += {NT}) {{      /* the rescue row's K / V rows to the path's position */
     copy_row(Kall + (L * {TMAX} + pos + kdst) * {KVR}, Kall + (L * {TMAX} + pos + ksrc) * {KVR}, desc);
@@ -2449,13 +3123,17 @@ class Kernels:
     if top3:
       k = self.key(f"head_top3|{nc}|{self.real}", head_top_src(nc, self.nrb, self.real, top3=True))
       return self.run(k, tag, NT * self.real * 8, dtypes.float32, ct)
-    if self.small_dma() and self.real <= 4:          # rows mode: the C tiles by DMA (head_topd)
-      dk = f"head_topd_desc{self.nrb}"
-      if dk not in self.bufs: self.bufs[dk] = Tensor(head_topd_desc(nc, self.nrb), device=DEV).realize()
+    if self.small_dma() and self.real <= 8:          # rows mode: the C tiles by DMA (head_topd; m > 4: row quads 0 and 1)
+      dk = f"head_topd_desc{self.nrb}" if self.real <= 4 else f"head_topd_desc{self.nrb}q2"
+      if dk not in self.bufs: self.bufs[dk] = Tensor(head_topd_desc(nc, self.nrb) if self.real <= 4 else head_topd_desc(nc, self.nrb, 2), device=DEV).realize()
       k = self.key(f"head_topd|{nc}|{self.real}", head_topd_src(nc, self.nrb, self.real))
       return self.run(k, tag, NT * self.real * 4, dtypes.float32, ct, self.bufs[dk])
     k = self.key(f"head_top|{nc}|{self.real}", head_top_src(nc, self.nrb, self.real))
     return self.run(k, tag, NT * self.real * 4, dtypes.float32, ct)
+  def head_top3_row(self, ct, nc, tag, row):
+    """A head part's top-3 (logit, column) on one row (head_top3_row_src) -> fp32 [NT, 1, 8] task partials (lane 6 = 0)."""
+    k = self.key(f"head_top3r|{nc}|{row}", head_top3_row_src(nc, self.nrb, row))
+    return self.run(k, tag, NT * 8, dtypes.float32, ct)
   def call(self, name, src, out, *ins):
     """A registered csrc kernel into an existing buffer `out` (persistent, realised), returned."""
     OA.csrc_call(self.key(name, src), out, *ins).realize(); return out
@@ -2508,7 +3186,14 @@ class Kernels:
     M = self.real; assert self.compact and 1 <= M <= 12
     diag = tuple(x for x in os.environ.get("GDN_TOKM_DIAG", "").split(",") if x)   # timing diagnostics (gdn_tokm_src)
     prep = gdn_prep()                                                              # "dma" (default) / "dma-lsarr": gdn_tokm_src's DMA-staged preparation; "fast" / "cached"
-    if defer is not None:    # (MS, accb): the commit deferred to the next verify pass (gdn_defer_src)
+    if defer is not None and gdn_fast() != "off":   # (MS, accb): the deferred commit, fused sweeps (gdn_fast_src), M <= 8
+      assert rows and not diag
+      MS, accb = defer; sw = gdn_fast(); fd = tuple(x for x in os.environ.get("GDN_FAST_DIAG", "").split(",") if x)   # timing diagnostics
+      kk = self.key(f"gdn_tokm|{M}|fast{MS}|{sw}|{fd}|{xoff}|{zoff}", ct_goff(gdn_fast_src(NV, NK, DK, DV, C, CONV, H, self.nrb, self.eps, M, NG, MS, sweeps=sw, diag=fd), self.nrb, (xoff, zoff), ("x", "z")))
+      dk = f"gdn_fast_desc{M}|{MS}"
+      if dk not in self.bufs: self.bufs[dk] = Tensor(gdn_fast_desc(DK, DV, H, gdn_hpt(NV), M, MS, C, CONV, NV=NV), device=DEV).realize()
+      return self.run(kk, "o_rows", self.rows * NV * DV, dtypes.float32, Sall, Call, idx, posb, qkv_ct, z_ct, xin, wab, adt, cwt, nw, self.bufs[dk], banks, rawm, accb).reshape(self.rows, NV * DV)
+    if defer is not None:    # (MS, accb): the commit deferred to the next verify pass (gdn_defer_src; QWEN_GDN_FAST=off)
       assert rows and prep == "dma" and not diag
       MS, accb = defer
       kk = self.key(f"gdn_tokm|{M}|defer{MS}|{xoff}|{zoff}", ct_goff(gdn_defer_src(gdn_tokm_src(NV, NK, DK, DV, C, CONV, H, self.nrb, self.eps, M, NG, rows_out=True), NV, M, MS), self.nrb, (xoff, zoff), ("x", "z")))
@@ -2539,17 +3224,32 @@ class Kernels:
     dk = f"gdn_tokt_desc{M}"
     if dk not in self.bufs: self.bufs[dk] = Tensor(gdn_tokm_desc(DK, DV, H, gdn_hpt(NV), M, C=C, CONV=CONV, tree=True), device=DEV).realize()
     return self.run(kk, "a_o", self.a_size(NV * DV), dtypes.uint16, Sall, Call, idx, posb, qkv_ct, z_ct, xin, wab, adt, cwt, nw, self.bufs[dk], banks, rawm, treeb)
-  def gdn_commit_tree(self, Sall, banks, Call, rawm, Kall, Vall, pathb, posb, NV, DK, DV, C, CONV, M, NG, NATT, TMAX, NKV, HD):
+  def gdn_tokl(self, Sall, Call, idx, posb, qkv_ct, z_ct, xin, wab, adt, cwt, nw, banks, rawm, pathb, treeb, NV, NK, DK, DV, C, CONV, H, NG, MS, xoff=0, zoff=0):
+    """The leaf tree's DeltaNet on the `real` rows -> fp32 rows in the persistent o_rows (as gdn_tokm(rows, defer)); `pathb`: the
+    previous pass's committed path (its pending updates), `treeb`: this pass's tree table. QWEN_GDN_FAST=asm|c (default asm):
+    gdn_fast_src(tree=True) (the fused sweeps, M <= 8); off: gdn_tokl_src (M <= 5). The same arguments, slots and results."""
+    M = self.real; assert self.compact
+    if gdn_fast() != "off":
+      sw = gdn_fast()
+      kk = self.key(f"gdn_tokl|{M}|fast{MS}|{sw}|{xoff}|{zoff}", ct_goff(gdn_fast_src(NV, NK, DK, DV, C, CONV, H, self.nrb, self.eps, M, NG, MS, sweeps=sw, tree=True), self.nrb, (xoff, zoff), ("x", "z")))
+      dk = f"gdn_fast_desc{M}|{MS}"
+      if dk not in self.bufs: self.bufs[dk] = Tensor(gdn_fast_desc(DK, DV, H, gdn_hpt(NV), M, MS, C, CONV, NV=NV), device=DEV).realize()
+      return self.run(kk, "o_rows", self.rows * NV * DV, dtypes.float32, Sall, Call, idx, posb, qkv_ct, z_ct, xin, wab, adt, cwt, nw, self.bufs[dk], banks, rawm, pathb, treeb).reshape(self.rows, NV * DV)
+    kk = self.key(f"gdn_tokl|{M}|{MS}|{xoff}|{zoff}", ct_goff(gdn_tokl_src(NV, NK, DK, DV, C, CONV, H, self.nrb, self.eps, M, MS, NG), self.nrb, (xoff, zoff), ("x", "z")))
+    dk = f"gdn_tokm_desc{M}defer{MS}"
+    if dk not in self.bufs: self.bufs[dk] = Tensor(np.concatenate([gdn_tokm_desc(DK, DV, H, gdn_hpt(NV), M, C=C, CONV=CONV), gdn_defer_desc(M, MS)]), device=DEV).realize()
+    return self.run(kk, "o_rows", self.rows * NV * DV, dtypes.float32, Sall, Call, idx, posb, qkv_ct, z_ct, xin, wab, adt, cwt, nw, self.bufs[dk], banks, rawm, pathb, treeb).reshape(self.rows, NV * DV)
+  def gdn_commit_tree(self, Sall, banks, Call, rawm, Kall, Vall, pathb, posb, NV, DK, DV, C, CONV, M, NG, NATT, TMAX, NKV, HD, defer=False):
     """Every DeltaNet layer to the state after the committed path (`pathb`: spec_tree.path_words), the path's raw rows into the
     rings, and a committed rescue row's K / V cache rows to its position in every attention layer."""
-    kk = self.key(f"gdn_commit_tree|{M}|{NATT}|{TMAX}", gdn_commit_tree_src(NV, DK, DV, C, CONV, M, NG, NATT, TMAX, NKV, HD))
+    kk = self.key(f"gdn_commit_tree|{M}|{NATT}|{TMAX}{'|defer' if defer else ''}", gdn_commit_tree_src(NV, DK, DV, C, CONV, M, NG, NATT, TMAX, NKV, HD, defer=defer))
     if "gdn_commit_tree_desc" not in self.bufs: self.bufs["gdn_commit_tree_desc"] = Tensor(gdn_commit_tree_desc(NKV * HD * 4), device=DEV).realize()
     OA.csrc_call(kk, Sall, banks, Call, rawm, Kall, Vall, pathb, posb, self.bufs["gdn_commit_tree_desc"]).realize()
   def attn_tree(self, q_rows, kv_rows, qnw, knw, rope, Kall, Vall, idx, treeb, NH, NKV, HD, TMAX, ROT):
     """attn_decm (attn_part + attn_comb) for a tree of `real` rows: attn_part_rg_src(tree=True) with the tree table `treeb`."""
-    M = self.real; P = attn_parts(NH, HD, TMAX); assert 7 < M <= 12, "the tree verify's attention: 8 .. 12 rows (the row-group kernel)"
+    M = self.real; P = attn_parts(NH, HD, TMAX); assert 2 <= M <= 12, "the tree verify's attention: 2 .. 12 rows"
     if "attn_part_desc" not in self.bufs: self.bufs["attn_part_desc"] = Tensor(attn_part_desc(NKV, HD), device=DEV).realize()
-    kp = self.key(f"attn_partt|{TMAX}|{M}", attn_part_rg_src(NH, NKV, HD, TMAX, ROT, self.eps, M, tree=True))
+    kp = self.key(f"attn_partt|{TMAX}|{M}", attn_part_rg_src(NH, NKV, HD, TMAX, ROT, self.eps, M, tree=True) if M > 7 else attn_part_tree_src(NH, NKV, HD, TMAX, ROT, self.eps, M))
     part = self.run(kp, "attn_part", NH * M * P * (HD + 16), dtypes.float32, q_rows, kv_rows, qnw, knw, rope, Kall, Vall, idx, self.bufs["attn_part_desc"], treeb)
     kc = self.key(f"attn_comb|{TMAX}|{M}", attn_comb_src(NH, HD, M, TMAX))
     return self.run(kc, "o_rows", self.rows * NH * HD, dtypes.float32, part, q_rows).reshape(self.rows, NH * HD)

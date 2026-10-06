@@ -6,6 +6,10 @@ the same parent, chain row j - 1). Pure Python on a few ints: the generator (qwe
                  rescue2       the two rescue rows at the two chain positions whose draft has the lowest top-1 - top-2 margin
                                (the rule that replayed best on logged passes of the 27B: +0.215 token / pass)
                  fixed:<j1,j2> the rescue rows at chain positions j1 and j2 (1-based: position j = draft j - 1 = chain row j)
+                 leaf          (the rotated-input models, bonsai2-27b) a pass of any row count up to QWEN_SPEC: the drafter's chain
+                               (drafting on while the chain's path probability p_1 ... p_j >= QWEN_TREE_TC) and, in the rows left,
+                               LEAVES -- the rank-2 / rank-3 candidates of the drafts, best path probability first, those >= QWEN_TREE_TL
+                               (build_leaf; the kernels gdn_tokl / attn_partt / gdn_commit_tree(defer))
 
 Rows and positions. Chain row k (0 <= k <= NC - 1, NC = 6) is the token at sequence position pos + k: row 0 the pass's token
 `cur`, row k >= 1 draft k - 1. A rescue row r (NC <= r < M) for chain position j (1 <= j <= NC - 1) holds another candidate for
@@ -21,7 +25,7 @@ the chain kernels (the simulator gate). `gdn_commit_tree` takes `path_words(...)
 """
 import numpy as np
 
-MODES = ("off", "rescue2", "fixed")
+MODES = ("off", "rescue2", "fixed", "leaf")
 TREE_M, TREE_NR = 8, 2                                                    # rows a tree verify pass; of them the rescue rows (chain NC = 6)
 
 def mode_from_env(env):
@@ -29,10 +33,11 @@ def mode_from_env(env):
   v = env.get("QWEN_SPEC_TREE", "off").strip()
   if v in ("", "off", "0"): return None
   if v == "rescue2": return ("rescue2", None)
+  if v == "leaf": return ("leaf", None)
   if v.startswith("fixed:"):
     js = tuple(int(x) for x in v[6:].split(",") if x); assert len(js) == 2 and js[0] != js[1] and all(1 <= j for j in js), f"QWEN_SPEC_TREE={v!r}: fixed:<j1,j2>, two distinct chain positions >= 1"
     return ("fixed", js)
-  raise ValueError(f"QWEN_SPEC_TREE={v!r}: off | rescue2 | fixed:<j1,j2>")
+  raise ValueError(f"QWEN_SPEC_TREE={v!r}: off | rescue2 | fixed:<j1,j2> | leaf")
 
 def merged_top3(t3k):
   """A draft's top-3 over the head parts read (`t3k`: per part ([ids], [logits])) -> [(logit, id)] in rank order (the generator's
@@ -92,6 +97,30 @@ def build(cur, d, t3, mode, M=8, NR=2):
     m3 = merged_top3(t3[j - 1]); tok = int(m3[rank][1]) if len(m3) > rank else int(toks[j])
     toks.append(tok); parent.append(j - 1); rescue.append((r, j, rank))
   while len(toks) < M: toks.append(toks[NC - 1]); parent.append(NC - 2); rescue.append((len(toks) - 1, NC - 1, 0))   # (never: NR rescues)
+  return Tree(toks, parent, rescue)
+
+def leaf_pick(pr, t3, B, tl):
+  """The leaf tree's leaves for a chain of nd = len(pr) drafts (their top-1 probabilities `pr`, merged top-3 lists `t3`) within B
+  rows: every draft's rank-2 / rank-3 candidate is a leaf candidate with the path probability p_1 ... p_(j-1) * p_j exp(l_r - l_1)
+  (the draft head's softmax over its top-3 logits); those >= tl, best first (ties: the shallower, then rank 2), fill the B - 1 - nd
+  rows the chain leaves -> [(j, rank)] (rank 1 = the 2nd candidate). check/draft_project.py's `dyn2` rule (bonsai2-27b)."""
+  cand, P = [], 1.0
+  for j, (p, t3k) in enumerate(zip(pr, t3), 1):
+    m3 = merged_top3(t3k)
+    for r in (1, 2):
+      if r < len(m3):
+        q = P * p * float(np.exp(m3[r][0] - m3[0][0]))
+        if q >= tl: cand.append((-q, j, r))
+    P *= p
+  return [(j, r) for _, j, r in sorted(cand)[:max(0, B - 1 - len(pr))]]
+
+def build_leaf(cur, d, t3, pr, B, tl):
+  """The leaf tree's pass: rows 0..nd the chain (cur, the nd drafts; no padding: the pass's geometry is its row count), then the
+  leaves of leaf_pick, each a sibling of chain row j (parent j - 1)."""
+  nd = len(d); assert 1 <= nd <= B - 1 and len(t3) >= nd, (nd, B, len(t3))
+  toks, parent, rescue = [cur] + list(d), [-1] + list(range(nd)), []
+  for j, r in leaf_pick(pr[:nd], t3[:nd], B, tl):
+    toks.append(int(merged_top3(t3[j - 1])[r][1])); parent.append(j - 1); rescue.append((len(toks) - 1, j, r))
   return Tree(toks, parent, rescue)
 
 def accept(tree, g):

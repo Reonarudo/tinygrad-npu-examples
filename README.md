@@ -13,7 +13,7 @@ and runs it; the text models can also be served over the OpenAI and Ollama APIs.
 
 | example | what it does | speed on the board |
 | --- | --- | --- |
-| [bonsai2-27b/](bonsai2-27b/) | PrismML's Ternary Bonsai 2 27B (Qwen3.8-27B with ternary weights) from its 5.9 GB GGUF: all 64 layers and the head on a ternary GEMM, speculative decoding with Qwen3.8-27B's MTP layer as the draft; an OpenAI- and Ollama-compatible server (`bonsai2_serve.py`) | 1.52 tok/s plain; **~4.3 tok/s** with speculative decoding (~5.6 on code) |
+| [bonsai2-27b/](bonsai2-27b/) | PrismML's Ternary Bonsai 2 27B (Qwen3.8-27B with ternary weights) from its 5.9 GB GGUF: all 64 layers and the head on a ternary GEMM, speculative decoding with Qwen3.8-27B's MTP layer as the draft; an OpenAI- and Ollama-compatible server (`bonsai2_serve.py`) | 2.0 tok/s plain; **~5.6 tok/s** with speculative decoding (~6.7 on code) |
 | [qwen3.8-27b/](qwen3.8-27b/) | Qwen3.8-27B text generation from its FP8 checkpoint: all 64 layers, the head and the multi-token-prediction (MTP) draft head on the NPU, weights mapped zero-copy from RAM | ~0.7 tok/s plain; **~1.9-3.0 tok/s** with speculative decoding (`QWEN_SPEC=6`), same tokens |
 | [ornith-9b/](ornith-9b/) | Ornith 1.0 9B (Qwen3.5 architecture) from its GGUF Q8_0 checkpoint, on the same modules as qwen3.8-27b; speculative decoding with Qwen3.5-9B's MTP head as the draft | ~4.4 tok/s across prompts, ~5.4 tok/s on a code prompt |
 | [ideogram4/](ideogram4/) | Ideogram 4 text-to-image at full precision: both DiT transformers and the VAE decoder on the NPU | ~170 s a sampling step at 1024 x 1024 (12 steps with `V4_TURBO_12`, ~35 min an image) |
@@ -50,7 +50,7 @@ More detail in [`tinygrad/extra/zhouyi/README.md`](tinygrad/extra/zhouyi/README.
 - **NPU clocks at their defaults** (`npuclk` 1.2 GHz, `npu_memclk` 750 MHz) to reproduce the numbers above.
 - **Optional, for the speeds above:** write access to `/dev/cpu_dma_latency` (see
   [bonsai2-27b/README.md](bonsai2-27b/README.md#the-cpu-latency-request)); without it the text models run slower and print a note.
-- **Disk:** Qwen3.8 about 27 GB of checkpoint + 27 GB of packed layers; Bonsai 2 about 6.4 GB of downloads + 8.7 GB packed;
+- **Disk:** Qwen3.8 about 27 GB of checkpoint + 27 GB of packed layers; Bonsai 2 about 6.4 GB of downloads + 8.2 GB packed;
   Ideogram 4 about 45 GB, plus ~16 GB of repacked panels (set `P48_DIR` / `W13I_DIR` to a disk with room).
 
 ## Getting started
