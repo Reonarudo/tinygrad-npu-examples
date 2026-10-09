@@ -103,7 +103,7 @@ def leaf_pick(pr, t3, B, tl):
   """The leaf tree's leaves for a chain of nd = len(pr) drafts (their top-1 probabilities `pr`, merged top-3 lists `t3`) within B
   rows: every draft's rank-2 / rank-3 candidate is a leaf candidate with the path probability p_1 ... p_(j-1) * p_j exp(l_r - l_1)
   (the draft head's softmax over its top-3 logits); those >= tl, best first (ties: the shallower, then rank 2), fill the B - 1 - nd
-  rows the chain leaves -> [(j, rank)] (rank 1 = the 2nd candidate). check/draft_project.py's `dyn2` rule (bonsai2-27b)."""
+  rows the chain leaves -> [(j, rank)] (rank 1 = the 2nd candidate). The `dyn2` rule of a host-side replay of bonsai2-27b's drafts."""
   cand, P = [], 1.0
   for j, (p, t3k) in enumerate(zip(pr, t3), 1):
     m3 = merged_top3(t3k)

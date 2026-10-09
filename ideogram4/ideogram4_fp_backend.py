@@ -34,7 +34,7 @@ import ideogram4_ref as R                                                # noqa:
 from ideogram4_weights import Ideogram4Weights                           # noqa: E402
 
 DEV = "ZHOUYI"
-os.environ.setdefault("ZHOUYI_CHAIN", "32")                 # one fused chain per layer (18 kernels): never a three-job wave (`wave_drop_probe.py`)
+os.environ.setdefault("ZHOUYI_CHAIN", "32")                 # one fused chain per layer (18 kernels): never a three-job wave (one lost data on the board)
 GATE = bool(int(os.environ.get("GATE", "0")))
 PROF = bool(int(os.environ.get("PROF", "0")))
 NT = 12
@@ -55,10 +55,10 @@ _SALT = [0]
 def host_read(t, tries: int = 200) -> np.ndarray:
     """A VERIFIED host read of a device-written tensor. The host's view of the device's writes lags -- data a DMA
     drain wrote is shadowed by a stale CLEAN line in the pages' one cacheable alias -- the kernel's linear
-    map -- for seconds, and a second host read of the same bytes can be stale too (2026-09-24,
-    `host_lag_cure_probe.py`) -- and a lagging line in a step's output fed the next step and made runs
+    map -- for seconds, and a second host read of the same bytes can be stale too (measured on the board,
+    2026-09-24) -- and a lagging line in a step's output fed the next step and made runs
     differ. `_flush()` invalidates that alias. The device checksums stay as the verification: they also
-    cover the wave drop of ticket 28, which no cache operation can fix. So: the device sums the buffer per task (`vec_f16.tec_sum`,
+    cover the lost device writes seen on the board, which no cache operation can fix. So: the device sums the buffer per task (`vec_f16.tec_sum`,
     by DMA: the device's view is consistent) with a per-call salt; the host reads the sums until the salt is
     the call's, then reads the data until its own per-task sums match. Returns the bytes as float32 (the
     caller reinterprets); sizes that are not a multiple of 12 x 8 KiB fall back to a plain read."""
@@ -67,7 +67,7 @@ def host_read(t, tries: int = 200) -> np.ndarray:
     e = _COPIES.get(n)
     if e is None:
         # (NT + 1) SLOTS, not ints: `tec_sum` gives every task its own 64-byte line, because two cores
-        # storing into one 32-byte line lose data (DCache rule 10, ticket 28) and these are the
+        # storing into one 32-byte line lose data (measured on the board) and these are the
         # checksums the read below is trusted against.
         e = _COPIES[n] = (OA.register_csrc("tec_sum_%d" % n, V.tec_sum_src(n // 4, nt=NT), ntasks=NT),
                           zeros((NT + 1) * V.TEC_SUM_SLOT, dtypes.int32), dev(V.tec_copy_descs()))
@@ -95,8 +95,8 @@ _FLUSH: list = []
 
 
 def _flush(*ts):
-    """Invalidate the CPU caches' stale clean lines for the tensors about to be read (ticket 37,
-    `ops_zhouyi.host_invalidate`): ~0.1 ms per 2 MB against the ~15 ms of the 32 MB E4M3 eviction pass
+    """Invalidate the CPU caches' stale clean lines for the tensors about to be read
+    (`ops_zhouyi.host_invalidate`): ~0.1 ms per 2 MB against the ~15 ms of the 32 MB E4M3 eviction pass
     this replaces. ⚠️ Needs the driver fix of 2026-09-24; under an older KMD the ioctl is a no-op and
     the checksum loop below will spin, so the pass is still available as `IDEO_FLUSH_PASS=1`."""
     if os.environ.get("IDEO_FLUSH_PASS") == "1":

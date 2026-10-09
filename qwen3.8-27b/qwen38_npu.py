@@ -108,6 +108,7 @@ class Layers:
     self._metas, self._inflight, self.pinned, self._small_dev, self.stage = {}, {}, {}, {}, {}
     self.zc = {}                                                                   # zero-copy state (pin), shared with the other geometry
     self.K = Kernels(self.nrb, self.R, R.EPS, real=n)                              # the hand-written layout kernels (ks 32)
+    self.K.small2 = os.environ.get("QWEN_SMALL2", "1") == "1"                      # QWEN_SMALL2's norm records / DMA top-3 (Kernels.s2)
     if self.had:                 # rotated linear inputs: the producers transform (Kernels.had), the norms' 1 + w carry the signs (_meta)
       assert TERN, f"{cache}: QWEN_MODEL={R.MODEL} needs its ternary cache (a `tern` marker; set QWEN_NPU to it)"
       self.signs, self.K.had_post = had_signs(cache); self.K.had = {w: dev(v) for w, v in self.signs.items()}
@@ -252,8 +253,9 @@ class Layers:
     return self.block_views(bp, j, R.LAYER_TYPES[l]), self._meta(l)[0]
   def _load_zc(self, l):
     zc = self.zc; prev = (l - 1) % R.NL
-    for i, sl in enumerate(zc["st_layer"]):                                     # layer l - 1 has run: its staging buffer is free
-      if sl == prev: sync(); self._stage_fill(i)                               # (its job may still be in flight: wait for it)
+    if not zc.get("late_refill"):                                               # (late_refill: after_submit(l) does it, no wait)
+      for i, sl in enumerate(zc["st_layer"]):                                   # layer l - 1 has run: its staging buffer is free
+        if sl == prev: sync(); self._stage_fill(i)                             # (its job may still be in flight: wait for it)
     if l in self._inflight: self._inflight.pop(l).join()
     else: self._map_zc(l)
     return zc["views"][(l % 2, R.LAYER_TYPES[l])]
@@ -308,6 +310,17 @@ class Layers:
     if self.zc and l in self.zc["wbufs"] and os.environ.get("QWEN_PREFETCH") != "1": return
     sync()                                                                         # slot l % 2's last reader (layer l - 2) may still be in flight
     t = threading.Thread(target=self._map_zc if self.zc else self._copy, args=(l,), daemon=True); t.start(); self._inflight[l] = t
+  def after_submit(self, l):
+    """The streamed layers' path without a wait (QWEN_STREAM_LATE=1, Model.verify): called right after layer l's job was submitted --
+    the submit drained layer l - 1's job, so layer l - 1's staging buffer is free (refilled with the next streamed layer, on a thread)
+    and slot (l + 1) % 2, last read by layer l - 1, may be re-pointed (layer l + 1's prefetch, on a thread). load() then neither
+    waits for the job in flight nor stalls the device while the refill thread starts."""
+    zc = self.zc; prev = (l - 1) % R.NL
+    for i, sl in enumerate(zc["st_layer"]):
+      if sl == prev: self._stage_fill(i)
+    if l + 1 < R.NL and l + 1 not in self._inflight and l + 1 not in zc["wbufs"]:
+      import threading
+      t = threading.Thread(target=self._map_zc, args=(l + 1,), daemon=True); t.start(); self._inflight[l + 1] = t
   def load(self, l):
     if self.zc: slot = self._load_zc(l)
     else:

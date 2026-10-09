@@ -11,6 +11,8 @@ The decode step of each layer type runs under TinyJit (one per weight-slot parit
 import argparse, ctypes, functools, json, math, os, sys, threading, time
 import numpy as np
 sys.path.insert(0, os.path.expanduser(os.environ.get("TG", os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "tinygrad")))); sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+# a layer's launches as one job (the backend's default 8 makes two): Qwen3.8-27B's 132 jobs a verify pass -> 68 (bonsai2 / ornith set it too)
+os.environ.setdefault("ZHOUYI_CHAIN_MAX", "16")
 from tinygrad import Tensor, dtypes                                      # noqa: E402
 from tinygrad.engine.jit import TinyJit                                  # noqa: E402
 from zy import OA                                                        # noqa: E402
@@ -90,6 +92,18 @@ def rope_tables(pos0, Rr):
 #         k / v rows go into the cache from the kernel (prefill's cache copy is skipped)
 ATT_PRE = os.environ.get("QWEN_ATTN_PREFILL", "csrc") or "none"
 NPU_IDS = os.environ.get("QWEN_NPU_IDS", "0") == "1"                     # the token ids chosen, embedded and accepted on the NPU (head_reduce, ...)
+# The decode loop's jobs and host work:
+#   QWEN_RING_COMMIT (1): the deferred commit's copies by ring_commit (one kernel for every geometry, the same bytes as gdn_commit_tree(defer) /
+#                         gdn_commit(ring_only))
+#   QWEN_COMMIT_FOLD (1): that commit runs inside the next draft pass's job instead of a job of its own
+#   QWEN_DRAFT_JOB (1):   a draft pass (the input rows, the MTP layer, the draft head's parts) as one job
+#   QWEN_STREAM_LATE (1): a streamed layer's staging refill and prefetch issued after the next layer's submit, not behind a sync()
+#   QWEN_MTPIN (dma):     the device's MTP input rows by mtpin_d_src (12 tasks, DMA) | task (mtpin_src, one task a row); the same bits
+RING_COMMIT = os.environ.get("QWEN_RING_COMMIT", "1") == "1"
+COMMIT_FOLD = os.environ.get("QWEN_COMMIT_FOLD", "1") == "1"
+STREAM_LATE = os.environ.get("QWEN_STREAM_LATE", "1") == "1"          # the verify pass's streamed layers: Layers.after_submit (no sync in load)
+DRAFT_JOB = os.environ.get("QWEN_DRAFT_JOB", "1") == "1"
+MTPIN_DMA = os.environ.get("QWEN_MTPIN", "dma") == "dma"
 assert ATT_PRE in ("none", "csrc"), f"QWEN_ATTN_PREFILL={ATT_PRE}: none | csrc"
 
 def qkv_proj(L, x, slot, meta, sm, cos, sin, xin=None):
@@ -167,10 +181,11 @@ class Model:
     have_mtp = os.path.exists(os.path.join(self.mtp_cache, f"L{R.NL}_small.npz"))
     # QWEN_SPEC_TREE=off (default) | rescue2 | fixed:<j1,j2> (spec_tree.py): the tree verify -- always TREE_M = 8 rows (the 6-row chain
     # + 2 rescue rows, the rank-2 siblings), its own kernels (gdn_tokt / attn_partt / gdn_commit_tree); off leaves every default path as it was
-    # QWEN_SPEC_TREE=leaf (the rotated-input models): the leaf tree (spec_tree.build_leaf) -- rows up to QWEN_SPEC, the deferred
-    # commit's DeltaNet (gdn_tokl), any row count a pass; rescue2 / fixed: the 8-row bank-path tree (gdn_tokt has no fp32-rows output)
+    # QWEN_SPEC_TREE=leaf (any model): the leaf tree (spec_tree.build_leaf) -- rows up to QWEN_SPEC, the deferred commit's DeltaNet
+    # (gdn_tokl: gdn_fast_src(tree=True), o_proj's A straight from it on the models without a rotated input), any row count a pass;
+    # rescue2 / fixed (not the rotated-input models): the 8-row bank-path tree (gdn_tokt has no fp32-rows output)
     self.tree = spec_tree.mode_from_env(os.environ); self.leaf = bool(self.tree) and self.tree[0] == "leaf"
-    assert not self.tree or self.leaf == bool(R.HAD), f"QWEN_SPEC_TREE={os.environ.get('QWEN_SPEC_TREE')} with QWEN_MODEL={R.MODEL}: leaf is the rotated-input models' tree, rescue2 / fixed the others'"
+    assert not self.tree or self.leaf or not R.HAD, f"QWEN_SPEC_TREE={os.environ.get('QWEN_SPEC_TREE')} with QWEN_MODEL={R.MODEL}: rescue2 / fixed are the bank-path tree, not the rotated-input models'"
     spec_default = "4" if self.leaf else str(spec_tree.TREE_M) if self.tree else ("6" if R.Q8 else "0")
     self.MTPL = R.NL if have_mtp and os.environ.get("QWEN_SPEC", spec_default) != "0" and os.environ.get("QWEN_DRAFT", "mtp") == "mtp" else None
     natt = self.NATT + (1 if self.MTPL else 0)                                               # the MTP head is attention index NATT
@@ -214,6 +229,9 @@ class Model:
     self.cos_dec, self.sin_dec = {}, {}
     # speculative decoding: M rows (the token + M - 1 drafts) a verify pass; the Q8_0 models prefill through the same geometries
     self.M = int(os.environ.get("QWEN_SPEC", spec_default))
+    if R.Q8 and not self.M:                # QWEN_SPEC=0 on a Q8_0 model: plain decoding (no drafter: MTPL is None), but its prompt is
+      self.M = int(spec_default)           # prefilled through the verify geometries (prefill_chunked), so they are made all the same
+      print(f"   QWEN_SPEC=0 ({R.MODEL}): plain decoding; the prompt prefilled through the {self.M}-row verify geometries", flush=True)
     if self.tree and not self.leaf and self.M != spec_tree.TREE_M:
       print(f"   QWEN_SPEC_TREE={os.environ['QWEN_SPEC_TREE']}: the tree verify runs {spec_tree.TREE_M} rows (QWEN_SPEC={self.M} ignored)", flush=True); self.M = spec_tree.TREE_M
     # QWEN_SPEC_LOG=path.jsonl: a line per verify pass (the drafts' probabilities and head features, which were accepted, the
@@ -226,18 +244,22 @@ class Model:
     assert 2 <= M <= 12 and self.head == "fp8", "QWEN_SPEC: 2..12 rows (the GEMMs' rows mode), the fp8 head"
     self.vers, self.xbvs = {}, {}; self.ver = self._ver(M)                   # the verify geometries (rows = tokens), made on demand
     K = self.ver.K; SZ = R.NV * R.DK * R.DV
-    # QWEN_GDN_DEFER (default on for a rotated-input model): the DeltaNet commit deferred to the next verify pass. The chain: gdn_fast_src
-    # (any M <= 8; QWEN_GDN_FAST=off: gdn_defer_src, M <= 4); the leaf tree: gdn_fast_src(tree=True) (M <= 8; QWEN_GDN_FAST=off:
-    # gdn_tokl_src, M <= 5). No per-token banks (1 GB at M = 4): `banks` holds each head's update inputs instead ([NG][NV][M] slots
-    # of GD_SLOT floats; + gdn_fast_scratch, a task's v rows when the fast kernel keeps half rows)
+    # QWEN_GDN_DEFER (default on): the DeltaNet commit deferred to the next verify pass. The chain: gdn_fast_src (any M <= 8;
+    # QWEN_GDN_FAST=off: gdn_defer_src, M <= 4, the rotated-input models' fp32 rows only -- the others then take the bank path,
+    # gdn_tokm_src); the leaf tree: gdn_fast_src(tree=True) (M <= 8; QWEN_GDN_FAST=off: gdn_tokl_src, M <= 5). No per-token banks
+    # (1 GB at M = 4 on the 27B): `banks` holds each head's update inputs instead ([NG][NV][M] slots of GD_SLOT floats; +
+    # gdn_fast_scratch, a task's v rows when the fast kernel keeps half rows). QWEN_GDN_DEFER=0 or QWEN_GDN_FAST=off: the
+    # per-token banks and the full commit (gdn_tokm_src + gdn_commit), as before the port, for the models without a rotated input
     fast = QK.gdn_fast() != "off"
-    self.defer = R.HAD and (not self.tree or self.leaf) and M <= (QK.GF_MS if fast else 5 if self.leaf else 4) and os.environ.get("QWEN_GDN_DEFER", "1") == "1"
+    self.defer = (R.HAD or fast or self.leaf) and (not self.tree or self.leaf) and M <= (QK.GF_MS if fast else 5 if self.leaf else 4) and os.environ.get("QWEN_GDN_DEFER", "1") == "1"
+    self.pend = False                                                     # (defer: a verify pass's accepted updates not yet in Sall; step() flushes them)
     assert self.defer or not self.leaf, f"QWEN_SPEC_TREE=leaf: the deferred DeltaNet commit (QWEN_GDN_DEFER=1), QWEN_SPEC <= {QK.GF_MS if fast else 5}"
     if self.defer: self.banks = K.buf("gdn_kvb", self.NGDN * R.NV * M * QK.GD_SLOT + (QK.gdn_fast_scratch(M) if fast else 0), dtypes.float32)
     else: self.banks = K.buf("gdn_banks", (M - 1) * self.NGDN * SZ, dtypes.float32)      # the state after tokens 0..M-2, every DeltaNet layer
     self.rawm = K.buf("gdn_raw", self.NGDN * M * self.CP, dtypes.float32)             # the M raw conv rows, every DeltaNet layer: [NG][M][CP]
     self.accb = K.buf("acc_b", 1, dtypes.int32)
-    self.jit_vgdn, self.jit_vatt, self.jit_head = {}, {}, {}
+    self.jit_vgdn, self.jit_vatt, self.jit_head, self.jit_d1 = {}, {}, {}, {}
+    self.pcommit = None                                                   # a commit left for the next draft pass's job (commit(fold=True))
     # adaptive draft depth: after the first draft, the chain goes on only while the draft head's probability of its draft is
     # >= QWEN_DRAFT_TAU; a verify pass then takes 1 + the drafts' rows (its own geometry)
     self.tau = float(os.environ.get("QWEN_DRAFT_TAU", "0.6"))
@@ -254,11 +276,14 @@ class Model:
       if self.leaf:                                                       # the leaf tree: every row count 2..M (QWEN_SPEC_GEOS ignored)
         self.geos = list(range(2, M + 1)); self.NC = M
         # QWEN_TREE_TC: the drafter drafts on while the chain's path probability p_1 ... p_j >= it (QWEN_DRAFT_TAU unused);
-        # QWEN_TREE_TL: a leaf candidate's least path probability (spec_tree.leaf_pick). Defaults: check/draft_project.py's best at 4-5 rows
+        # QWEN_TREE_TL: a leaf candidate's least path probability (spec_tree.leaf_pick). Defaults: the best of a host-side replay at 4-5 rows
         self.tc, self.tl = float(os.environ.get("QWEN_TREE_TC", "0.4")), float(os.environ.get("QWEN_TREE_TL", "0.05"))
       else: self.geos = [M]; self.NC = M - spec_tree.TREE_NR; self.kmax = min(self.kmax, self.NC - 1)
       self.treeb = K.buf("tree_b", 2 * M, dtypes.int32); self.pathb = K.buf("path_b", 4 + M, dtypes.int32)   # spec_tree.table / path_words
       if self.leaf: poke(self.pathb, np.zeros(4 + M, np.int32))           # (gdn_tokl: the previous pass's path, none yet)
+    # ring_commit (QWEN_RING_COMMIT): the deferred commits only -- the leaf tree's gdn_commit_tree(defer), the chain's gdn_commit(ring_only)
+    self.ringc = RING_COMMIT and self.defer and (self.leaf or not self.tree)
+    if self.ringc: self.cwords = K.buf("commit_w", QK.RC_W + M, dtypes.int32); poke(self.cwords, np.zeros(QK.RC_W + M, np.int32))
     # QWEN_LAYER_BLOCK=k (default 1; bonsai2_generate: 4): the verify pass's layers k at a time, each block one TinyJit call and so
     # one job (with ZHOUYI_CHAIN_MAX >= its launches), its k layers in k window slots of their own (2 k slots: the next block's are
     # mapped while this one runs); the head's parts in one job over the block slots too. Needs every layer pinned zero-copy (no
@@ -306,26 +331,82 @@ class Model:
   def _vacc(self, m):
     L = self.vers[m]
     return self._jid(("vacc", m), lambda _: L.K.call(f"accept|{m}", QK.accept_src(m), self.acco, self.vtok, L.K.bufs["ids_head"], self.accb, self.nxtb))
-  def _dcatch(self, m, a, mp):
-    """The drafter's catch-up input rows (rows 0..a-1: the accepted tokens' embeddings | the verify pass's hidden rows) on the device."""
+  def _mtpin(self, K, r, mp, hoff, catch, X):
+    """The MTP layer's input rows (mtpin_src) into geometry mp's `mtp_in`: QWEN_MTPIN=dma (default) mtpin_d_src (12 tasks, the rows
+    by DMA; the same bits, checked on the vendor simulator) | task (mtpin_src: one task a row)."""
+    if MTPIN_DMA:
+      if not hasattr(self, "mi_desc"): self.mi_desc = dev(QK.mtpin_d_desc(R.H))
+      return K.call(f"mtp_in_d|{r}|{mp}|{hoff}|{int(catch)}", QK.mtpin_d_src(r, mp, R.H, R.EPS, hoff, catch), K.bufs["mtp_in"], self.embrows, X, self.ne1, self.nh1, self.fn1, self.mi_desc)
+    return K.call(f"mtp_in|{r}|{mp}|{hoff}|{int(catch)}", QK.mtpin_src(r, mp, R.H, R.EPS, hoff, catch), K.bufs["mtp_in"], self.embrows, X, self.ne1, self.nh1, self.fn1)
+  def _dcatch_fn(self, m, a, mp):
+    """The drafter's catch-up input rows (rows 0..a-1: the accepted tokens' embeddings | the verify pass's hidden rows) on the
+    device -> (key, the kernels' call)."""
     Lm, Lv = self._mtpL(mp), self.vers[m]
     def f(_):
       self._embed_dev(Lm.K, a, self.embrows, self.nxtb)
-      return Lm.K.call(f"mtp_in|{a}|{mp}|0|1", QK.mtpin_src(a, mp, R.H, R.EPS, 0, True), Lm.K.bufs["mtp_in"], self.embrows, Lv.K.bufs["xiov0"], self.ne1, self.nh1, self.fn1)
-    return self._jid(("dcatch", m, a, mp), f)
-  def _dchain(self, mprev, row, mp):
+      return self._mtpin(Lm.K, a, mp, 0, True, Lv.K.bufs["xiov0"])
+    return ("dcatch", m, a, mp), f
+  def _dchain_fn(self, mprev, row, mp):
     """A chained draft's input row (the last draft's embedding | the MTP layer's output row `row` of geometry mprev) on the device."""
     Lm, Lp = self._mtpL(mp), self._mtpL(mprev)
     def f(_):
       self._embed_dev(Lm.K, 1, self.embrows, self.dtok)
-      return Lm.K.call(f"mtp_in|1|{mp}|{row}|0", QK.mtpin_src(1, mp, R.H, R.EPS, row, False), Lm.K.bufs["mtp_in"], self.embrows, Lp.K.bufs["mtp_out"], self.ne1, self.nh1, self.fn1)
-    return self._jid(("dchain", mprev, row, mp), f)
-  def mtp_pass_dev(self, r, pos, pick, rows_in=None):
+      return self._mtpin(Lm.K, 1, mp, row, False, Lp.K.bufs["mtp_out"])
+    return ("dchain", mprev, row, mp), f
+  def _dcatch(self, m, a, mp): return self._jid(*self._dcatch_fn(m, a, mp))
+  def _dchain(self, mprev, row, mp): return self._jid(*self._dchain_fn(mprev, row, mp))
+  def _draft1_ok(self, hp, parts):
+    """QWEN_DRAFT_JOB=1 (default): a draft pass as ONE job -- the pending commit (if any), the input rows, the MTP layer and the
+    draft head's parts -- when the MTP layer has a slot of its own and every part a slot of its own (the layer blocks' parity-0
+    slots, or the two layer slots); else (QWEN_DRAFT_JOB=0, or the parts take turns in one slot) the jobs as before."""
+    zc = self.pre.zc
+    if not DRAFT_JOB or hp["sid"] is not None or getattr(self, "mtp_own", None) is None: return False
+    if self.blk > 1: return len(parts) <= self.blk and all(p_["n"] <= zc["bsize"] for p_ in parts)
+    return len(parts) <= 2
+  def _dhead_views(self, hp, parts):
+    """The draft head's parts mapped into their one-job slots (no drain: the caller has waited for the job in flight) -> their views."""
+    zc = self.pre.zc; raw = zc["raw"]
+    if self.blk > 1:
+      for i, p_ in enumerate(parts): slot_map_nodrain(raw, zc["bslots"][(0, i)][0], p_["wid"], 0, p_["n"])
+      return [self.pre.blob_view(0, i, p_["n"]) for i, p_ in enumerate(parts)]
+    for i, p_ in enumerate(parts): slot_map_nodrain(raw, zc["slots"][i][0], p_["wid"], 0, p_["n"])
+    zc.setdefault("slot_src", [None, None])[0] = None; zc["slot_src"][1] = None
+    return [p_["views"][i] for i, p_ in enumerate(parts)]
+  def _mtp_map_own(self):
+    """The MTP layer into its own slot (no drain: nothing is in flight -- the caller poked first) -> its views."""
+    zc = self.pre.zc; slot_map_nodrain(zc["raw"], self.mtp_own, self.mtp_w[0], 0, self.mtp_w[2]); return self.mtp_own_views
+  def _draft1(self, m, rows_fn, commit_fn, L, hp, n, c0s, pick, x3, top3, devhead, aix, *views):
+    """ONE draft pass as one JIT (one job): the pending commit, the input rows (rows_fn: the device's mtp_in; None: poked by the
+    host), the MTP layer on geometry m (-> mtp_out), then the draft head's first n parts: `devhead` (QWEN_NPU_IDS) _head_parts
+    (head_reduce, pick_id); else each part's partials (top_head<i> / top3_head<i>), as head_top's per-part JITs leave them."""
+    if commit_fn is not None: commit_fn()
+    if rows_fn is not None: rows_fn(None)
+    nm = len(self.MTP_LIN); out = self.mtp_step(m, aix, *views[:nm])
+    if devhead: return self._head_parts(L, out, self.mtp_norm_w1, hp, n, c0s, pick, x3, *views[nm:])
+    for i in range(n): self._head_part(L, i, out, self.mtp_norm_w1, views[nm + i], top3=top3, hp=hp)
+    return out
+  def _take_commit(self):
+    """The commit left pending for the next draft job (commit(fold=True)) -> (key, its kernel's call) or None; cleared."""
+    c = getattr(self, "pcommit", None); self.pcommit = None; return c
+  def mtp_pass_dev(self, r, pos, pick, rows_in=None, rows=None):
     """mtp_pass with the input rows already on the device (_dcatch / _dchain) and the draft's id picked into vt (pick = (j, row)).
-    `rows_in`: the call that puts them there, made here after the position's poke (a poke waits for a job in flight), so the MTP
-    layer's JIT is prepared while the input rows' job runs."""
+    `rows`: (key, call) of the input rows' kernels (_dcatch_fn / _dchain_fn): with the one-job draft (QWEN_DRAFT_JOB) the pending
+    commit, they, the MTP layer and the head parts are one JIT; else `rows_in` (the call that runs them as their own job) is
+    made here after the position's poke (a poke waits for a job in flight), so the MTP layer's JIT is prepared while it runs."""
     zc = self.pre.zc; m = min(g for g in self.mtp_geos if g >= r); t0 = time.perf_counter()
     poke(self.aix[self.NATT], np.array([self.NATT, pos], np.int32))
+    hp = self.dhead; parts = hp["parts"][:self.draft_parts]
+    if rows is not None and self._draft1_ok(hp, parts):
+      L = self._dheadL(m); c0s = tuple(p_["c0"] for p_ in parts); x3 = pick if self.leaf else False; cm = self._take_commit()
+      own = self._mtp_map_own(); views = [own[k] for k in self.MTP_LIN] + self._dhead_views(hp, parts)
+      key = ("d1", rows[0], m, pick, x3, cm[0] if cm else None)
+      if key not in self.jit_d1: self.jit_d1[key] = TinyJit(functools.partial(self._draft1, m, rows[1], cm[1] if cm else None, L, hp, len(parts), c0s, pick, x3, False, True))
+      with one_job(): o = self.jit_d1[key](self.aix[self.NATT], *views)
+      ids, pr = self._head_out(o, L, parts, c0s, x3)
+      self._draft_feats(r); self.prof["mtp_dev"] = self.prof.get("mtp_dev", 0.0) + time.perf_counter() - t0
+      return m, ids, pr
+    self._commit_flush()
+    if rows_in is None and rows is not None: rows_in = lambda: self._jid(*rows)
     if rows_in is not None: rows_in()
     if self.mtp_x: slot_map_nodrain(zc["raw"], self.mtp_sid, self.mtp_w[0], 0, self.mtp_w[2]); views = self.mtp_views   # (in flight: the input rows' job)
     else:
@@ -341,14 +422,14 @@ class Model:
     k - 1 chained drafts while the draft probability stays >= tau. Each draft's id goes into vt on the device; the host reads
     the ids and probabilities only (the geometry of the next pass, the log)."""
     t0 = time.perf_counter(); mp = min(g for g in self.mtp_geos if g >= a)
-    mp, ids, ps = self.mtp_pass_dev(a, pos, (0, a - 1), rows_in=lambda: self._dcatch(m, a, mp)); d, pr = [int(ids[a - 1])], [float(ps[a - 1])]
+    mp, ids, ps = self.mtp_pass_dev(a, pos, (0, a - 1), rows=self._dcatch_fn(m, a, mp)); d, pr = [int(ids[a - 1])], [float(ps[a - 1])]
     log = self.spec_log is not None; mprev, row = mp, a - 1
     if log: tl, fx, px = [time.perf_counter() - t0], [self.mtp_feats[a - 1]], [self.mtp_ptop[a - 1]]
     t3 = [self.mtp_t3[a - 1]] if self.leaf else []                       # (the leaf tree: each draft's top-3, its leaves)
     for j in range(1, k):
       if not (len(pr) < self.kmax and (float(np.prod(pr)) >= self.tc if self.leaf else pr[-1] >= self.tau)): break
       t1 = time.perf_counter(); m1 = min(self.mtp_geos)
-      _, ids, ps = self.mtp_pass_dev(1, pos + a - 1 + j, (j, 0), rows_in=lambda: self._dchain(mprev, row, m1)); d.append(int(ids[0])); pr.append(float(ps[0])); mprev, row = m1, 0
+      _, ids, ps = self.mtp_pass_dev(1, pos + a - 1 + j, (j, 0), rows=self._dchain_fn(mprev, row, m1)); d.append(int(ids[0])); pr.append(float(ps[0])); mprev, row = m1, 0
       if self.leaf: t3.append(self.mtp_t3[0])
       if log: tl.append(time.perf_counter() - t1); fx.append(self.mtp_feats[0]); px.append(self.mtp_ptop[0])
     self.draft_p, self.draft_t3 = pr, t3
@@ -364,9 +445,36 @@ class Model:
     if self.MTPL:
       for g in self.mtp_geos:
         for _ in range(2): self.mtp_pass(np.zeros((g, 2 * R.H), np.float32), 0)
+      if os.environ.get("QWEN_DRAFT_WARM", "1") == "1": self._draft_warmup()
     gb = sum(t.nbytes() for V_ in self.vers.values() for t in V_.K.bufs.values()) / 1e9   # every verify / draft geometry's persistent buffers
     self.prof = {}; print(f"   speculative decoding: geometries {self.geos} (+ the MTP layer) captured in {time.perf_counter() - t0:.0f} s; their device buffers "
                           f"{gb:.2f} GB (of which the state banks {self.banks.nbytes() / 1e9:.2f} GB)", flush=True)
+  def _draft_warmup(self):
+    """QWEN_DRAFT_WARM (default 1): capture the decode loop's draft JITs too, so no capture (~0.5-1.5 s each) lands inside a
+    generation: QWEN_NPU_IDS -- every catch-up (verify geometry m, a accepted rows; with the folded commit) and chained (the row it
+    drafts from, its depth) draft of mtp_draft_dev; the host path -- the one-job pass per MTP geometry, with and without the folded
+    commit. Throwaway passes at position 0 before any prefill, as spec_warmup's (the commit's words copy nothing: a = 0)."""
+    t0 = time.perf_counter(); n = 0; fold = COMMIT_FOLD and self.ringc
+    def with_commit():
+      if fold: poke(self.cwords, np.array([0, self.M, 0, -1, -1] + [0] * self.M, np.int32)); self.pcommit = self._commit_call(self.M)
+    if NPU_IDS:
+      m1 = min(self.mtp_geos); seen = set()
+      for m in self.geos:
+        for a in range(1, min(m, self.kmax + 1) + 1):
+          mp = min(g for g in self.mtp_geos if g >= a)
+          for _ in range(2): with_commit(); self.mtp_pass_dev(a, 0, (0, a - 1), rows=self._dcatch_fn(m, a, mp)); n += 1
+          for j in range(1, self.kmax):
+            src = (mp, a - 1) if j == 1 else (m1, 0)
+            if (src, j) in seen: continue
+            seen.add((src, j))
+            for _ in range(2): self.mtp_pass_dev(1, 0, (j, 0), rows=self._dchain_fn(src[0], src[1], m1)); n += 1
+    elif self._draft1_ok(self.dhead, self.dhead["parts"][:self.draft_parts if self.parts_thresh is None else 1]):
+      for g in self.mtp_geos:                                             # (spec_warmup's mtp_pass captured the passes without a commit)
+        if fold:
+          for _ in range(2): with_commit(); self.mtp_pass(np.zeros((g, 2 * R.H), np.float32), 0); n += 1
+    self.pcommit = None
+    if self.ringc: poke(self.cwords, np.zeros(QK.RC_W + self.M, np.int32))
+    print(f"   draft JITs warmed: {n} passes in {time.perf_counter() - t0:.0f} s", flush=True)
   def _ver(self, m):
     """The verify geometry for m tokens (Layers(m): compact rows), sharing the weight slots; its two ping-pong row buffers."""
     if m not in self.vers:
@@ -421,6 +529,15 @@ class Model:
     else:
       assert offs == zc["packs"][l0][1] and n <= zc["packs"][l0][2], "the MTP pack does not match an attention layer's layout"
       self.dhead = self.mhead
+    # the MTP layer's own window slot (the one-job draft, QWEN_DRAFT_JOB: the head's parts take the layer slots meanwhile): another
+    # model's MTP layer has one already; else one more slot of the layer's size, if the window has room (else the jobs as before)
+    self.mtp_own = self.mtp_own_views = None
+    if self.mtp_x: self.mtp_own, self.mtp_own_views = self.mtp_sid, self.mtp_views
+    elif DRAFT_JOB:
+      try:
+        sid_, sva_ = raw.slot_alloc(n); self.mtp_own = sid_
+        self.mtp_own_views = {k_: Tensor.from_blob(sva_ + offs[k_], (sz,), dtype=dtypes.uint8, device=DEV) for k_, sz in sizes.items()}
+      except OSError as e: print(f"   (QWEN_DRAFT_JOB: no window slot for the MTP layer -- {e}; a draft pass keeps its jobs)", flush=True)
     wid, mm = raw.wbuf_alloc(n)
     for k_, sz in sizes.items(): read_into(os.path.join(self.mtp_cache, f"L{self.MTPL}_{k_}.bin"), memoryview(mm)[offs[k_]:offs[k_] + sz], sz)
     self.mtp_w = (wid, mm, n); self.meta_mtp, small = src._meta(self.MTPL)
@@ -462,6 +579,21 @@ class Model:
     x = np.empty((m, 2 * R.H), np.float32); x[:r] = rows; x[r:] = rows[-1]
     poke(L.K.rows_buf("mtp_in", 2 * R.H), x)                              # only the m real rows (the kernels read no others)
     poke(self.aix[self.NATT], np.array([self.NATT, pos], np.int32))
+    hp = self.dhead; parts = hp["parts"][:self.draft_parts]; n0 = len(parts) if self.parts_thresh is None else 1   # (thresh: part 0, then maybe more)
+    if self._draft1_ok(hp, parts[:n0]):                                    # one job: the pending commit, the MTP layer, the first n0 parts
+      cm = self._take_commit(); own = self._mtp_map_own(); Ld = self._dheadL(m); top3 = self.head_top3
+      views = [own[k] for k in self.MTP_LIN] + self._dhead_views(hp, parts[:n0])
+      key = ("h1", m, n0, top3, cm[0] if cm else None)
+      if key not in self.jit_d1: self.jit_d1[key] = TinyJit(functools.partial(self._draft1, m, None, cm[1] if cm else None, Ld, hp, n0, None, None, False, top3, False))
+      t1 = time.perf_counter()
+      with one_job(): out = self.jit_d1[key](self.aix[self.NATT], *views)
+      hx = OA.host_invalidate(out).numpy()[:r].copy()
+      pre = [OA.host_invalidate(Ld.K.bufs[f"top3_head{i}" if top3 else f"top_head{i}"]).numpy().reshape(-1, Ld.n, 8 if top3 else 4).copy() for i in range(n0)]
+      t2 = time.perf_counter(); ids, pr = self.head_top(out, Ld, self.mtp_norm_w1, self.draft_parts, thresh=self.parts_thresh, row=r - 1, top3=top3, hp=hp, pre=pre)
+      lg = (ids[:r], pr[:r]); t3 = time.perf_counter(); self._draft_feats(r)
+      for k_, v in (("mtp_in", t1 - t0), ("mtp_layer", t2 - t1), ("mtp_head", t3 - t2)): pf[k_] = pf.get(k_, 0.0) + v
+      return hx, lg
+    self._commit_flush()
     if self.mtp_x: zc["raw"].slot_map(self.mtp_sid, self.mtp_w[0], 0, self.mtp_w[2]); views = self.mtp_views   # its own slot
     else:
       zc["raw"].slot_map(zc["slots"][0][0], self.mtp_w[0], 0, self.mtp_w[2]); zc.setdefault("slot_src", [None, None])[0] = None
@@ -515,9 +647,10 @@ class Model:
     a_h = L.K.rms_a(x, (self.Win_g, idh), R.H, "a_h")
     ct = L.lin_cts(a_h, slot, self.meta_gdn, ("qkv", "z"))                   # one GEMM when the cache fuses qkv | z
     if self.leaf:                                                         # the leaf tree: leaves read-only from their parent's state, the deferred commit (QWEN_GDN_FAST: gdn_fast_src(tree=True))
+      rows = R.HAD or QK.gdn_fast() == "off"                              # (else o_proj's A straight from the kernel)
       a_o = L.K.gdn_tokl(self.Sall, self.Call, idh, self.posb, ct["qkv"][0], ct["z"][0], x, self.Wab, self.Adt, self.Cwt, self.Nw, self.banks, self.rawm, self.pathb, self.treeb,
-                         R.NV, R.NK, R.DK, R.DV, self.C, R.CONV, R.H, self.NGDN, self.M, xoff=ct["qkv"][1], zoff=ct["z"][1])
-      a_o = L.K.rms_a(a_o, None, R.NV * R.DV, "a_o", norm=False)
+                         R.NV, R.NK, R.DK, R.DV, self.C, R.CONV, R.H, self.NGDN, self.M, xoff=ct["qkv"][1], zoff=ct["z"][1], rows=rows)
+      if rows: a_o = L.K.rms_a(a_o, None, R.NV * R.DV, "a_o", norm=False)
     elif self.tree:                                                       # the tree verify: the rescue rows as one-token waves from their parents' banks
       a_o = L.K.gdn_tokt(self.Sall, self.Call, idh, self.posb, ct["qkv"][0], ct["z"][0], x, self.Wab, self.Adt, self.Cwt, self.Nw, self.banks, self.rawm, self.treeb,
                          R.NV, R.NK, R.DK, R.DV, self.C, R.CONV, R.H, self.NGDN, xoff=ct["qkv"][1], zoff=ct["z"][1])
@@ -558,25 +691,47 @@ class Model:
     o = K.head_reduce(red)                                                # the last part read: the token on the device too
     if pick is not None and red: K.call(f"pick_id|{pick[0]}|{pick[1]}", QK.pick_src(*pick), self.vtok, o, self.dtok)   # a draft: into vt
     return o
-  def head_top(self, x, L, norm_w1=None, parts=None, thresh=None, row=None, top3=False, hp=None):
+  def head_top(self, x, L, norm_w1=None, parts=None, thresh=None, row=None, top3=False, hp=None, pre=None):
     """The block-scaled head's top-1 on geometry L's rows of x (after the final norm, or `norm_w1`'s) -> (ids [m], probabilities
     [m]); `parts`: the head's first parts only (a draft needs no exact vocabulary: the verify pass decides). Per part the GEMM
     and head_top run as one JIT submission (their slot mapped first); only the 12 tasks' partials come back.
     `thresh`: parts 1.. are skipped when part 0's top logit on row `row` (every row if None) exceeds it (QWEN_DRAFT_PARTS' thresh:<x>).
     `top3`: the top-3 kernel; `head_t3` then holds per row, per part read, ([3 global ids], [3 logits]) in rank order.
-    Also set: `head_ptop` [parts read, m] (each part's top logit) and, when `need_feats`, `head_feats`. `hp`: as _head_part's."""
-    zc = self.pre.zc; raw = zc["raw"]; nw = self.norm_w1 if norm_w1 is None else norm_w1; tops = []; hp = self.mhead if hp is None else hp
-    if NPU_IDS and thresh is None and not top3: return self._head_top_dev(x, L, nw, hp, hp["parts"][:parts])
+    Also set: `head_ptop` [parts read, m] (each part's top logit) and, when `need_feats`, `head_feats`. `hp`: as _head_part's.
+    `pre`: the first parts' partials, already computed (the one-job draft pass, _draft1)."""
+    zc = self.pre.zc; raw = zc["raw"]; nw = self.norm_w1 if norm_w1 is None else norm_w1; tops = list(pre or []); hp = self.mhead if hp is None else hp
+    if NPU_IDS and thresh is None and not top3 and not pre: return self._head_top_dev(x, L, nw, hp, hp["parts"][:parts])
+    if not pre and thresh is None and DRAFT_JOB and getattr(self, "blk", 1) > 1 and hp["sid"] is None and len(hp["parts"][:parts]) <= 2 * self.blk \
+       and all(p_["n"] <= zc["bsize"] for p_ in hp["parts"][:parts]):
+      tops = self._head_tops_blk(x, L, nw, hp, hp["parts"][:parts], top3)   # layer blocks: every part in a block slot, one job
     for i, p_ in enumerate(hp["parts"][:parts]):
-      par = i % 2; raw.slot_map(zc["slots"][par][0] if hp["sid"] is None else hp["sid"], p_["wid"], 0, p_["n"]); key = (L.n, id(L), i, id(x), id(nw), top3, id(hp))
-      if key not in self.jit_head: self.jit_head[key] = TinyJit(functools.partial(self._head_part, L, i, x, nw, top3=top3, hp=hp))
-      tops.append(OA.host_invalidate(self.jit_head[key](p_["views"][par])).numpy().reshape(-1, L.n, 8 if top3 else 4).copy())
+      if i >= len(tops):
+        par = i % 2; raw.slot_map(zc["slots"][par][0] if hp["sid"] is None else hp["sid"], p_["wid"], 0, p_["n"]); key = (L.n, id(L), i, id(x), id(nw), top3, id(hp))
+        if key not in self.jit_head: self.jit_head[key] = TinyJit(functools.partial(self._head_part, L, i, x, nw, top3=top3, hp=hp))
+        tops.append(OA.host_invalidate(self.jit_head[key](p_["views"][par])).numpy().reshape(-1, L.n, 8 if top3 else 4).copy())
       if i == 0 and thresh is not None:                                   # the parts policy: part 0's top on the decision row(s)
         p0 = tops[0][..., 0].max(0)
         if (p0[row] if row is not None else p0.min()) > thresh: break
     ids, pr, self.head_ptop, feats, self.head_t3 = combine_tops(tops, [p_["c0"] for p_ in hp["parts"][:len(tops)]], top3, getattr(self, "need_feats", False))
     if feats is not None: self.head_feats = feats
     return ids, pr
+  def _head_tops_blk(self, x, L, nw, hp, parts, top3):
+    """head_top's parts as ONE job over the layer blocks' slots (QWEN_LAYER_BLOCK): parts 0..k-1 into the parity-0 block slots
+    without a drain (the job in flight is the last block's, parity 1), the rest into the parity-1 slots after it -> each part's
+    partials, as the per-part JITs leave them."""
+    zc = self.pre.zc; raw = zc["raw"]; k = self.blk; views = []
+    for i, p_ in enumerate(parts):
+      bp, j = (0, i) if i < k else (1, i - k)
+      if i < k: slot_map_nodrain(raw, zc["bslots"][(bp, j)][0], p_["wid"], 0, p_["n"])
+      else: raw.slot_map(zc["bslots"][(bp, j)][0], p_["wid"], 0, p_["n"])   # (drains: the last block may read that slot)
+      views.append(self.pre.blob_view(bp, j, p_["n"]))
+    key = ("hall", L.n, id(L), id(x), id(nw), id(hp), len(parts), top3)
+    if key not in self.jit_head: self.jit_head[key] = TinyJit(functools.partial(self._head_parts_host, L, x, nw, hp, len(parts), top3))
+    with one_job(): self.jit_head[key](*views)
+    return [OA.host_invalidate(L.K.bufs[f"top3_head{i}" if top3 else f"top_head{i}"]).numpy().reshape(-1, L.n, 8 if top3 else 4).copy() for i in range(len(parts))]
+  def _head_parts_host(self, L, x, nw, hp, n, top3, *views):
+    for i in range(n): t = self._head_part(L, i, x, nw, views[i], top3=top3, hp=hp)
+    return t
   def _head_top_dev(self, x, L, nw, hp, parts, pick=None, x3=False):
     """head_top with the token chosen on the device (QWEN_NPU_IDS): the last part's job ends with head_reduce, and only its
     [ids | probabilities] come back. Telemetry (need_feats: QWEN_SPEC_LOG) still reads the partials and checks the ids."""
@@ -634,6 +789,7 @@ class Model:
     per-token state banks (commit() picks the accepted one). QWEN_SPEC_TREE: `tree` (a spec_tree.Tree over the M rows; None =
     the chain) is the kernels' table -- rows at pos + depth, attending their ancestors; the rescue rows' K / V at pos + row."""
     M = len(toks); L = self._ver(M); xbv = self.xbvs[M]; assert 2 <= M <= self.M and pos + M <= self.TMAX
+    self._commit_flush()                                                  # (a folded commit no draft pass took)
     if NPU_IDS and not getattr(self, "_prompt_pass", False):              # vt holds [cur, drafts] (accept / pick_id wrote them)
       if self.need_feats: assert OA.host_invalidate(self.vtok).numpy()[:M].tolist() == [int(t) for t in toks], ("vt", OA.host_invalidate(self.vtok).numpy()[:M], toks)
       self._vemb(M)
@@ -643,9 +799,11 @@ class Model:
     if self.tree: assert M == self.M or self.leaf; poke(self.treeb, spec_tree.table(tree) if tree is not None else spec_tree.chain_table(M))
     if self.blk > 1: self._verify_blocks(M, L)
     else:
+      zc = self.pre.zc; late = STREAM_LATE and bool(zc) and bool(zc.get("stream"))   # streamed layers: refill / prefetch after the next submit
       L.prefetch(0)
+      if late: zc["late_refill"] = True
       for l in range(R.NL):
-        if l + 1 < R.NL: L.prefetch(l + 1)
+        if l + 1 < R.NL and not late: L.prefetch(l + 1)
         slot, meta, sm = L.load(l); par = l % 2
         if R.LAYER_TYPES[l] == "full":
           self.meta_att = meta
@@ -655,6 +813,8 @@ class Model:
           self.meta_gdn = meta
           if (M, par) not in self.jit_vgdn: self.jit_vgdn[(M, par)] = TinyJit(functools.partial(self.vgdn_step, M, par))
           self.jit_vgdn[(M, par)](self.sidx[self.gidx[l]], *[slot[k] for k in self.GDN_LIN])
+        if late: L.after_submit(l)
+      if late: zc["late_refill"] = False
     if not NPU_IDS or self.dump is not None or getattr(self, "_prompt_pass", False): self.v_hidden = OA.host_invalidate(xbv[0]).numpy()[:M].copy()   # the MTP draft head's input
     if head is None: return None                                          # (the last layer, parity 1, wrote xbv[0])
     return self.head_top(xbv[0], L)[0] if head == "top" else self.logits_rows(xbv[0], L=L)
@@ -673,19 +833,37 @@ class Model:
       if jit.cnt < 2:                                                     # the capture: the whole block as one graph, one chain
         with one_job(): jit(*args)
       else: jit(*args)
-  def commit(self, a, pos, m=None, path=None):
+  def commit(self, a, pos, m=None, path=None, fold=False):
     """After verify(toks, pos) accepted a of its M tokens: the DeltaNet states and rings as after toks[:a] (posb still = pos).
     QWEN_SPEC_TREE: `path` = the committed rows (spec_tree.accept; None = the chain's first a): the state from the path's last
-    row's bank, the ring from the path's raw rows, a committed rescue row's K / V rows moved to its position (gdn_commit_tree)."""
-    m = self.M if m is None else m
+    row's bank, the ring from the path's raw rows, a committed rescue row's K / V rows moved to its position (gdn_commit_tree).
+    The deferred commit (the state's updates wait for the next verify pass) leaves only copies: ring_commit (QWEN_RING_COMMIT=1,
+    default) does them for any geometry from `cwords`, the same bytes as gdn_commit_tree(defer) / gdn_commit(ring_only). `fold`
+    (the decode loop, a draft pass next): the kernel is not run here but by the next draft pass's job (QWEN_COMMIT_FOLD, `pcommit`);
+    anything else that runs first (verify, flush, prefill) runs it on its own (_commit_flush)."""
+    m = self.M if m is None else m; self._commit_flush()
+    self.pend = self.defer                                                # (the deferred commit: the accepted updates wait for the next verify pass)
+    nc = None
     if self.tree:                                                         # (leaf: pathb is also the next pass's pending path, gdn_tokl)
       nc = getattr(self, "pass_nc", m) if self.leaf and path is not None else (m if self.leaf else self.NC)
       poke(self.pathb, spec_tree.path_words(list(range(a)) if path is None else path, self.M if self.leaf else m, nc))
-      self.vers[m].K.gdn_commit_tree(self.Sall, self.banks, self.Call, self.rawm, self.Kall, self.Vall, self.pathb, self.posb,
-                                     R.NV, R.DK, R.DV, self.C, R.CONV, m, self.NGDN, self.NATT, self.TMAX, R.NKV, R.HD, defer=self.leaf)
-      return
-    if not NPU_IDS or getattr(self, "_prompt_pass", False): poke(self.accb, np.array([a], np.int32))   # QWEN_NPU_IDS: accept wrote it (not for a prompt pass)
-    self.vers[m].K.gdn_commit(self.Sall, self.banks, self.Call, self.rawm, self.accb, self.posb, R.NV, R.DK, R.DV, self.C, R.CONV, m, self.NGDN, ring_only=self.defer)
+    elif not NPU_IDS or getattr(self, "_prompt_pass", False): poke(self.accb, np.array([a], np.int32))   # QWEN_NPU_IDS: accept wrote it (not for a prompt pass)
+    if self.ringc: poke(self.cwords, QK.ring_commit_words(a, m, pos, path, nc if self.tree else None, self.M))
+    c = self._commit_call(m)
+    if fold and COMMIT_FOLD and self.ringc: self.pcommit = c
+    else: c[1]()
+  def _commit_call(self, m):
+    """The commit's kernel for a pass on geometry m -> (its key, the call that issues it)."""
+    if self.ringc:
+      return ("ring",), lambda: self.ver.K.ring_commit(self.Call, self.rawm, self.Kall, self.Vall, self.cwords, self.C, R.CONV, self.NGDN, self.NATT, self.TMAX, R.NKV, R.HD)
+    if self.tree:
+      return ("tree", m), lambda: self.vers[m].K.gdn_commit_tree(self.Sall, self.banks, self.Call, self.rawm, self.Kall, self.Vall, self.pathb, self.posb,
+                                                                 R.NV, R.DK, R.DV, self.C, R.CONV, m, self.NGDN, self.NATT, self.TMAX, R.NKV, R.HD, defer=self.leaf)
+    return ("chain", m), lambda: self.vers[m].K.gdn_commit(self.Sall, self.banks, self.Call, self.rawm, self.accb, self.posb, R.NV, R.DK, R.DV, self.C, R.CONV, m, self.NGDN, ring_only=self.defer)
+  def _commit_flush(self):
+    """A commit left for the next draft job (commit(fold=True)) that has not run: run it now, on its own."""
+    c = self._take_commit()
+    if c is not None: c[1]()
   def spec_generate(self, first, pos, max_new, drafter, stats=None, cb=None):
     """Greedy speculative decoding from `first` (generated, not yet fed) at `pos`: each pass verifies [cur, d1..d(M-1)]
     (drafter(cur, pos, out) -> M - 1 ids), keeps the drafts the model agrees with plus its own next token. Returns the new ids
@@ -738,13 +916,14 @@ class Model:
       if mtp:                                                             # (draft depth, probability, accepted) for the threshold's choice
         st.setdefault("draft_log", []).extend((j, self.draft_p[j], j < ac) for j in range(nd))
       st.setdefault("rows", []).append(m)
-      tc = time.perf_counter(); self.commit(a, pos, m, path); tc = time.perf_counter() - tc
       n0 = len(out)
       for t in new:
         out.append(t)
         if t in EOS or len(out) >= max_new: break
+      more = mtp and len(out) < max_new and out[-1] not in EOS            # a draft pass next: the commit rides in its job (QWEN_COMMIT_FOLD)
+      tc = time.perf_counter(); self.commit(a, pos, m, path, fold=more); tc = time.perf_counter() - tc
       if cb is not None: cb(out[n0:], tv)
-      if mtp and len(out) < max_new and out[-1] not in EOS:               # the MTP cache caught up on the committed path's hidden rows
+      if more:                                                            # the MTP cache caught up on the committed path's hidden rows
         t0 = time.perf_counter(); dnext = self.mtp_draft_dev(m, a, pos, self.kmax) if NPU_IDS else self.mtp_draft(self.v_hidden[path], new, pos, self.kmax)
         st["t_draft"] = st.get("t_draft", 0.0) + time.perf_counter() - t0
       if tree is not None:
@@ -756,6 +935,7 @@ class Model:
           tv=tv, tc=tc, t_rest=time.perf_counter() - t0v - tv, **drec, **(dict(tree=trec) if tree is not None else {}))) + "\n")
       cur, pos = out[-1], pos + a
       st.setdefault("passes", 0); st["passes"] += 1; st.setdefault("accepted", 0); st["accepted"] += a - 1; st.setdefault("t_verify", 0.0); st["t_verify"] += tv
+    self._commit_flush()                                                  # (a commit no draft pass took: run it)
     if flog:
       flog.write(json.dumps({"end": dict(tokens=len(out), dt=time.perf_counter() - t_start, passes=st.get("passes", 0), out_ids=[int(v) for v in out])}) + "\n"); flog.close()
     return out
@@ -836,6 +1016,8 @@ class Model:
     DeltaNet states and caches carried like a decode), the last chunk padded and committed to its real length -> the logits of
     the last prompt token. The rows-mode (compact) layouts only: the Q8_0 models' prefill."""
     self.ids_prompt = list(ids); n = len(ids); m = max(self.geos); lg = None
+    self.reset()                                                          # (the first chunk reads Sall as the state before position 0: zero it --
+    #                                                                        spec_warmup's bank-path passes, a previous prompt or plain steps left one there)
     self._prompt_pass = True                                              # QWEN_NPU_IDS: the prompt's ids / rows come from the host
     for c0 in range(0, n, m):
       chunk = list(ids[c0:c0 + m]); a = len(chunk); mm = min(g for g in self.geos if g >= max(2, a))
@@ -850,7 +1032,8 @@ class Model:
     new prompt has written."""
     self.Sall.assign(Tensor.zeros(self.Sall.shape[0], device=DEV, dtype=dtypes.float32)).realize()
   def prefill(self, ids, nlayers=None):
-    if getattr(self, "defer", False): poke(self.accb, np.zeros(1, np.int32))   # no update pending for the next verify pass (gdn_defer_src)
+    self._commit_flush()
+    if getattr(self, "defer", False): poke(self.accb, np.zeros(1, np.int32)); self.pend = False   # no update pending for the next verify pass (gdn_defer_src)
     if getattr(self, "leaf", False) and self.M: poke(self.pathb, np.zeros(4 + self.M, np.int32))   # (the leaf tree's gdn_tokl: its pending path)
     if R.Q8 or os.environ.get("QWEN_PREFILL") == "chunked": return self.prefill_chunked(ids)
     nlayers = R.NL if nlayers is None else nlayers
@@ -908,8 +1091,17 @@ class Model:
     x = L.K.resid(x, L.lin_ct(L.K.rms_a(oc, None, R.NH * R.HD, "a_o", norm=False), slot, self.meta_att, "o"), R.H, "x1")
     return L.mlp(x, slot, self.meta_att, (self.Wpost_a, ah), f"xio{1 - par}").realize()
 
+  def flush(self):
+    """The deferred commit's pending updates into Sall now (gdn_flush), none left pending: before a plain decode step, which reads
+    Sall -- the Q8_0 models' prompt goes through the verify path (prefill_chunked), and a step may follow a verify pass."""
+    self._commit_flush()
+    if not getattr(self, "pend", False): return
+    K = self.ver.K; acc = self.pathb if self.leaf else self.accb
+    K.gdn_flush(self.Sall, self.banks, acc, R.NV, R.DK, R.DV, self.NGDN, self.M, tree=self.leaf)
+    poke(acc, np.zeros(4 + self.M if self.leaf else 1, np.int32)); self.pend = False
   def step(self, tok, pos):
     L = self.dec; assert pos < self.TMAX
+    self.flush()
     x = np.zeros((L.R, R.H), np.float32); x[0] = self.W.embed([tok])[0]; self.xb[0].assign(dev(x)).realize()
     if pos not in self.cos_dec: self.cos_dec[pos], self.sin_dec[pos] = rope_tables(pos, L.R)
     for i, t in enumerate(self.aix): t.assign(Tensor([i, pos], device=DEV, dtype=dtypes.int32)).realize()

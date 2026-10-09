@@ -19,6 +19,7 @@ os.environ.setdefault("QWEN_NPU", "/mnt/ssd/bonsai2-npu")
 os.environ.setdefault("QWEN_DIR", os.environ.get("BONSAI_GGUF", "/mnt/ssd/bonsai2/Ternary-Bonsai-2-27B-PTQ1_0.gguf"))
 os.environ.setdefault("QWEN_TOK", os.environ["QWEN_NPU"])
 os.environ.setdefault("QWEN_NPU_IDS", "1")                 # the decode loop's token ids chosen, embedded, accepted and drafted on the NPU
+os.environ.setdefault("ZHOUYI_TEXT_GM", "1")              # kernel code fetched from the cluster's GM, not DDR (4.4x cheaper cold fetch; -17 ms a verify pass)
 os.environ.setdefault("ZHOUYI_CHAIN_MAX", "16")           # a layer's launches as one job (8: two); -16 ms a 4-row verify pass
 os.environ.setdefault("QWEN_LAYER_BLOCK", "4")            # the verify pass's layers 4 at a time, a block one job (and the head one job)
 os.environ.setdefault("QWEN_SPEC", "4")                 # verify geometries up to 4 rows: a 5th row still costs ~+80 ms a pass (rows 6-8 ~+15 each)

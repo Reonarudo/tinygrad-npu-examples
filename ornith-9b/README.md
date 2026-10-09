@@ -5,9 +5,9 @@ the Radxa Orion O6N through tinygrad's `ZHOUYI` backend (the repository's `tinyg
 and the prompt's prefill run on the NPU; the host tokenises, looks up the embedding and picks tokens.
 
 **Status: it generates.** *"What is the capital of Portugal? Answer in one sentence."* ->
-`The capital of Portugal is Lisbon.<|im_end|>` (greedy). Measured on the board: model set-up 16 s, prefill ~7.8 tokens/s
-(35 tokens in 4.5 s), **decode ~4.4 tok/s across prompts and ~5.4 tok/s on a code prompt** with speculative decoding and
-the `--q8f` cache (below; 1.7 tok/s, 0.58 s a token, without speculative decoding).
+`The capital of Portugal is Lisbon.<|im_end|>` (greedy). Measured on the board: model set-up 30 s (14 s for plain decoding),
+prefill ~14 tokens/s (42 tokens in 2.4 s), **decode 6.8 tok/s with speculative decoding** on three prompts (4.9-8.4; below),
+2.1 tok/s without, with the same tokens.
 
 ## The model
 
@@ -40,7 +40,7 @@ It is the same layer structure as [qwen3.8-27b](../qwen3.8-27b/) at smaller size
 - **Prefill through the multi-token decode path**: the prompt goes through the speculative-decoding verify pass in chunks of
   up to 6 tokens (each chunk one streaming of the weights, the DeltaNet states and caches carried as in decoding).
 
-### `--q8f`: the weights built in fp16 (optional, faster, not exact)
+### `--q8f`: the weights built in fp16 (optional, not exact)
 
 `ornith_pack.py --q8f --out /mnt/ssd/ornith-9b-npu-q8f` packs the same Q8_0 weights for `k_gemm_gs(q8f)`: the expand builds each
 weight in fp16 with the TEC's 16-lane fp16 ALU (the code u = q + 128 zipped under 0x64 is 1024 + u; `sub.fp16` 1152 gives q
@@ -63,6 +63,24 @@ group 171), the MTP head too; ~1.7 GB more on disk, nothing read from the GGUF, 
 There is no fixed-function dequantisation on this NPU to use instead: the vendor's GPTQ hardware (group scales, fp16×int8/int4)
 is X3-only, compiled into the X2 simulator but hard-wired off.
 
+## Speed
+
+Measured on the board with the published backend and `ornith_generate.py`'s defaults (the leaf tree, up to 8 rows and 5 drafts),
+the NPU clocks at their defaults, the host on CPUs 0 and 1 (`QWEN_CPUS=0,1`; CPU 0 takes the NPU's interrupt) holding a 0 µs
+CPU-latency request (`QWEN_CPU_LATENCY`, the default), 120 new tokens, wall time after the first token, the prefill excluded. One
+session, on a board shared with other jobs (not running at the same time). Every speculative run returned exactly the ids of plain
+greedy decoding (`QWEN_SPEC=0`) on the same cache.
+
+| prompt | plain | speculative (default cache) | speculative (`--q8f` cache) |
+| --- | ---: | ---: | ---: |
+| e0 Fibonacci in Python | 2.08 | 8.11 | 7.91 |
+| e4 a short story's opening | 2.08 | 4.95 | 4.83 |
+| e8 a train journey's length, step by step | 2.07 | 8.35 | 8.15 |
+| **the three together** | **2.08** | **6.75** | **6.56** |
+
+On the published backend the `--q8f` cache no longer pays: plain decoding is level (2.09 tok/s) and speculative decoding is 2-3 %
+slower than on the exact cache, with the same tokens. The sections below record how the speed was reached, on earlier builds.
+
 ## Speculative decoding: Qwen3.5-9B's MTP head drafts for Ornith
 
 Ornith's GGUF has no multi-token-prediction head, but Ornith is a fine-tune of Qwen3.5-9B (its weights are within 2-3 % of the
@@ -77,6 +95,20 @@ of the weights (`QWEN_DRAFT_MAX`; the chain stops early when the draft head is u
 | decode, three prompts x 64 tokens | **3.50 / 4.55 / 3.69 tok/s** (plain: 1.72; 2.74 / 3.58 / 2.93 before the host overhead and the TEC work below) |
 | decode, 300 tokens (a binary-search-tree module) | **4.45 tok/s** (3.89 with the old attention kernel; the same 300 tokens) |
 | tokens | identical to plain greedy decoding on all three |
+
+**The leaf tree on the fast DeltaNet kernel (the default).** The verify pass's DeltaNet is Bonsai 2's fast kernel (`gdn_fast_src`:
+hand-scheduled fused sweeps, the commit deferred to the next pass, no per-token state banks), writing o_proj's A directly:
+`gdn_tokm` 842 -> 328 us a call (4 rows, 2 pending updates, `QWEN_SPEC=4`); at the default `QWEN_SPEC=8` (8 pending slots, another
+LSRAM plan) 834 -> 382 us at 4 rows and 1669 -> 626 us at 8. `ornith_generate.py` sets the leaf tree up to 8 rows and 5 drafts
+(`QWEN_SPEC_TREE=leaf QWEN_SPEC=8 QWEN_DRAFT_MAX=5`: the chain plus the drafts' rank-2/3 candidates in the spare rows). Three
+prompts x 120 tokens on a backend whose Q8_0 GEMM rows 5-8 were rescheduled, one session, every run identical to plain
+greedy: 5.04 tok/s pooled with the old kernel and the chain of 3, 5.17 with the fast kernel, 5.39 with 5 drafts, **6.07** with the
+leaf tree. A second session on the final tree (3 prompts x 120): the previous default 5.04 tok/s, the fast kernel with the chain of 3 5.46, the leaf
+tree **6.59** (e0 / e4 / e8 7.94 / 4.81 / 8.18); over the ten prompts 6.19 tok/s pooled, every run identical to plain greedy
+(`QWEN_SPEC=0`). On an older backend, whose rows 5+ still cost ~1.35x, take `QWEN_SPEC=4` (the leaf tree at 4 rows, +6 % over
+the chain). `QWEN_GDN_FAST=off` returns to the per-token banks, `QWEN_SPEC_TREE=off` to the chain. Before this, the chunked
+prefill started from whatever state the warm-up's verify passes had left in place (e4 / e8 of the board's prompts took other
+tokens after 12 / 29); it now starts from zero.
 
 A verify pass of up to 4 rows costs about one plain step; 5-6 rows cost ~1.45x (the Q8_0 GEMM is compute-bound), which is why
 the drafts stop at 3. Where a pass's time goes (4 rows): 0.56 s = the layers 0.48 s
@@ -106,15 +138,16 @@ a Qwen3.5-9B GGUF that keeps the `nextn` (MTP) tensors, e.g. its bf16 conversion
 ```sh
 cd ornith-9b
 export ORNITH_GGUF=/mnt/ssd/models/ornith-1.0-9b-Q8_0.gguf ORNITH_MTP=/mnt/ssd/models/Qwen3.5-9B-bf16.gguf
-export QWEN_NPU=/mnt/ssd/ornith-9b-npu-q8f
-python3 ornith_pack.py --q8f                       # the 32 layers and the head, ~1 min, 8.0 GB
-python3 ornith_pack.py --q8f --mtp                 # the draft head from $ORNITH_MTP (optional: without it, plain decoding)
+export QWEN_NPU=/mnt/ssd/ornith-9b-npu
+python3 ornith_pack.py                             # the 32 layers and the head, ~1 min, 8.0 GB
+python3 ornith_pack.py --mtp                       # the draft head from $ORNITH_MTP (optional: without it, plain decoding)
 python3 ornith_pack.py --fuse                      # the fused projections, ~1.7 GB more (optional)
 cp /path/to/tokenizer.json $QWEN_NPU/
 python3 ornith_generate.py "Write a Python function that returns the n-th Fibonacci number." --max-new 64
 ```
 
-Leave out `--q8f` for the exact kernel's cache (a separate folder: a cache holds one format). `ornith_generate.py` is
+`--q8f` on every pack command (into another folder: a cache holds one format) builds the `--q8f` cache instead; on the
+published backend it measures 2-3 % slower than the exact one. `ornith_generate.py` is
 qwen3.8-27b's `qwen38_generate.py` with the profile set; the same options apply (`--max-new`, `--thinking`, `--out`); with the MTP
 head packed, decoding is speculative (`QWEN_SPEC=0`: plain). Environment: `ORNITH_GGUF` (the checkpoint, read for the
 embedding), `QWEN_NPU` (the packed cache), `QWEN_TOK` (tokenizer.json's folder, default the cache), `QWEN_PIN_GB` (default 12).

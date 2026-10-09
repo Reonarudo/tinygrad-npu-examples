@@ -25,6 +25,11 @@ static inline float8 exp2_d4(float8 t) {
 }
 static inline float8 sw(float8 u, float8 q) { float8 e = exp2_d4(BC(-1.4426950408889634f) * u); return u * VRCP(BC(1.0f) + e) * q; }
 """
+# act="gelu" (Gemma 4's gelu_pytorch_tanh gate, ../gemma4): 0.5 u (1 + tanh(z)) = u sigmoid(2 z), z = sqrt(2 / pi) (u + 0.044715 u^3),
+# with swiglu's sigmoid (exp2 by EXP's polynomial, the reciprocal unit). Appended to EXP only for that act (SiLU sources unchanged).
+GELU = """static inline float8 gl(float8 u, float8 q) { float8 z = u + BC(0.044715f) * u * u * u; float8 e = exp2_d4(BC(-2.302208198546288f) * z); return u * VRCP(BC(1.0f) + e) * q; }
+"""
+ACTS = {"silu": ("sw", "swiglu"), "gelu": ("gl", "geglu")}                  # act -> (the helper, the kernel name's stem)
 
 def _units(nrb, nsl):
   """(parts per row block, slices per part): 12 tasks over nrb row blocks x P slice parts."""
@@ -119,15 +124,118 @@ __kernel void rms_a32d(__global half* restrict out, __global float* restrict x, 
   DMA_WAIT_ALL();
 }}"""
 
-def swiglu_a32_src(m_, nrb, real=None, compact=False):
-  """gate | up tiles (N = 2 m_, groups of 48 columns, `nrb` row blocks) -> the A layout of K = m_ (`compact`: as rms_a32)."""
-  assert m_ % 128 == 0; nsl = m_ // 128; rbr, iqr = _real(real, nrb); P = _units(rbr, nsl)
+# ---- QWEN_SMALL2: the RMSNorm's row norms as a RECORD, and the A producer that reads it ----------------------------------------
+# rms_a32d (norm) had every task sum the squares of every real row (12 tasks x the rows: 12-13x its floor at 3-8 rows). Here one
+# launch computes each real row's 1 / rms ONCE (rms_rec: a task a row, or resid32q: the residual's own row-quad tasks) into a
+# record -- float32 [12][16], row r's 1 / rms at [16 r] (one 64-byte line a row: no two tasks store into one line) -- and the A
+# producer (rms_a32f) reads it. The sums run in rms_a32d's order (per row, lane by lane, K ascending; hsum8; the same expression):
+# the same bits. QWEN_RMS2=0: rms_a32d as before.
+NOUNROLL_H = '#define NOUNROLL _Pragma("clang loop unroll(disable)")\n'
+REC_N = 12 * 16                                                             # the record's floats
+
+def rms_rec_desc(c):
+  """slot 0: half a row (c / 2 floats, contiguous); slot 1: one record line (64 B)."""
+  return V._desc_slots((c * 2,), (64,))
+
+def rms_rec_src(c, real, eps):
+  """rec[16 r] = 1 / sqrt(mean(x[r]^2) + eps) for r < real (rms_a32d's phase 1 for one row: acc += v * v over float8 lanes in K
+  order, hsum8, the same expression). A task a row: the row arrives by two DMAs (halves), the sum runs as each lands, the line
+  leaves by DMA. args: rec (float32 [REC_N]), x (fp32 rows, pitch c), desc (rms_rec_desc)."""
+  assert c % 16 == 0 and 1 <= real <= 12 and c * 4 + 64 <= 32768 - 64; H2 = c // 2
+  return V.FULL_H + NOUNROLL_H + f"""
+__kernel void rms_rec(__global float* restrict rec, __global float* restrict x, __global int* restrict desc, const int core_id) {{
+  if (core_id < {real}) {{
+    __global float* xr = x + core_id * {c};
+    DMA_FILL(0, DESC(desc, 0), 0, (int)xr); DMA_FILL(1, DESC(desc, 0), {H2 * 4}, (int)(xr + {H2}));
+    __global float* b = LSF(0); float8 acc = BC(0.0f);
+    DMA_WAIT(0);
+    NOUNROLL for (int k = 0; k < {H2}; k += 8) {{ float8 v = *(__global float8*)(b + k); acc += v * v; }}
+    DMA_WAIT(1);
+    NOUNROLL for (int k = {H2}; k < {c}; k += 8) {{ float8 v = *(__global float8*)(b + k); acc += v * v; }}
+    __global float* o = LSF({c * 4}); o[0] = 1.0f / __builtin_sqrtf(hsum8(acc) * {1.0 / c!r}f + {eps!r}f);
+    DMA_DRAIN(2, DESC(desc, 1), {c * 4}, (int)(rec + core_id * 16));
+  }}
+  DMA_WAIT_ALL();
+}}"""
+
+def rms_a32f_desc(c, real):
+  """slot 0: one 128-column slice of the tiles' rows (4 iqr rows, pitch c); 1: the slice's 128 weights; 2: the slice's A block
+  (32 iqr 32-byte pieces, contiguous); 3: the record's real lines."""
+  iqr = min(3, -(-real // 4))
+  return V._desc_slots((4 * iqr * 128 * 4, 128 * 4, c * 4, 128 * 4), (512,), (1024 * iqr,), (real * 64,), (real * RMS_CH * 4, RMS_CH * 4, c * 4, RMS_CH * 4))
+
+def rms_a32f_src(c, eps, real, norm=True, stacked=False, guard=False):
+  """rms_a32d's phase 2 with the row norms from a record (`norm`: rms_rec / resid32q wrote it) instead of every task's phase 1,
+  and every operand by DMA: a task's slices (sl = core_id, core_id + NT, ..) double-buffered -- the slice's rows and weights in
+  (flag p), its A block built in LSRAM with rms_a32d's expression ((x * inv) * w, CVT16) and out by one DMA (flag 2 + p; the
+  1024 iqr bytes of a slice are one task's, whole lines). Padding rows (r >= real in the last quad) get inv 0, as in rms_a32d.
+  The same bits as rms_a32d. args: out, x, w1 (or x when not `norm`), [idx], [rec (norm)], desc (rms_a32f_desc)."""
+  assert c % 128 == 0 and 1 <= real <= 12; nsl = c // 128; iqr = min(3, -(-real // 4))
+  XB = 4 * iqr * 512; WB = 512 if norm else 0; XS = XB + WB; OB = 1024 * iqr; X0 = 1024; O0 = X0 + 2 * XS
+  assert O0 + 2 * OB <= 32768 - 64
+  def fill(k, p):
+    return (f"{{ int s_ = core_id + ({k}) * {NT}; DMA_FILL({p}, DESC(desc, 0), {X0 + p * XS}, (int)(x + s_ * 128));"
+            + (f" DMA_FILL({p}, DESC(desc, 1), {X0 + p * XS + XB}, (int)(w1 + s_ * 128));" if norm else "") + " }")
+  assert not guard or (norm and stacked)
+  inv = (f"DMA_FILL(2, DESC(desc, 3), 0, (int)rec); DMA_WAIT(2);\n    __global float* R_ = LSF(0);\n"
+         f"    NOUNROLL for (int r = 0; r < {4 * iqr}; r++) inv[r] = r < {real} ? R_[16 * r] : 0.0f;") if norm else \
+        f"NOUNROLL for (int r = 0; r < {4 * iqr}; r++) inv[r] = 1.0f;"
+  if guard:   # idx[0] == 0 (the stack's first layer: its input rows were written outside the kernels, e.g. the embedding, so the
+              # record is stale): rms_a32d's phase 1 here (every task sums every real row; the same order: the same bits)
+    CHB = real * RMS_CH * 4; NCH = c // RMS_CH; assert c % RMS_CH == 0 and 2 * CHB <= 32768 - 64
+    inv = f"""if (idx[0] != 0) {{ {inv} }} else {{
+    float8 acc[{real}]; for (int r = 0; r < {real}; r++) acc[r] = BC(0.0f);
+    DMA_FILL(0, DESC(desc, 4), 0, (int)x);
+    NOUNROLL for (int ch = 0; ch < {NCH}; ch++) {{
+      int p = ch & 1;
+      if (ch + 1 < {NCH}) {{ if (p == 0) DMA_FILL(1, DESC(desc, 4), {CHB}, (int)(x + (ch + 1) * {RMS_CH})); else DMA_FILL(0, DESC(desc, 4), 0, (int)(x + (ch + 1) * {RMS_CH})); }}
+      if (p == 0) DMA_WAIT(0); else DMA_WAIT(1);
+      __global float* b = LSF(p * {CHB});
+      NOUNROLL for (int r = 0; r < {real}; r++) NOUNROLL for (int i = 0; i < {RMS_CH}; i += 8) {{ float8 v = *(__global float8*)(b + r * {RMS_CH} + i); acc[r] += v * v; }}
+    }}
+    NOUNROLL for (int r = 0; r < {4 * iqr}; r++) inv[r] = (r < {real}) ? 1.0f / __builtin_sqrtf(hsum8(acc[r]) * {1.0 / c!r}f + {eps!r}f) : 0.0f;
+    }}"""
+  return V.FULL_H + TILE + NOUNROLL_H + f"""
+__kernel void rms_a32f(__global half* restrict out, __global float* restrict x, __global float* restrict w1{", __global int* restrict idx" if stacked else ""}{", __global float* restrict rec" if norm else ""}, __global int* restrict desc, const int core_id) {{
+{"  w1 += idx[0] * %d;" % c if stacked else ""}
+  if (core_id < {nsl}) {{                                  /* one exit for every task (an early `return` beside DMA: had_a32d_src) */
+    int nk = ({nsl} - core_id + {NT - 1}) / {NT};
+    float inv[12];
+    {inv}
+    {fill(0, 0)}
+    NOUNROLL for (int k = 0; k < nk; k++) {{
+      int p = k & 1;
+      if (k + 1 < nk) {{ if (p == 0) {fill("k + 1", 1)} else {fill("k + 1", 0)} }}
+      if (p == 0) DMA_WAIT(0); else DMA_WAIT(1);
+      if (k >= 2) {{ if (p == 0) DMA_WAIT(2); else DMA_WAIT(3); }}      /* this buffer's previous A block gone */
+      __global float* X = LSF({X0}) + p * {XS // 4}; __global half* O = LSH({O0}) + p * {OB // 2};
+      NOUNROLL for (int i = 0; i < {iqr}; i++) {{
+        __global float* x0 = X + (4 * i) * 128;
+        float8 i01 = ROWS2(inv[4 * i], inv[4 * i + 1]), i23 = ROWS2(inv[4 * i + 2], inv[4 * i + 3]);
+        NOUNROLL for (int kq = 0; kq < 32; kq++) {{
+          float4 w4 = {f"*(__global float4*)(X + {XB // 4} + 4 * kq)" if norm else "(float4){1.0f, 1.0f, 1.0f, 1.0f}"}; float8 w8 = F8(w4, w4);
+          float8 t01 = F8(*(__global float4*)(x0 + 4 * kq), *(__global float4*)(x0 + 128 + 4 * kq)) * i01 * w8;
+          float8 t23 = F8(*(__global float4*)(x0 + 256 + 4 * kq), *(__global float4*)(x0 + 384 + 4 * kq)) * i23 * w8;
+          *(__global half16*)(O + (kq * {iqr} + i) * 16) = CVT16(t01, t23);
+        }}
+      }}
+      int sl = core_id + k * {NT};
+      if (p == 0) DMA_DRAIN(2, DESC(desc, 2), {O0}, (int)(out + sl * {512 * iqr})); else DMA_DRAIN(3, DESC(desc, 2), {O0 + OB}, (int)(out + sl * {512 * iqr}));
+    }}
+  }}
+  DMA_WAIT_ALL();
+}}"""
+
+def swiglu_a32_src(m_, nrb, real=None, compact=False, act="silu"):
+  """gate | up tiles (N = 2 m_, groups of 48 columns, `nrb` row blocks) -> the A layout of K = m_ (`compact`: as rms_a32).
+  `act`: "silu" (SwiGLU) or "gelu" (GeGLU with the tanh GELU: kernel geglu_a32)."""
+  assert m_ % 128 == 0; nsl = m_ // 128; rbr, iqr = _real(real, nrb); P = _units(rbr, nsl); fn, stem = ACTS[act]
   assert not compact or rbr == 1
   obase, oel = ((f"sl * {32 * 16 * iqr}", f"(kq * {iqr} + i) * 16") if compact else (f"((sl * {nrb} + rb) * 32) * 48", "(kq * 3 + i) * 16"))
   def tile(col):   # the 16 floats of (row quad i, the 4 columns col..col+3) for row block rb: [4 rows][4 cols]
     return f"ct + ((({col}) / 48 * {nrb} + rb) * 3 + (({col}) % 48) / 16) * 192 + (i * 4 + (({col}) % 16) / 4) * 16"
-  return V.FULL_H + TILE + EXP + f"""
-__kernel void swiglu_a32(__global half* restrict out, __global float* restrict ct, const int core_id) {{
+  return V.FULL_H + TILE + EXP + (GELU if act == "gelu" else "") + f"""
+__kernel void {stem}_a32(__global half* restrict out, __global float* restrict ct, const int core_id) {{
   for (int u = core_id; u < {rbr * P}; u += {NT}) {{
     int rb = u / {P}, part = u % {P};
     for (int sl = part; sl < {nsl}; sl += {P}) {{
@@ -135,11 +243,59 @@ __kernel void swiglu_a32(__global half* restrict out, __global float* restrict c
       for (int i = 0; i < {iqr}; i++) for (int kq = 0; kq < 32; kq++) {{
         int col = sl * 128 + 4 * kq;
         __global float* g = {tile("col")}; __global float* p = {tile("col + %d" % m_)};
-        float8 t01 = sw(*(__global float8*)(g), *(__global float8*)(p)), t23 = sw(*(__global float8*)(g + 8), *(__global float8*)(p + 8));
+        float8 t01 = {fn}(*(__global float8*)(g), *(__global float8*)(p)), t23 = {fn}(*(__global float8*)(g + 8), *(__global float8*)(p + 8));
         *(__global half16*)(o + {oel}) = CVT16(t01, t23);
       }}
     }}
   }}
+}}"""
+
+def swiglu_a32d_desc(nrb, real):
+  """slot 0: a chunk's gate (or up) pieces -- the iqr row quads (256 iqr bytes) of 3 nrb + 3 consecutive C sub-tiles from a group's
+  first (pitch 768: the other row blocks' ride along; the last group's stop at row block 0); slot 1: a chunk's A (512 iqr bytes)."""
+  iqr = min(3, -(-real // 4)); PB = 256 * iqr
+  return V._desc_slots(((3 * nrb + 3) * PB, PB, 768, PB), (512 * iqr,))
+
+def swiglu_a32d_src(m_, nrb, real, act="silu"):
+  """swiglu_a32 in rows mode (compact A, `real` <= 12 rows) by DMA: a unit is a chunk of 64 columns (4 C sub-tiles; tasks take
+  chunks core_id, core_id + NT, ...): its gate and up pieces (row quads 0..iqr-1 of 3 nrb + 3 sub-tiles from the chunk's first
+  group) arrive in LSRAM double-buffered (flags 0 / 2, 1 / 3), the A of its 16 k-quads (all iqr quads: 512 iqr contiguous bytes,
+  whole 64-byte lines, so one task writes every byte of them) is built there with swiglu_a32's expression and leaves by one DMA
+  (unit k's on flag 2 + parity of k + 1, issued once unit k + 1's inputs are in; waited before that flag's next fill). The same
+  operations on the same values: the same bits. args: out, ct, desc (swiglu_a32d_desc). `act`: as swiglu_a32_src (geglu_a32d)."""
+  assert m_ % 128 == 0 and 1 <= real <= 12; iqr = min(3, -(-real // 4)); nch = m_ // 64; assert nch >= NT; fn, stem = ACTS[act]
+  NPR = 3 * nrb; PB = 256 * iqr; GB = (NPR + 3) * PB; OB = 512 * iqr; OUT0 = 4 * GB; assert OUT0 + 2 * OB <= 32768 - 64
+  def fill(k, p):
+    return (f"{{ int c_ = core_id + ({k}) * {NT}; int j0_ = 4 * c_; int ju_ = j0_ + {m_ // 16};\n"
+            f"        DMA_FILL({p}, DESC(desc, 0), {p * 2 * GB}, (int)(ct + (j0_ / 3) * {NPR * 192}));\n"
+            f"        DMA_FILL({p + 2}, DESC(desc, 0), {p * 2 * GB + GB}, (int)(ct + (ju_ / 3) * {NPR * 192})); }}")
+  def drain(flag, buf, k): return f"DMA_DRAIN({flag}, DESC(desc, 1), {OUT0 + buf * OB}, (int)(out + (core_id + ({k}) * {NT}) * {256 * iqr}));"
+  return V.FULL_H + TILE + EXP + (GELU if act == "gelu" else "") + f"""
+__kernel void {stem}_a32d(__global half* restrict out, __global float* restrict ct, __global int* restrict desc, const int core_id) {{
+  if (core_id < {nch}) {{                                  /* one exit for every task (an early `return` beside DMA: had_a32d_src) */
+  int nk = ({nch} - core_id + {NT - 1}) / {NT};
+  {fill(0, 0)}
+  for (int k = 0; k < nk; k++) {{
+    int p = k & 1;
+    if (k >= 2) {{ if (p == 0) DMA_WAIT(3); else DMA_WAIT(2); }}     /* unit k - 2's A gone: its flag and its LSRAM (this unit's) free */
+    if (k + 1 < nk) {{ if (p == 0) {fill("k + 1", 1)} else {fill("k + 1", 0)} }}
+    if (p == 0) {{ DMA_WAIT(0); DMA_WAIT(2); }} else {{ DMA_WAIT(1); DMA_WAIT(3); }}
+    if (k >= 1) {{ if (p == 0) {drain(2, 1, "k - 1")} else {drain(3, 0, "k - 1")} }}
+    __global float* G = LSF(p * {2 * GB}); __global float* U = G + {GB // 4}; __global half* O = LSH({OUT0} + p * {OB});
+    int j0 = 4 * (core_id + k * {NT}), ju0 = j0 + {m_ // 16};
+    for (int jj = 0; jj < 4; jj++) {{
+      int j = j0 + jj, ju = ju0 + jj;
+      __global float* g = G + ((j / 3 - j0 / 3) * {NPR} + j % 3) * {64 * iqr}; __global float* q = U + ((ju / 3 - ju0 / 3) * {NPR} + ju % 3) * {64 * iqr};
+      for (int i = 0; i < {iqr}; i++) for (int cq = 0; cq < 4; cq++) {{
+        __global float* gg = g + i * 64 + cq * 16; __global float* qq = q + i * 64 + cq * 16;
+        float8 t01 = {fn}(*(__global float8*)(gg), *(__global float8*)(qq)), t23 = {fn}(*(__global float8*)(gg + 8), *(__global float8*)(qq + 8));
+        *(__global half16*)(O + ((4 * jj + cq) * {iqr} + i) * 16) = CVT16(t01, t23);
+      }}
+    }}
+  }}
+  if ((nk - 1) & 1) {{ {drain(1, 1, "nk - 1")} }} else {{ {drain(0, 0, "nk - 1")} }}
+  }}
+  DMA_WAIT_ALL();
 }}"""
 
 HAD_B = 1024                                                                # had_a32: the Walsh-Hadamard block (along K)
@@ -426,6 +582,67 @@ __kernel void {"resid32d" if resid else "rows32d"}(__global float* restrict out,
   DMA_WAIT_ALL();
 }}"""
 
+RQ_G = 8                                                                    # resid32q: C groups (48 columns) a chunk
+
+def resid32q_desc(c, nrb, real):
+  """slot g - 1 (g = 1 .. RQ_G): g groups' pieces of one sub-tile residue of one row quad (256 B, a group apart in DDR, 768 B apart
+  in LSRAM); RQ_G + 0 / 1: a full chunk's / the last chunk's 4 rows (pitch c, LSRAM pitch 48 RQ_G); + 2 / 3: the same for the
+  last quad's rows (nl); + 4 / 5: the record lines of 4 / nl rows."""
+  iqr = min(3, -(-real // 4)); nl = real - 4 * (iqr - 1); W = 48 * RQ_G; ngr = -(-c // 48); nch = -(-ngr // RQ_G); WL = c - (nch - 1) * W
+  xs = lambda n, w: (n * w * 4, w * 4, c * 4, W * 4)
+  return V._desc_slots(*[(g * 256, 256, nrb * 2304, 768) for g in range(1, RQ_G + 1)], xs(4, W), xs(4, WL), xs(nl, W), xs(nl, WL), (4 * 64,), (nl * 64,))
+
+def resid32q_src(c, nrb, real, eps):
+  """resid32d (out = x + C, the real rows) that also writes the next RMSNorm's record (rms_rec's: rec[16 r] = 1 / rms of out's row
+  r): a task per row quad -- the quad's rows and its C pieces (row block 0, three requests a chunk, one per sub-tile residue)
+  stream through LSRAM by chunks of RQ_G groups, double-buffered; out = x + C is built in place (the same additions as resid32 /
+  resid32d), accumulated into the rows' sums of squares as rms_a32d's phase 1 does (lane by lane, K ascending: the same bits),
+  and leaves by one 2D DMA a chunk; the quad's record lines leave at the end. Rows >= real and columns >= c are not written.
+  args: out, x, ct, rec (float32 [REC_N]), desc (resid32q_desc)."""
+  assert c % 16 == 0 and 1 <= real <= 12; iqr = min(3, -(-real // 4)); nl = real - 4 * (iqr - 1); W = 48 * RQ_G
+  ngr = -(-c // 48); nch = -(-ngr // RQ_G); WL = c - (nch - 1) * W; XB = 4 * W * 4; CB = RQ_G * 768; BUF = XB + CB; REC = 2 * BUF
+  assert REC + 256 <= 32768 - 64 and WL % 16 == 0
+  def body(R):      # one chunk's sub-tiles j (16 columns: units h = 0, 1 of 8), the R rows interleaved (their sums independent chains)
+    lines = []
+    for h in (0, 1):
+      for r in range(R):
+        lines.append(f"float8 v{r}{h} = *(__global float8*)(xk + {r * W + 8 * h}) + F8(*(__global float4*)(q + {32 * h + 4 * r}), *(__global float4*)(q + {32 * h + 16 + 4 * r}));")
+      for r in range(R):
+        lines.append(f"*(__global float8*)(xk + {r * W + 8 * h}) = v{r}{h}; acc{r} += v{r}{h} * v{r}{h};")
+    return f"""NOUNROLL for (int j = 0; j < nj; j++) {{
+        __global float* q = Cb + j * 64; __global float* xk = Xb + 16 * j;
+        {" ".join(lines)}
+      }}"""
+  def quad(R, sx, sr):
+    fill = lambda k, p: (f"{{ int ga_ = ({k}) * {RQ_G}; int gn_ = {ngr} - ga_ < {RQ_G} ? {ngr} - ga_ : {RQ_G};"
+                         f" NOUNROLL for (int t_ = 0; t_ < 3; t_++) DMA_FILL({p}, DESC(desc, gn_ - 1), {p * BUF + XB} + t_ * 256, (int)(ct + (ga_ * {nrb * 3} + t_) * 192 + i * 64));"
+                         f" DMA_FILL({p}, DESC(desc, ({k}) == {nch - 1} ? {sx + 1} : {sx}), {p * BUF}, (int)(xq + ({k}) * {W})); }}")
+    accs = " ".join(f"float8 acc{r} = BC(0.0f);" for r in range(R))
+    return f"""{{
+    {accs}
+    {fill(0, 0)}
+    NOUNROLL for (int k = 0; k < {nch}; k++) {{
+      int p = k & 1;
+      if (k + 1 < {nch}) {{ if (p == 0) {{ if (k >= 1) DMA_WAIT(3); {fill("k + 1", 1)} }} else {{ DMA_WAIT(2); {fill("k + 1", 0)} }} }}
+      if (p == 0) DMA_WAIT(0); else DMA_WAIT(1);
+      __global float* Xb = LSF(p * {BUF}); __global float* Cb = Xb + {XB // 4}; int nj = k == {nch - 1} ? {WL // 16} : {W // 16};
+      {body(R)}
+      if (p == 0) DMA_DRAIN(2, DESC(desc, k == {nch - 1} ? {sx + 1} : {sx}), 0, (int)(oq + k * {W})); else DMA_DRAIN(3, DESC(desc, k == {nch - 1} ? {sx + 1} : {sx}), {BUF}, (int)(oq + k * {W}));
+    }}
+    __global float* Rl = LSF({REC});
+    {" ".join(f"Rl[{16 * r}] = 1.0f / __builtin_sqrtf(hsum8(acc{r}) * {1.0 / c!r}f + {eps!r}f);" for r in range(R))}
+    DMA_DRAIN(0, DESC(desc, {sr}), {REC}, (int)(rec + i * 64));
+  }}"""
+  S0 = RQ_G
+  return V.FULL_H + TILE + NOUNROLL_H + f"""
+__kernel void resid32q(__global float* restrict out, __global float* restrict x, __global float* restrict ct, __global float* restrict rec, __global int* restrict desc, const int core_id) {{
+  if (core_id < {iqr}) {{
+    const int i = core_id; __global float* xq = x + 4 * i * {c}; __global float* oq = out + 4 * i * {c};
+    {quad(nl, S0 + 2, S0 + 5) if iqr == 1 else f"if (i == {iqr - 1}) {quad(nl, S0 + 2, S0 + 5)} else {quad(4, S0, S0 + 4)}"}
+  }}
+  DMA_WAIT_ALL();
+}}"""
+
 def ct_goff(src, nrb, goff, names=("ct",)):
   """A fused GEMM's C tiles: the kernel reads linear `name`'s tiles from group `goff` on -- its pointer advanced by goff whole
   groups ([group][nrb][3][192] floats) at the top of the body (the only edit; goff 0 leaves the source byte-identical)."""
@@ -603,6 +820,48 @@ __kernel void mtp_in(__global float* restrict out, __global float* restrict E, _
   }}
 }}"""
 
+MI_PC = 256                                                                 # mtpin_d: columns an output piece (one drain)
+
+def mtpin_d_desc(H):
+  """slot 0: one whole H-float row (fp32) into LSRAM; slot 1: an MI_PC-float output piece."""
+  return V._desc_slots((H * 4,), (MI_PC * 4,))
+
+def mtpin_d_src(r, mp, H, eps, hoff, catch):
+  """mtpin_src over the 12 TECs by DMA: a unit = (row i, half: the embedding's or the hidden row's, part of the half's columns);
+  W = 2 r halves, P = max(1, NT // W) parts each (tasks W P.. idle). Each unit takes its half's whole source row into LSRAM by one
+  DMA (E[i] or X[hoff + i]; rows another core or job wrote are never read by cached loads), sums its squares there in mtpin_src's
+  order -- per lane over k = 0, 8, .., then hsum8 -- (the hidden half with `catch`: x * inv * fn1 rounded, then its squares, as
+  mtpin_src's second pass reads the stored row), scales its part's columns in place with mtpin_src's expressions and drains them
+  (MI_PC-float pieces; the last real row's pieces also to rows r .. mp - 1, mtp_pass' padding). The same operations on the same
+  values: the same bits. args: out [mp, 2H], E, X, ne1, nh1, fn1, desc (mtpin_d_desc)."""
+  assert H % MI_PC == 0 and H * 4 + 64 <= 32768 - 64 and 1 <= r <= mp; W = 2 * r; P = max(1, NT // W); NSL = H // MI_PC
+  def ssq(body): return f"float8 a8 = BC(0.0f); for (int k = 0; k < {H}; k += 8) {{ {body} a8 += v * v; }} float inv = 1.0f / __builtin_sqrtf(hsum8(a8) * {1.0 / H!r}f + {eps!r}f);"
+  return V.FULL_H + f"""
+__kernel void mtp_in_d(__global float* restrict out, __global float* restrict E, __global float* restrict X, __global float* restrict ne1, __global float* restrict nh1, __global float* restrict fn1, __global int* restrict desc, const int core_id) {{
+  if (core_id < {W * P}) {{                                /* one exit for every task (an early `return` beside DMA: had_a32d_src) */
+  __global float* B = LSF(0);
+  for (int u = core_id; u < {W * P}; u += {NT}) {{
+    int wi = u / {P}, part = u % {P}, i = wi / 2, hf = wi % 2;
+    __global float* src = hf ? X + ({hoff} + i) * {H} : E + i * {H};
+    DMA_FILL(0, DESC(desc, 0), 0, (int)src); DMA_WAIT(0);
+    float s1, s2 = 1.0f;
+    {{ {ssq("float8 v = *(__global float8*)(B + k);")} s1 = inv; }}
+    {"if (hf) { " + ssq("float8 v = *(__global float8*)(B + k) * BC(s1) * *(__global float8*)(fn1 + k);") + " s2 = inv; }" if catch else ""}
+    int p0 = part * {NSL} / {P}, p1 = (part + 1) * {NSL} / {P};
+    for (int p = p0; p < p1; p++) {{
+      __global float* b = B + p * {MI_PC};
+      if (hf) for (int k = 0; k < {MI_PC}; k += 8) {{
+        {"float8 oh = *(__global float8*)(b + k) * BC(s1) * *(__global float8*)(fn1 + p * %d + k); *(__global float8*)(b + k) = oh * BC(s2) * *(__global float8*)(nh1 + p * %d + k);" % (MI_PC, MI_PC) if catch else "*(__global float8*)(b + k) = *(__global float8*)(b + k) * BC(s1) * *(__global float8*)(nh1 + p * %d + k);" % MI_PC}
+      }} else for (int k = 0; k < {MI_PC}; k += 8) *(__global float8*)(b + k) = *(__global float8*)(b + k) * BC(s1) * *(__global float8*)(ne1 + p * {MI_PC} + k);
+      for (int q = i; q < (i == {r - 1} ? {mp} : i + 1); q++) {{
+        DMA_DRAIN(3, DESC(desc, 1), p * {MI_PC * 4}, (int)(out + q * {2 * H} + hf * {H} + p * {MI_PC})); DMA_WAIT(3);
+      }}
+    }}
+  }}
+  }}
+  DMA_WAIT_ALL();
+}}"""
+
 def head_reduce_desc(m): return V._desc_slots((NT * m * 16,))
 
 def head_reduce_src(m, c0s):
@@ -690,6 +949,73 @@ __kernel void head_topd(__global float* restrict out, __global float* restrict c
   for (int r = 0; r < {m}; r++) {{ __global float* o = out + (core_id * {m} + r) * 4; o[0] = mx[r]; o[1] = (float)am[r]; o[2] = ssum[r]; o[3] = 0.0f; }}
   DMA_WAIT_ALL();
   #undef ISSUE
+}}"""
+
+# ---- QWEN_SMALL2: head_top3 / head_top3r by DMA, bit-identical ---------------------------------------------------------------
+# head_top3 read its C tiles by cached loads (Ornith's draft head ~485 us a part, head_top3r ~395). These keep its task split (8-
+# column units, task t: units t n8 / NT .. (t + 1) n8 / NT), its per-row loops in unit order and its expressions (hmax8, the
+# insertion, exp2_d4, hsum8): the same partials, bit for bit. The task's whole C groups stream through LSRAM: per chunk of <= T3_CG
+# groups three requests (one per sub-tile residue s = 0, 1, 2: the row quads' pieces of the groups' row block 0, a group apart in
+# DDR, packed [group][s][quads] in LSRAM), double-buffered (flags 0 / 1). head_top3d makes two passes over the range (the top-3, then
+# the sum of exp against the final maximum), head_top3rd one (no sum).
+T3_CG = 8                                                                    # head_top3d: C groups a chunk
+
+def head_top3d_desc(nrb, nq):
+  """slot g - 1 (g = 1 .. T3_CG): g groups' pieces of one sub-tile residue -- `nq` row quads (256 nq contiguous bytes) of row block
+  0, a group apart (nrb * 2304 B) in DDR, 3 * 256 nq apart in LSRAM."""
+  PB = 256 * nq
+  return V._desc_slots(*[(g * PB, PB, nrb * 2304, 3 * PB) for g in range(1, T3_CG + 1)])
+
+def head_top3d_src(nc, nrb, m, row=None):
+  """head_top3 (m <= 8 rows: row quads 0 .. nq - 1) or, `row` given, head_top3r (that one row, no sum: one pass, its row quad only)
+  with the C tiles by DMA (see T3_CG). out as theirs: fp32 [NT][m (1)][8]. args: out, ct, desc (head_top3d_desc(nrb, nq))."""
+  one = row is not None; mm = 1 if one else m
+  assert (1 <= m <= 8) if not one else 0 <= row < 12
+  n8 = -(-nc // 8); tail = nc % 8; nq = 1 if one else -(-m // 4); PF = 64 * nq; CHB = T3_CG * 3 * PF * 4; assert 2 * CHB <= 32768 - 64
+  qoff = (row // 4) * 64 if one else 0                                          # head_top3r: its row quad's pieces only
+  ro = (lambda r: f"{(row % 4) * 4}") if one else (lambda r: f"(({r}) / 4) * 64 + (({r}) % 4) * 4")
+  mask = "".join(f" v[{j}] = -3.0e38f;" for j in range(tail, 8)) if tail else ""
+  load = (f"int c = 8 * u; __global float* p = B + ((u - 6 * ga) >> 1) * {PF} + (u & 1) * 32 + RO; "   # (group, sub-tile) = (u - 6 ga) / 2, jt = 2 (u & 1)
+          
+          f"float8 v = F8(*(__global float4*)p, *(__global float4*)(p + 16));" + (f" if (u == {n8 - 1}) {{{mask} }}" if tail else ""))
+  ins = ("NOUNROLL for (int j = 0; j < 8; j++) { x = v[j]; if (x > m1) { m3 = m2; c3 = c2; m2 = m1; c2 = c1; m1 = x; c1 = c + j; } "
+         "else if (x > m2) { m3 = m2; c3 = c2; m2 = x; c2 = c + j; } else if (x > m3) { m3 = x; c3 = c + j; } }")   # the lanes in order (a small loop body)
+  def issue(k, buf):
+    return (f"{{ int ga_ = g0 + ({k}) * {T3_CG}; int gn_ = g1 - ga_ < {T3_CG} ? g1 - ga_ : {T3_CG};"
+            f" NOUNROLL for (int t_ = 0; t_ < 3; t_++) DMA_FILL({buf}, DESC(desc, gn_ - 1), {buf} * {CHB} + t_ * {PF * 4}, (int)(ct + (ga_ * {nrb * 3} + t_) * 192 + {qoff})); }}")
+  def sweep(body):     # every chunk of the task's groups, double-buffered; body sees B (the chunk), ga / gn, and runs its units
+    return f"""
+  if (nch > 0) {issue(0, 0)}
+  NOUNROLL for (int k = 0; k < nch; k++) {{
+    int p = k & 1; if (k + 1 < nch) {{ if (p == 0) {issue("k + 1", 1)} else {issue("k + 1", 0)} }}
+    if (p == 0) DMA_WAIT(0); else DMA_WAIT(1);
+    __global float* B = LSF(p * {CHB}); int ga = g0 + k * {T3_CG}, gn = g1 - ga < {T3_CG} ? g1 - ga : {T3_CG};
+    int ua = 6 * ga > u0 ? 6 * ga : u0, ub = 6 * (ga + gn) < u1 ? 6 * (ga + gn) : u1;   /* the chunk's units of the task (6 a group) */
+    {body}
+  }}"""
+  p1 = f"""NOUNROLL for (int r = 0; r < {mm}; r++) {{
+      int RO = {ro("r")}; float m1 = M1[r], m2 = M2[r], m3 = M3[r], x; int c1 = C1[r], c2 = C2[r], c3 = C3[r];
+      NOUNROLL for (int u = ua; u < ub; u++) {{ {load} if (hmax8(v) > m3) {{ {ins} }} }}
+      M1[r] = m1; M2[r] = m2; M3[r] = m3; C1[r] = c1; C2[r] = c2; C3[r] = c3;
+    }}"""
+  p2 = f"""NOUNROLL for (int r = 0; r < {mm}; r++) {{
+      int RO = {ro("r")}; float8 s = S8[r]; float m1 = M1[r];
+      NOUNROLL for (int u = ua; u < ub; u++) {{ {load} s += exp2_d4((v - BC(m1)) * BC(1.4426950408889634f)); }}
+      S8[r] = s;
+    }}"""
+  name = "head_top3r" if one else "head_top3"
+  return V.FULL_H + TILE + EXP + NOUNROLL_H + f"""
+__kernel void {name}(__global float* restrict out, __global float* restrict ct, __global int* restrict desc, const int core_id) {{
+  int u0 = core_id * {n8} / {NT}, u1 = (core_id + 1) * {n8} / {NT};
+  int g0 = u0 / 6, g1 = u1 > u0 ? (u1 - 1) / 6 + 1 : g0; int nch = (g1 - g0 + {T3_CG - 1}) / {T3_CG};
+  float M1[{mm}], M2[{mm}], M3[{mm}]; int C1[{mm}], C2[{mm}], C3[{mm}];{"" if one else f" float8 S8[{mm}];"}
+  for (int r = 0; r < {mm}; r++) {{ M1[r] = -3.0e38f; M2[r] = -3.0e38f; M3[r] = -3.0e38f; C1[r] = 0; C2[r] = 0; C3[r] = 0;{"" if one else " S8[r] = BC(0.0f);"} }}
+  {sweep(p1)}{"" if one else sweep(p2)}
+  for (int r = 0; r < {mm}; r++) {{
+    __global float* o = out + (core_id * {mm} + r) * 8; o[0] = M1[r]; o[1] = (float)C1[r]; o[2] = M2[r]; o[3] = (float)C2[r]; o[4] = M3[r]; o[5] = (float)C3[r];
+    o[6] = {"0.0f" if one else "hsum8(S8[r])"}; o[7] = 0.0f;
+  }}
+  DMA_WAIT_ALL();
 }}"""
 
 def gemv32_src(rows, k, n, nt=NT, norm=False, eps=1e-6, stacked=False):
@@ -1966,19 +2292,21 @@ def gdn_fast_kbd(M, HPT, KB=128, H=5120):
   """gdn_fast_src's a|b DMA chunk (columns): 2 KB when both double-buffered chunks fit LSRAM (half the requests of KB), else KB."""
   return 2 * KB if 2 * (M + 2 * HPT) * 2 * KB * 4 <= 32768 - 64 and H % (2 * KB) == 0 else KB
 
-def gdn_fast_desc(DK, DV, H, HPT, M, MS, C, CONV=4, KB=128, W=16, NV=48):
+def gdn_fast_desc(DK, DV, H, HPT, M, MS, C, CONV=4, KB=128, W=16, NV=48, a_out=False):
   """gdn_fast_src's DMA slots: 0 a state block; 1 a chunk of the M input rows; 2 a chunk of a task's a|b rows (chunks of
   gdn_fast_kbd columns); 3 the CONV rows of a
   128-channel segment (taps or ring); 4 the M raw rows of a segment; 5 / 6 / 7 the MS pending slots' k / v / beta-decay rows in
   (DDR pitch GD_SLOT floats); 8 / 9 / 10 the M new k / v / beta-decay rows out (the same pitch); VG 2: 11 the M v rows to / from
   the scratch (contiguous), 12 half the pending v rows (one column group), 13 half the new v rows from the scratch; 14 / 15 the MS
   pending / M new slots whole (one request each, when they fit the staging buffer); 16 a head's M output rows out (DDR pitch NV DV); 17 / 18 a 128-channel segment's C tiles, row quad 0 (14 / 17 virtual
-  strips of 768 B, the first 256 B of each: gdn_fast_src's CTD)."""
+  strips of 768 B, the first 256 B of each: gdn_fast_src's CTD); a_out: 19 a head's block of o_proj's compact A out (contiguous,
+  DV / 128 x 32 k-quads x RT row tiles x 16 halves)."""
   G = GD_SLOT * 4; KBD = gdn_fast_kbd(M, HPT, KB, H)
   sl = [(DK * W * 4, W * 4, DV * 4, W * 4), (M * KBD * 4, KBD * 4, H * 4, KBD * 4), (2 * HPT * KBD * 4, KBD * 4, H * 4, KBD * 4),
         (CONV * DK * 4, DK * 4, ring_pitch(C) * 4, DK * 4), (M * DK * 4, DK * 4, ring_pitch(C) * 4, DK * 4),
         (MS * 512, 512, G, 512), (MS * 512, 512, G, 512), (MS * 64, 64, G, 64), (M * 512, 512, G, 512), (M * 512, 512, G, 512), (M * 64, 64, G, 64),
         (M * 512,), (MS * 256, 256, G, 256), (M * 256, 256, 512, 256), (MS * G,), (M * G,), (M * DV * 4, DV * 4, NV * DV * 4, DV * 4), (14 * 256, 256, 768, 256), (17 * 256, 256, 768, 256)]
+  if a_out: sl.append((DV // 128 * 512 * -(-M // 4) * 2,))
   return V._desc_slots(*sl)
 
 def gdn_fast_scratch(M):
@@ -2113,7 +2441,29 @@ def _gf_tree_chain(asm, M, MS, drain):
       *(__global float8*)(OR(nc - 1) + j0) = o[0]; *(__global float8*)(OR(nc - 1) + j0 + 8) = o[1]; }}
 """
 
-def gdn_fast_src(NV, NK, DK, DV, C, CONV, H, nrb, eps, M, NG, MS, W=16, KB=128, sweeps="asm", diag=(), tree=False):
+def _gf_a_out(src, DV, M, cf):
+  """gdn_fast_src(a_out=True): the output as o_proj's compact A (gdn_tokm_src's default layout: per head h = K-slice h a block of
+  [32 k-quads][RT row tiles][16 halves], a tile's 16 halves = 4 rows x 4 columns, rows >= M zero) instead of fp32 rows. The fp32
+  rows are computed and staged exactly as before (the head's dead v rows, VA); they are then converted in LSRAM into the dead o
+  rows (OA: the o rows' last reader was the staging) and drained as one contiguous block (slot 19). fp16 of the staged values ==
+  gdn_tokm_src's A (the same expression, rounded by the same conversion); everything else is the rows kernel's text."""
+  RT, OA0, VA0 = -(-M // 4), cf["OA"], cf["VA"]                           # (cf: gdn_fast_cfg, the kernel's LSRAM plan)
+  assert M * 512 >= RT * 1024 and "dbg[0] = ph0" not in src, "a_out: the A block in the o rows; no phases diag"
+  V8 = lambda t: f"float8 v{t} = " + (f"*(__global float8*)(sv + {t * DV} + c);" if t < M else "Z;")
+  ST = lambda i: (f"*(__global half16*)(oa + ((c / 4) * {RT} + {i}) * 16) = CVT16(F8(LO4(v{4*i}), LO4(v{4*i+1})), F8(LO4(v{4*i+2}), LO4(v{4*i+3}))); "
+                  f"*(__global half16*)(oa + ((c / 4 + 1) * {RT} + {i}) * 16) = CVT16(F8(HI4(v{4*i}), HI4(v{4*i+1})), F8(HI4(v{4*i+2}), HI4(v{4*i+3})));")
+  a = f"      {{ int fo = 3 - p; DMA_WAIT(fo); DMA_DRAIN(fo, DESC(desc, 16), {VA0}, (int)(out + h * {DV})); }}"
+  b = (f"      {{ __global half* oa = LSH({OA0}); __global float* sv = LSF({VA0}); float8 Z = BC(0.0f);   /* a_out: the staged rows -> o_proj's compact A (the dead o rows) */\n"
+       + "".join(f"        NOUNROLL for (int c = 0; c < {DV}; c += 8) {{ {' '.join(V8(t) for t in range(4 * i, 4 * i + 4))} {ST(i)} }}\n" for i in range(RT))
+       + f"        int fo = 3 - p; DMA_WAIT(fo); DMA_DRAIN(fo, DESC(desc, 19), {OA0}, (int)(out + h * {DV // 128 * 512 * RT})); }}")
+  edits = [(a, b), ("(__global float* restrict out, __global float* restrict Sall,", "(__global half* restrict out, __global float* restrict Sall,"),
+           ("#define NOHWL(i) ", "#define LO4(v) __builtin_shufflevector((v), (v), 0, 1, 2, 3)\n#define HI4(v) __builtin_shufflevector((v), (v), 4, 5, 6, 7)\n#define NOHWL(i) ")]
+  for x, y in edits:
+    assert src.count(x) == 1, x
+    src = src.replace(x, y)
+  return src
+
+def gdn_fast_src(NV, NK, DK, DV, C, CONV, H, nrb, eps, M, NG, MS, W=16, KB=128, sweeps="asm", diag=(), tree=False, a_out=False):
   """The DeltaNet verify kernel with the commit deferred (gdn_defer_src's contract), restructured around FUSED SWEEPS: a state
   block (DK x W fp32, in LSRAM) takes a token's update and the next token's decay + k.S in ONE pass over its rows, so T tokens
   cost T + 1 passes instead of 2 T, and the previous pass's ap = accp[0] accepted updates and the M new tokens run as one chain:
@@ -2141,7 +2491,10 @@ def gdn_fast_src(NV, NK, DK, DV, C, CONV, H, nrb, eps, M, NG, MS, W=16, KB=128, 
   spec_tree.chain_table and chain paths every result is gdn_fast_src's bit for bit; under trees gdn_tokl_src's (outputs, slots,
   raw rows, the state written back): checked on the vendor simulator. tree=False: the source
   is byte-identical to the chain kernel's.
+  `a_out` (the models without a rotated input: Ornith, Qwen3.8-27B): `out` is o_proj's compact A layout (half; RT = ceil(M / 4)
+  row tiles, rows >= M zero), as gdn_tokm_src's default output -- see _gf_a_out. False: the fp32 rows (gdn_tokm_src(rows_out)'s).
   """
+  if a_out: return _gf_a_out(gdn_fast_src(NV, NK, DK, DV, C, CONV, H, nrb, eps, M, NG, MS, W, KB, sweeps, diag, tree), DV, M, gdn_fast_cfg(M, MS))
   D = set(diag); PH = "phases" in D
   # tree (the leaf tree, QWEN_SPEC_TREE=leaf): the kernel `gdn_tokl` (gdn_tokl_src's contract and arguments) -- see the docstring
   TR = bool(tree); DPX = (lambda e: f"dpt[{e}]") if TR else (lambda e: e); DPA = ", dpa" if TR else ""
@@ -2500,6 +2853,49 @@ static inline __attribute__((always_inline)) float softplus1(float t) {{
 }}"""
   return src
 
+def gdn_flush_desc(DK, DV, MS, W=16):
+  """gdn_flush_src: 0 a state block (as gdn_lsr_desc); 1 a head's MS update slots (contiguous)."""
+  return V._desc_slots((DK * W * 4, W * 4, DV * 4, W * 4), (MS * GD_SLOT * 4,))
+
+def gdn_flush_src(NV, DK, DV, NG, MS, W=16, tree=False):
+  """The deferred commit's pending updates applied to every DeltaNet layer's state NOW (gdn_fast_src / gdn_defer_src leave the
+  last verify pass's accepted updates in `banks` for the next verify pass to apply): what a plain decode step (gdn_tok3, which
+  reads Sall) needs after a deferred verify pass -- the Q8_0 models prefill through the verify path. Per (layer, head, state block):
+  the block in, the ap = accp[0] pending updates (slot t; `tree`: accp = spec_tree.path_words, slot accp[4 + t]) applied with
+  gdn_defer_src's loops (the old kernel's per-token arithmetic and order: the state after them == the old bank / the fast
+  kernel's committed state, bit for bit), the block back. The caller then clears the pending count (accp[0] = 0).
+  args: Sall (in / out), banks, accp, desc (gdn_flush_desc). Tasks: blocks round-robin."""
+  assert DK == 128 and W == 16 and MS <= GF_MS
+  NB = DV // W; BLK = DK * W * 4; SL = MS * GD_SLOT; NBLK = NG * NV * NB
+  return V.FULL_H + f"""
+__kernel void gdn_flush(__global float* restrict Sall, __global float* restrict banks, __global int* restrict accp, __global int* restrict desc, const int core_id) {{
+  int ap = accp[0];
+  if (ap <= 0) return;
+  __global float* B = LSF(0); __global float* PV = LSF({BLK});
+  for (int u = core_id; u < {NBLK}; u += {NT}) {{
+    int L = u / {NV * NB}, h = (u / {NB}) % {NV}, jb = u % {NB}, j0 = jb * {W};
+    __global float* blk = Sall + (L * {NV} + h) * {DK * DV} + j0;
+    DMA_FILL(0, DESC(desc, 0), 0, (int)blk); DMA_FILL(1, DESC(desc, 1), {BLK}, (int)(banks + (L * {NV} + h) * {SL})); DMA_WAIT(0); DMA_WAIT(1);
+    for (int t = 0; t < ap; t++) {{
+      int r = {"accp[4 + t]" if tree else "t"};
+      __global float* ks = PV + r * {GD_SLOT};
+      float8 db = BC(PV[r * {GD_SLOT} + 257]), kv0 = BC(0.0f), kv1 = BC(0.0f);
+      for (int i = 0; i < {DK}; i++) {{
+        float8 kb = BC(ks[i]); float8 s0 = *(__global float8*)(B + i * {W}) * db, s1 = *(__global float8*)(B + i * {W} + 8) * db;
+        *(__global float8*)(B + i * {W}) = s0; *(__global float8*)(B + i * {W} + 8) = s1; kv0 += kb * s0; kv1 += kb * s1;
+      }}
+      float8 bt = BC(PV[r * {GD_SLOT} + 256]);
+      float8 dl0 = (*(__global float8*)(PV + r * {GD_SLOT} + 128 + j0) - kv0) * bt, dl1 = (*(__global float8*)(PV + r * {GD_SLOT} + 128 + j0 + 8) - kv1) * bt;
+      for (int i = 0; i < {DK}; i++) {{
+        float8 kb = BC(ks[i]);
+        float8 s0 = *(__global float8*)(B + i * {W}) + kb * dl0, s1 = *(__global float8*)(B + i * {W} + 8) + kb * dl1;
+        *(__global float8*)(B + i * {W}) = s0; *(__global float8*)(B + i * {W} + 8) = s1;
+      }}
+    }}
+    DMA_DRAIN(2, DESC(desc, 0), 0, (int)blk); DMA_WAIT(2);
+  }}
+}}"""
+
 def gdn_commit_desc(CH=8192): return V._desc_slots((CH,))
 
 def gdn_commit_tree_desc(KVB, CH=8192): return V._desc_slots((CH,), (KVB,))   # slot 1: one K (or V) cache row of a layer
@@ -2533,6 +2929,46 @@ __kernel void gdn_commit_tree(__global float* restrict Sall, __global float* res
 {"" if defer else f"    if (last < {M - 1}) copy_ch(Sall + L * {SZ}, banks + (last * {NG} + L) * {SZ}, {SZ * 4 // CH}, desc);" + chr(10)}    for (int i = 0; i < a; i++) copy_ch(Call + (L * {CONV} + (pos + i) % {CONV}) * {CP}, rawm + (L * {M} + pathb[4 + i]) * {CP}, {C * 4 // CH}, desc);
   }}
   if (ksrc >= 0) for (int L = core_id; L < {NATT}; L += {NT}) {{      /* the rescue row's K / V rows to the path's position */
+    copy_row(Kall + (L * {TMAX} + pos + kdst) * {KVR}, Kall + (L * {TMAX} + pos + ksrc) * {KVR}, desc);
+    copy_row(Vall + (L * {TMAX} + pos + kdst) * {KVR}, Vall + (L * {TMAX} + pos + ksrc) * {KVR}, desc);
+  }}
+}}"""
+
+RC_W = 5                                                                    # ring_commit: the words before the committed rows
+
+def ring_commit_words(a, m, pos, path=None, NC=None, MS=12):
+  """ring_commit's int32 [RC_W + MS]: a (rows committed), m (the verify pass's rows: rawm's row stride), pos (its first position),
+  the K / V copy (source row, destination row; -1: none -- a chain path, or a path ending on a chain row), then the committed rows
+  (the chain: 0..a-1; a tree: spec_tree.accept's path), padded with the last."""
+  path = list(range(a)) if path is None else list(path); last = path[-1]
+  src, dst = (last, a - 1) if NC is not None and last >= NC else (-1, -1)
+  return np.array([a, m, pos, src, dst] + path + [last] * (MS - len(path)), np.int32)
+
+def ring_commit_src(C, CONV, NG, NATT, TMAX, NKV, HD, CH=8192):
+  """The deferred commit's copies (gdn_commit_tree(defer) / gdn_commit(ring_only)) with the pass's row count read from the words, so
+  one kernel serves every verify geometry (and can sit inside a draft's JIT, QWEN_COMMIT_FOLD): each DeltaNet layer's ring takes the
+  committed rows' raw rows at positions pos .. pos + a - 1 (row w[RC_W + i] at slot (pos + i) % CONV, rawm [NG][m][CP]); a path
+  ending on a leaf moves that row's K / V cache rows (written at pos + source) to pos + destination in every trunk attention layer
+  (not the MTP layer's, index NATT). The same DMA copies through LSRAM as those kernels: the same bytes. No state copy (the state
+  commit is deferred to the next verify pass). Tasks: layers. args: Call (out), rawm, Kall, Vall, words (ring_commit_words), desc
+  (gdn_commit_tree_desc)."""
+  CP, KVR = ring_pitch(C), NKV * HD; assert (C * 4) % CH == 0 and 4 * KVR <= CH
+  return V.FULL_H + f"""
+static inline __attribute__((always_inline)) void copy_ch(__global float* restrict dst, __global float* restrict src, int n, __global int* restrict desc) {{
+  for (int c = 0; c < n; c++) {{                           /* CH bytes a request: fill, then drain; one request in flight per flag */
+    DMA_FILL(0, DESC(desc, 0), 0, (int)(src + c * {CH // 4})); DMA_WAIT(0);
+    DMA_DRAIN(2, DESC(desc, 0), 0, (int)(dst + c * {CH // 4})); DMA_WAIT(2);
+  }}
+}}
+static inline __attribute__((always_inline)) void copy_row(__global float* restrict dst, __global float* restrict src, __global int* restrict desc) {{
+  DMA_FILL(0, DESC(desc, 1), 0, (int)src); DMA_WAIT(0); DMA_DRAIN(2, DESC(desc, 1), 0, (int)dst); DMA_WAIT(2);
+}}
+__kernel void ring_commit(__global float* restrict Call, __global float* restrict rawm, __global float* restrict Kall, __global float* restrict Vall,
+                          __global int* restrict w, __global int* restrict desc, const int core_id) {{
+  int a = w[0], m = w[1], pos = w[2], ksrc = w[3], kdst = w[4];
+  for (int L = core_id; L < {NG}; L += {NT})
+    for (int i = 0; i < a; i++) copy_ch(Call + (L * {CONV} + (pos + i) % {CONV}) * {CP}, rawm + (L * m + w[{RC_W} + i]) * {CP}, {C * 4 // CH}, desc);
+  if (ksrc >= 0) for (int L = core_id; L < {NATT}; L += {NT}) {{      /* the leaf row's K / V rows to the path's position */
     copy_row(Kall + (L * {TMAX} + pos + kdst) * {KVR}, Kall + (L * {TMAX} + pos + ksrc) * {KVR}, desc);
     copy_row(Vall + (L * {TMAX} + pos + kdst) * {KVR}, Vall + (L * {TMAX} + pos + ksrc) * {KVR}, desc);
   }}
@@ -2627,6 +3063,19 @@ __kernel void attn_decm(__global float* restrict o_rows, __global float* restric
 }}"""
 
 ATT_BT = 4                                                                   # attn_part: cache rows a DMA block (Kall / Vall keep this many rows of margin)
+
+def attn_gqa_on():
+  """QWEN_ATTN_GQA=1 (default): the verify / draft attention as attn_gqa.py's kv-head kernels (byte-identical records and o_rows);
+  0: attn_part / attn_partt + attn_comb as before."""
+  return os.environ.get("QWEN_ATTN_GQA", "1") != "0"
+
+def attn_gqa_nte(M, NH=None, NKV=None, HD=None, TMAX=None):
+  """The tasks taking attention records (attn_gqa_src's NTE): QWEN_ATTN_NTE=<n>, or `auto` (default: attn_gqa.gqa_nte's cost model --
+  8 for the 27B's one-row draft passes, 12 otherwise)."""
+  v = os.environ.get("QWEN_ATTN_NTE", "auto")
+  if v == "auto":
+    import attn_gqa as AG; n = AG.gqa_nte(NH, NKV, HD, TMAX, M); return None if n == NT else n
+  return int(v) if v else None
 
 def _attn_lsram(M, HD, CL, BT=ATT_BT): return 2 * M * HD * 4 + M * CL * 4 + 2 * BT * HD * 4 + HD * 4   # q, o, scores, K / V blocks, a new k
 def _attn_cl(TMAX, P): return -(-(-(-TMAX // P) + 1) // 8) * 8                 # a slice's positions (+1 for the rounding), to 8
@@ -3038,26 +3487,58 @@ class Kernels:
     # become had_a32 (rms / plain / swiglu), a plain one multiplying by these signs; `had_post` the factor after the transform
     # (1.0: the 1 / sqrt(HAD_B) is in the GEMM's scale tables). None: every producer as before (the other models)
     self.had, self.had_post = None, 1.0
+    # small2 (Layers sets it from QWEN_SMALL2, default on; other users of Kernels, gemma4, keep the previous kernels): the RMSNorm
+    # producers read a record of the rows' norms (rms_rec + rms_a32f, or the residual's own resid32q), head_top3[r] by DMA
+    self.small2 = False
+    self.tag_of = {}       # id(a tensor handed out: rows_buf / resid's output) -> (tag, tensor)
+    self.ext = set()       # tags handed to callers by rows_buf: written outside the kernels too (pokes, the embedding, row moves)
+    self.writers = {}      # tag -> the kernel kinds that wrote it (in program order, at capture)
+    self.last_out = {}     # tag -> id of resid's latest returned view
+  def s2(self, k="QWEN_SMALL2"):
+    """The QWEN_SMALL2 kernel family `k` on this geometry (rows mode): QWEN_SMALL2=0 none; QWEN_RQ=0 / QWEN_RMS2=0 / QWEN_T3D=0 one off."""
+    return self.small2 and self.compact and os.environ.get("QWEN_SMALL2", "1") == "1" and os.environ.get(k, "1") == "1"
+  def _tag(self, x):
+    t = self.tag_of.get(id(x)); return t[0] if t is not None and t[1] is x else None
+  def _rec_src(self, x):
+    """(the record's tag, guarded) when x's rows came from resid32q (the record beside them), else None. A tag also written outside
+    the kernels (rows_buf: the residual stream's ping-pong rows, which the embedding fills before layer 0) needs the guard: the
+    record is used when the layer index idx[0] != 0 (the stack's first layer -- layer 0 of the DeltaNet stack -- recomputes)."""
+    t = self._tag(x)
+    if t is None or self.writers.get(t) != {"rq"} or f"rec|{t}" not in self.bufs: return None
+    return f"rec|{t}", t in self.ext
   def key(self, name, src):
     if name not in self.reg: self.reg[name] = OA.register_csrc(name.split("|")[0], src, ntasks=NT)
     return self.reg[name]
+  # QWEN_AGM: a rows-mode GEMM's A operand (the tags "a_*": every one written by its producer right before the GEMMs that read
+  # it) goes to the backend's A staging buffer in GM (OA.gemm_a_gm: one region every geometry shares; the GEMM's A requests then read
+  # GM, off the DDR port). QWEN_AGM=0 (or ZHOUYI_GEMM_AGM=0): in DDR as before. The full-layout (non-rows) A stays in DDR.
+  # Board, per call: -2 to -7 % at rows 1-4 (ternary, Q8_0, E4M3), -2 to -4 % at rows 5-8 (Q8_0, E4M3), -14 / -32 %
+  # at rows 9-12 (Q8_0 / E4M3), C bit-identical; but the ternary rows 5-8 k-loop (rt 2) runs 2-10 % SLOWER with its A from GM (with the
+  # text in DDR too: not instruction-fetch contention), so a rotated-input (ternary) geometry at rt 2 keeps A in DDR (QWEN_AGM=all: GM)
+  def a_gm(self, tag, dt):
+    v = os.environ.get("QWEN_AGM", "1")
+    return tag.startswith("a_") and self.compact and dt == dtypes.uint16 and (v == "all" or (v == "1" and not (self.had is not None and self.rt == 2)))
   def buf(self, tag, n, dt):
     if tag not in self.bufs:
-      self.bufs[tag] = Tensor.zeros(n, device=DEV, dtype=dt).contiguous().realize()
+      g = OA.gemm_a_gm(n, dt, DEV) if self.a_gm(tag, dt) and hasattr(OA, "gemm_a_gm") else None
+      self.bufs[tag] = g if g is not None else Tensor.zeros(n, device=DEV, dtype=dt).contiguous().realize()
       if os.environ.get("QWEN_PA"): print(f"[buf] {tag} n={n} pa={self.bufs[tag].uop.buffer._buf.pa:#x}", flush=True)
     assert self.bufs[tag].shape[0] == n, (tag, n, self.bufs[tag].shape)
     return self.bufs[tag]
   def rows_buf(self, tag, c):
     """A persistent fp32 [rows, c] buffer for a generic kernel's output that a hand-written kernel reads (`buf.assign(expr)`)."""
-    return self.buf(tag, self.rows * c, dtypes.float32).reshape(self.rows, c)
+    t = self.buf(tag, self.rows * c, dtypes.float32).reshape(self.rows, c); self.ext.add(tag); self.tag_of[id(t)] = (tag, t); return t
   def hold(self, tag, t):
     """`t` (a JIT input or any tinygrad tensor) copied into the persistent buffer `tag`: a hand-written kernel must not read a JIT
     input buffer directly (its replay hangs) nor a recycled allocation."""
     n = int(np.prod(t.shape)); return self.buf(tag, n, t.dtype).assign(t.reshape(n)).realize().reshape(t.shape)
-  def run(self, k, tag, n, dt, *ins):
+  def run(self, k, tag, n, dt, *ins, kind="k"):
     """The kernel into the persistent buffer `tag`, realised; the buffer itself is returned (a plain realised buffer, so
     a consumer's `.contiguous()` copies nothing: the copy tinygrad made of an `after` view hung the next kernel)."""
-    buf = self.buf(tag, n, dt); OA.csrc_call(k, buf, *ins).realize(); return buf
+    buf = self.buf(tag, n, dt); OA.csrc_call(k, buf, *ins).realize(); self.writers.setdefault(tag, set()).add(kind); return buf
+  def desc(self, dk, mk):
+    if dk not in self.bufs: self.bufs[dk] = Tensor(mk(), device=DEV).realize()
+    return self.bufs[dk]
   def rms_a(self, x, w1, c, tag, norm=True):
     """x fp32 [R, c] (w1 = 1 + weight fp32 [c], or (stack [L * c], idx) -- the layer's row picked on the device) -> the A layout
     halves (uint16 [nsl * nrb * 32 * 48])."""
@@ -3065,12 +3546,35 @@ class Kernels:
     if self.had is not None:                     # rotated inputs: had_a32 (norm: w1 carries the signs; plain: the signs of width c)
       assert norm or c in self.had, f"rms_a(norm=False) of width {c}: no rotated linear takes it (no signs)"
       mode = "rms" if norm else "plain"; ws = (w1 if st else (w1,)) if norm else (self.had[c],)
+      rs = self._rec_src(x) if norm and st and self.s2("QWEN_RQ") and self.had_dma() and self.had_fast() else None
+      if rs is not None:                         # QWEN_SMALL2: the norms from the residual's record (had_fast v2 "rec", guarded)
+        import had_fast as HF
+        op = self.HAD_FAST_OPTS + ("rec",)
+        k = self.key(f"had_a32d|fast|rec|{mode}|{c}|{self.real}|{self.had_post}", HF.had_fast_src(mode, c, self.nrb, self.eps, self.real, stacked=True, post=self.had_post, opts=op))
+        d = self.desc(f"had_a32d_desc|fast|rec|{mode}|{c}", lambda: HF.had_fast_desc(mode, c, self.nrb, self.real, opts=op))
+        return self.run(k, tag, self.a_size(c), dtypes.uint16, x, *ws, self.bufs[rs[0]], d)
       if self.had_dma(): return self.run(self.had_d(mode, c, st and norm), tag, self.a_size(c), dtypes.uint16, x, *ws, self.had_desc(mode, c))
       k = self.key(f"had_a32|{mode}|{c}|{self.real}|{self.compact}|{st}|{self.had_post}", had_a32_src(mode, c, self.nrb, self.eps, real=self.real, compact=self.compact, stacked=st and norm, post=self.had_post))
       return self.run(k, tag, self.a_size(c), dtypes.uint16, x, *ws)
     # rows mode with the norm: the rows through LSRAM by DMA (rms_a32d: -0.26 ms a call at 4 rows, bit-identical; never implicated
-    # in the hang of gdn_tokm_src's note); without the norm there is no row pass and plain loads are as fast. QWEN_RMS_DMA=0: plain
-    if self.compact and norm and os.environ.get("QWEN_RMS_DMA", "1") == "1":
+    # in the hang of gdn_tokm_src's note). QWEN_RMS_DMA=0: plain. Without the norm (the o / fc inputs): rms_a32d's phase 2 alone
+    # under small_dma() (on the board, qwen3.8-27b: o 6144 at 4 rows 69.5 -> 24.4 us, the MTP fc's 10240 at 1 row 107 -> 43; the same bits)
+    if self.s2("QWEN_RMS2") and c % 128 == 0 and (norm or self.small_dma()):
+      # QWEN_SMALL2: rms_a32f -- the norms from a record (the residual's, resid32q; else rms_rec's, one launch: a task a row), the
+      # slices by double-buffered DMA; without the norm the same phase 2 (the o / fc inputs). The same bits as rms_a32d
+      d = self.desc(f"rms_a32f_desc{c}", lambda: rms_a32f_desc(c, self.real)); ws = (w1 if st else (w1 if norm else x,))
+      if not norm:
+        return self.run(self.key(f"rms_a32f|{c}|False|{self.real}", rms_a32f_src(c, self.eps, self.real, False)), tag, self.a_size(c), dtypes.uint16, x, x, d)
+      rs = self._rec_src(x) if self.s2("QWEN_RQ") else None
+      if rs is not None and rs[1] and not st: rs = None   # a guarded record needs the layer index
+      if rs is None:
+        rk = self.key(f"rms_rec|{c}|{self.real}", rms_rec_src(c, self.real, self.eps))
+        rec = self.run(rk, "rec|rms", REC_N, dtypes.float32, x, self.desc(f"rms_rec_desc{c}", lambda: rms_rec_desc(c)))
+        g = False
+      else: rec, g = self.bufs[rs[0]], rs[1]
+      k = self.key(f"rms_a32f|{c}|True|{self.real}|{st}|{g}", rms_a32f_src(c, self.eps, self.real, True, stacked=st, guard=g))
+      return self.run(k, tag, self.a_size(c), dtypes.uint16, x, *ws, rec, d)
+    if self.compact and ((norm and os.environ.get("QWEN_RMS_DMA", "1") == "1") or (not norm and self.small_dma())):
       dk = f"rms_a32d_desc{c}"
       if dk not in self.bufs: self.bufs[dk] = Tensor(rms_a32d_desc(c, self.real), device=DEV).realize()
       k = self.key(f"rms_a32d|{c}|{norm}|{self.real}|{st}", rms_a32d_src(c, self.nrb, self.eps, self.real, norm, stacked=st))
@@ -3080,31 +3584,67 @@ class Kernels:
   # rows mode: had_a32d (every operand by DMA, lane-extract butterflies; at 4 rows rms 0.58 -> 0.075 ms a call, plain 0.29 -> 0.039,
   # swiglu 0.65 -> 0.106 on the board; the same bits as had_a32 on the simulator). QWEN_HAD_DMA=0: had_a32
   def had_dma(self): return self.compact and os.environ.get("QWEN_HAD_DMA", "1") == "1"
+  # QWEN_HAD_FAST (default 1): had_fast.py's kernel (compact asm loops for the instruction fetch, no row re-fetch in rms's sums,
+  # swiglu's sub-tiles by exact bytes; 4 rows on the board: rms 75 -> 46 us a call, plain 38 -> 25, swiglu 111 -> 78) with the
+  # same bits as had_a32d (simulator and board gates). 0: had_a32d. "v2": the same
+  # kernel with less executed text (rms 46 -> 41 us, plain 25 -> 22, swiglu 76 -> 69 at 4 rows); QWEN_HAD_V2=0: the "asm"+"swasm" one
+  HAD_FAST_OPTS = ("v2",) if os.environ.get("QWEN_HAD_V2", "1") == "1" else ("asm", "swasm")
+  def had_fast(self): return os.environ.get("QWEN_HAD_FAST", "1") == "1"
   def had_d(self, mode, c, st):
+    if self.had_fast():
+      import had_fast as HF
+      return self.key(f"had_a32d|fast|{mode}|{c}|{self.real}|{st}|{self.had_post}", HF.had_fast_src(mode, c, self.nrb, self.eps, self.real, stacked=st, post=self.had_post, opts=self.HAD_FAST_OPTS))
     return self.key(f"had_a32d|{mode}|{c}|{self.real}|{st}|{self.had_post}", had_a32d_src(mode, c, self.nrb, self.eps, self.real, stacked=st, post=self.had_post))
   def had_desc(self, mode, c):
-    dk = f"had_a32d_desc|{mode}|{c}"
-    if dk not in self.bufs: self.bufs[dk] = Tensor(had_a32d_desc(mode, c, self.nrb, self.real), device=DEV).realize()
+    fast = self.had_fast(); dk = f"had_a32d_desc|{'fast|' if fast else ''}{mode}|{c}"
+    if dk not in self.bufs:
+      if fast:
+        import had_fast as HF
+        self.bufs[dk] = Tensor(HF.had_fast_desc(mode, c, self.nrb, self.real, opts=self.HAD_FAST_OPTS), device=DEV).realize()
+      else: self.bufs[dk] = Tensor(had_a32d_desc(mode, c, self.nrb, self.real), device=DEV).realize()
     return self.bufs[dk]
   def a_size(self, c):
     """halves of an A layout of K = c: compact (row block 0's rt tiles) in rows mode, else all row blocks' three tiles."""
     return (c // 128) * 32 * 16 * self.rt if self.compact else (c // 128) * self.nrb * 32 * 48
-  def swiglu_a(self, ct, m_, tag):
+  def swiglu_a(self, ct, m_, tag, act="silu"):
+    """The down projection's A from the gate|up tiles: fp16(silu(g) u), or `act="gelu"` fp16(gelu_tanh(g) u) (Gemma 4: geglu_a32[d])."""
+    if act != "silu":
+      assert self.had is None, "GeGLU on a rotated-input model"
+      if self.small_dma():
+        dk = f"swiglu_a32d_desc{m_}"
+        if dk not in self.bufs: self.bufs[dk] = Tensor(swiglu_a32d_desc(self.nrb, self.real), device=DEV).realize()
+        return self.run(self.key(f"{ACTS[act][1]}_a32d|{m_}|{self.real}", swiglu_a32d_src(m_, self.nrb, self.real, act)), tag, self.a_size(m_), dtypes.uint16, ct, self.bufs[dk])
+      k = self.key(f"{ACTS[act][1]}_a32|{m_}|{self.real}|{self.compact}", swiglu_a32_src(m_, self.nrb, real=self.real, compact=self.compact, act=act))
+      return self.run(k, tag, self.a_size(m_), dtypes.uint16, ct)
     if self.had is not None and self.had_dma(): return self.run(self.had_d("swiglu", m_, False), tag, self.a_size(m_), dtypes.uint16, ct, self.had_desc("swiglu", m_))
     if self.had is not None:                     # rotated inputs: the down projection's signs are in the up rows' scales
       k = self.key(f"had_a32|swiglu|{m_}|{self.real}|{self.compact}|{self.had_post}", had_a32_src("swiglu", m_, self.nrb, self.eps, real=self.real, compact=self.compact, post=self.had_post))
       return self.run(k, tag, self.a_size(m_), dtypes.uint16, ct)
+    if self.small_dma():                         # rows mode: by DMA (swiglu_a32d)
+      dk = f"swiglu_a32d_desc{m_}"
+      if dk not in self.bufs: self.bufs[dk] = Tensor(swiglu_a32d_desc(self.nrb, self.real), device=DEV).realize()
+      return self.run(self.key(f"swiglu_a32d|{m_}|{self.real}", swiglu_a32d_src(m_, self.nrb, self.real)), tag, self.a_size(m_), dtypes.uint16, ct, self.bufs[dk])
     k = self.key(f"swiglu_a32|{m_}|{self.real}|{self.compact}", swiglu_a32_src(m_, self.nrb, real=self.real, compact=self.compact))
     return self.run(k, tag, self.a_size(m_), dtypes.uint16, ct)
-  # rows mode, the rotated-input model (bonsai2-27b; the others' kernels unchanged until checked there): resid32d / rows32d /
-  # head_topd by DMA -- 4 rows on the board: resid32 122 -> 36 us, rows32 (q) 348 -> 56, head_top 2965 -> 350; the same bits
-  # (resid32d / rows32d) and the same ids (head_topd). QWEN_SMALL_DMA=0: the plain-load kernels
-  def small_dma(self): return self.compact and self.had is not None and os.environ.get("QWEN_SMALL_DMA", "1") == "1"
+  # rows mode (every model's verify / draft / decode geometries): resid32d / rows32d / head_topd / swiglu_a32d / rms_a32d without
+  # the norm by DMA -- 4 rows on the board (qwen3.8-27b): resid32 122 -> 27 us, rows32 (q) 347 -> 48, swiglu
+  # 274 -> 61, head_top 3000 -> 280 a part; the same bits (resid32d / rows32d / swiglu_a32d / rms_a32d: simulator and board) and
+  # the same ids (head_topd). QWEN_SMALL_DMA: 1 (default) every
+  # rows-mode geometry, the non-rotated models' and bonsai2-27b's E4M3 drafter's included; had: the rotated-input
+  # geometries only (the previous default); 0: the plain-load kernels everywhere
+  def small_dma(self):
+    v = os.environ.get("QWEN_SMALL_DMA", "1"); return self.compact and (v == "1" or (v == "had" and self.had is not None))
   def rd_desc(self, c):
     dk = f"rows32d_desc{c}"
     if dk not in self.bufs: self.bufs[dk] = Tensor(rows32d_desc(c, self.nrb, self.real), device=DEV).realize()
     return self.bufs[dk]
   def resid(self, x, ct, c, tag):
+    if self.s2("QWEN_RQ") and c % 16 == 0:       # QWEN_SMALL2: resid32q -- the residual and its rows' norms (the record "rec|<tag>")
+      k = self.key(f"resid32q|{c}|{self.real}", resid32q_src(c, self.nrb, self.real, self.eps))
+      rec = self.buf(f"rec|{tag}", REC_N, dtypes.float32); d = self.desc(f"resid32q_desc{c}", lambda: resid32q_desc(c, self.nrb, self.real))
+      out = self.run(k, tag, self.rows * c, dtypes.float32, x, ct, rec, d, kind="rq").reshape(self.rows, c)
+      self.tag_of.pop(self.last_out.get(tag), None); self.tag_of[id(out)] = (tag, out); self.last_out[tag] = id(out)   # (the latest view only)
+      return out
     if self.small_dma():                         # rows mode: by DMA (resid32d)
       k = self.key(f"resid32d|{c}|{self.real}", rows32d_src(c, self.nrb, self.real, True))
       return self.run(k, tag, self.rows * c, dtypes.float32, x, ct, self.rd_desc(c)).reshape(self.rows, c)
@@ -3120,6 +3660,9 @@ class Kernels:
   def head_top(self, ct, nc, tag, top3=False):
     """A head part's top-1 per real row from its C tiles (head_top_src) -> fp32 [NT, real, 4] task partials; `top3`: the top-3
     kernel -> [NT, real, 8] (three (logit, column) pairs, the sum of exp, 0)."""
+    if top3 and self.s2("QWEN_T3D") and self.real <= 8:   # QWEN_SMALL2: by DMA, the same partials
+      nq = -(-self.real // 4); d = self.desc(f"head_top3d_desc{nq}", lambda: head_top3d_desc(self.nrb, nq))
+      return self.run(self.key(f"head_top3d|{nc}|{self.real}", head_top3d_src(nc, self.nrb, self.real)), tag, NT * self.real * 8, dtypes.float32, ct, d)
     if top3:
       k = self.key(f"head_top3|{nc}|{self.real}", head_top_src(nc, self.nrb, self.real, top3=True))
       return self.run(k, tag, NT * self.real * 8, dtypes.float32, ct)
@@ -3132,6 +3675,9 @@ class Kernels:
     return self.run(k, tag, NT * self.real * 4, dtypes.float32, ct)
   def head_top3_row(self, ct, nc, tag, row):
     """A head part's top-3 (logit, column) on one row (head_top3_row_src) -> fp32 [NT, 1, 8] task partials (lane 6 = 0)."""
+    if self.s2("QWEN_T3D"):                       # QWEN_SMALL2: by DMA (its row quad only), the same partials
+      d = self.desc("head_top3d_desc1", lambda: head_top3d_desc(self.nrb, 1))
+      return self.run(self.key(f"head_top3rd|{nc}|{row}", head_top3d_src(nc, self.nrb, 1, row=row)), tag, NT * 8, dtypes.float32, ct, d)
     k = self.key(f"head_top3r|{nc}|{row}", head_top3_row_src(nc, self.nrb, row))
     return self.run(k, tag, NT * 8, dtypes.float32, ct)
   def call(self, name, src, out, *ins):
@@ -3170,6 +3716,12 @@ class Kernels:
     OA.csrc_call(kk, o, q, Kall, Vall, knew, vnew, idx).realize(); return o.reshape(NH, HD)
   def attn_dec2(self, q_rows, kv_rows, qnw, knw, rope, Kall, Vall, idx, NH, NKV, HD, TMAX, ROT):
     """The fused decode attention (attn_dec2_src) -> the persistent o_rows [rows, NH*HD], the token in row 0."""
+    if attn_gqa_on() and 4 * 1024 + 10 * HD * 4 + TMAX * 32 <= 32768 - 64 and NH // NKV <= 8:   # attn_dec3 (attn_gqa.py): byte-identical o_rows / cache
+      import attn_gqa as AG
+      U = int(os.environ.get("QWEN_ATTN_DEC_U", "1"))
+      if f"attn_dec3_desc" not in self.bufs: self.bufs["attn_dec3_desc"] = Tensor(AG.attn_dec3_desc(NH, NKV, HD), device=DEV).realize()
+      kk = self.key(f"attn_dec2|kv|{TMAX}|{U}", AG.attn_dec3_src(NH, NKV, HD, TMAX, ROT, self.eps, U=U))
+      return self.run(kk, "o_rows", self.rows * NH * HD, dtypes.float32, q_rows, kv_rows, qnw, knw, rope, Kall, Vall, idx, self.bufs["attn_dec3_desc"]).reshape(self.rows, NH * HD)
     kk = self.key(f"attn_dec2|{TMAX}", attn_dec2_src(NH, NKV, HD, TMAX, ROT, self.eps))
     return self.run(kk, "o_rows", self.rows * NH * HD, dtypes.float32, q_rows, kv_rows, qnw, knw, rope, Kall, Vall, idx).reshape(self.rows, NH * HD)
   def gdn_lsr(self, Sall, idx, q, k, v, beta, decay, NV, DK, DV, n, diag=None):
@@ -3187,11 +3739,12 @@ class Kernels:
     diag = tuple(x for x in os.environ.get("GDN_TOKM_DIAG", "").split(",") if x)   # timing diagnostics (gdn_tokm_src)
     prep = gdn_prep()                                                              # "dma" (default) / "dma-lsarr": gdn_tokm_src's DMA-staged preparation; "fast" / "cached"
     if defer is not None and gdn_fast() != "off":   # (MS, accb): the deferred commit, fused sweeps (gdn_fast_src), M <= 8
-      assert rows and not diag
+      assert not diag                                # (not rows: o_proj's compact A straight from the kernel, gdn_fast_src(a_out))
       MS, accb = defer; sw = gdn_fast(); fd = tuple(x for x in os.environ.get("GDN_FAST_DIAG", "").split(",") if x)   # timing diagnostics
-      kk = self.key(f"gdn_tokm|{M}|fast{MS}|{sw}|{fd}|{xoff}|{zoff}", ct_goff(gdn_fast_src(NV, NK, DK, DV, C, CONV, H, self.nrb, self.eps, M, NG, MS, sweeps=sw, diag=fd), self.nrb, (xoff, zoff), ("x", "z")))
-      dk = f"gdn_fast_desc{M}|{MS}"
-      if dk not in self.bufs: self.bufs[dk] = Tensor(gdn_fast_desc(DK, DV, H, gdn_hpt(NV), M, MS, C, CONV, NV=NV), device=DEV).realize()
+      kk = self.key(f"gdn_tokm|{M}|fast{MS}|{sw}|{fd}|{xoff}|{zoff}{'' if rows else '|a'}", ct_goff(gdn_fast_src(NV, NK, DK, DV, C, CONV, H, self.nrb, self.eps, M, NG, MS, sweeps=sw, diag=fd, a_out=not rows), self.nrb, (xoff, zoff), ("x", "z")))
+      dk = f"gdn_fast_desc{M}|{MS}{'' if rows else '|a'}"
+      if dk not in self.bufs: self.bufs[dk] = Tensor(gdn_fast_desc(DK, DV, H, gdn_hpt(NV), M, MS, C, CONV, NV=NV, a_out=not rows), device=DEV).realize()
+      if not rows: return self.run(kk, "a_o", self.a_size(NV * DV), dtypes.uint16, Sall, Call, idx, posb, qkv_ct, z_ct, xin, wab, adt, cwt, nw, self.bufs[dk], banks, rawm, accb)
       return self.run(kk, "o_rows", self.rows * NV * DV, dtypes.float32, Sall, Call, idx, posb, qkv_ct, z_ct, xin, wab, adt, cwt, nw, self.bufs[dk], banks, rawm, accb).reshape(self.rows, NV * DV)
     if defer is not None:    # (MS, accb): the commit deferred to the next verify pass (gdn_defer_src; QWEN_GDN_FAST=off)
       assert rows and prep == "dma" and not diag
@@ -3224,30 +3777,45 @@ class Kernels:
     dk = f"gdn_tokt_desc{M}"
     if dk not in self.bufs: self.bufs[dk] = Tensor(gdn_tokm_desc(DK, DV, H, gdn_hpt(NV), M, C=C, CONV=CONV, tree=True), device=DEV).realize()
     return self.run(kk, "a_o", self.a_size(NV * DV), dtypes.uint16, Sall, Call, idx, posb, qkv_ct, z_ct, xin, wab, adt, cwt, nw, self.bufs[dk], banks, rawm, treeb)
-  def gdn_tokl(self, Sall, Call, idx, posb, qkv_ct, z_ct, xin, wab, adt, cwt, nw, banks, rawm, pathb, treeb, NV, NK, DK, DV, C, CONV, H, NG, MS, xoff=0, zoff=0):
+  def gdn_tokl(self, Sall, Call, idx, posb, qkv_ct, z_ct, xin, wab, adt, cwt, nw, banks, rawm, pathb, treeb, NV, NK, DK, DV, C, CONV, H, NG, MS, xoff=0, zoff=0, rows=True):
     """The leaf tree's DeltaNet on the `real` rows -> fp32 rows in the persistent o_rows (as gdn_tokm(rows, defer)); `pathb`: the
     previous pass's committed path (its pending updates), `treeb`: this pass's tree table. QWEN_GDN_FAST=asm|c (default asm):
-    gdn_fast_src(tree=True) (the fused sweeps, M <= 8); off: gdn_tokl_src (M <= 5). The same arguments, slots and results."""
-    M = self.real; assert self.compact
+    gdn_fast_src(tree=True) (the fused sweeps, M <= 8); off: gdn_tokl_src (M <= 5). The same arguments, slots and results.
+    `rows` False (the fast kernel only): o_proj's compact A in `a_o` instead (gdn_fast_src(a_out); the models without a rotated input)."""
+    M = self.real; assert self.compact and (rows or gdn_fast() != "off"), "gdn_tokl: o_proj's A only from the fast kernel"
     if gdn_fast() != "off":
       sw = gdn_fast()
-      kk = self.key(f"gdn_tokl|{M}|fast{MS}|{sw}|{xoff}|{zoff}", ct_goff(gdn_fast_src(NV, NK, DK, DV, C, CONV, H, self.nrb, self.eps, M, NG, MS, sweeps=sw, tree=True), self.nrb, (xoff, zoff), ("x", "z")))
-      dk = f"gdn_fast_desc{M}|{MS}"
-      if dk not in self.bufs: self.bufs[dk] = Tensor(gdn_fast_desc(DK, DV, H, gdn_hpt(NV), M, MS, C, CONV, NV=NV), device=DEV).realize()
+      kk = self.key(f"gdn_tokl|{M}|fast{MS}|{sw}|{xoff}|{zoff}{'' if rows else '|a'}", ct_goff(gdn_fast_src(NV, NK, DK, DV, C, CONV, H, self.nrb, self.eps, M, NG, MS, sweeps=sw, tree=True, a_out=not rows), self.nrb, (xoff, zoff), ("x", "z")))
+      dk = f"gdn_fast_desc{M}|{MS}{'' if rows else '|a'}"
+      if dk not in self.bufs: self.bufs[dk] = Tensor(gdn_fast_desc(DK, DV, H, gdn_hpt(NV), M, MS, C, CONV, NV=NV, a_out=not rows), device=DEV).realize()
+      if not rows: return self.run(kk, "a_o", self.a_size(NV * DV), dtypes.uint16, Sall, Call, idx, posb, qkv_ct, z_ct, xin, wab, adt, cwt, nw, self.bufs[dk], banks, rawm, pathb, treeb)
       return self.run(kk, "o_rows", self.rows * NV * DV, dtypes.float32, Sall, Call, idx, posb, qkv_ct, z_ct, xin, wab, adt, cwt, nw, self.bufs[dk], banks, rawm, pathb, treeb).reshape(self.rows, NV * DV)
     kk = self.key(f"gdn_tokl|{M}|{MS}|{xoff}|{zoff}", ct_goff(gdn_tokl_src(NV, NK, DK, DV, C, CONV, H, self.nrb, self.eps, M, MS, NG), self.nrb, (xoff, zoff), ("x", "z")))
     dk = f"gdn_tokm_desc{M}defer{MS}"
     if dk not in self.bufs: self.bufs[dk] = Tensor(np.concatenate([gdn_tokm_desc(DK, DV, H, gdn_hpt(NV), M, C=C, CONV=CONV), gdn_defer_desc(M, MS)]), device=DEV).realize()
     return self.run(kk, "o_rows", self.rows * NV * DV, dtypes.float32, Sall, Call, idx, posb, qkv_ct, z_ct, xin, wab, adt, cwt, nw, self.bufs[dk], banks, rawm, pathb, treeb).reshape(self.rows, NV * DV)
+  def gdn_flush(self, Sall, banks, accp, NV, DK, DV, NG, MS, tree=False):
+    """The deferred commit's pending updates (`accp`: accb, or the leaf tree's pathb) applied to every layer's state now
+    (gdn_flush_src: before a plain decode step); the caller clears the pending count."""
+    kk = self.key(f"gdn_flush|{MS}{'|tree' if tree else ''}", gdn_flush_src(NV, DK, DV, NG, MS, tree=tree))
+    dk = f"gdn_flush_desc{MS}"
+    if dk not in self.bufs: self.bufs[dk] = Tensor(gdn_flush_desc(DK, DV, MS), device=DEV).realize()
+    OA.csrc_call(kk, Sall, banks, accp, self.bufs[dk]).realize()
   def gdn_commit_tree(self, Sall, banks, Call, rawm, Kall, Vall, pathb, posb, NV, DK, DV, C, CONV, M, NG, NATT, TMAX, NKV, HD, defer=False):
     """Every DeltaNet layer to the state after the committed path (`pathb`: spec_tree.path_words), the path's raw rows into the
     rings, and a committed rescue row's K / V cache rows to its position in every attention layer."""
     kk = self.key(f"gdn_commit_tree|{M}|{NATT}|{TMAX}{'|defer' if defer else ''}", gdn_commit_tree_src(NV, DK, DV, C, CONV, M, NG, NATT, TMAX, NKV, HD, defer=defer))
     if "gdn_commit_tree_desc" not in self.bufs: self.bufs["gdn_commit_tree_desc"] = Tensor(gdn_commit_tree_desc(NKV * HD * 4), device=DEV).realize()
     OA.csrc_call(kk, Sall, banks, Call, rawm, Kall, Vall, pathb, posb, self.bufs["gdn_commit_tree_desc"]).realize()
+  def ring_commit(self, Call, rawm, Kall, Vall, words, C, CONV, NG, NATT, TMAX, NKV, HD):
+    """The deferred commit's ring (and leaf K / V) copies for any verify geometry (ring_commit_src; `words`: ring_commit_words)."""
+    kk = self.key(f"ring_commit|{NATT}|{TMAX}", ring_commit_src(C, CONV, NG, NATT, TMAX, NKV, HD))
+    if "gdn_commit_tree_desc" not in self.bufs: self.bufs["gdn_commit_tree_desc"] = Tensor(gdn_commit_tree_desc(NKV * HD * 4), device=DEV).realize()
+    OA.csrc_call(kk, Call, rawm, Kall, Vall, words, self.bufs["gdn_commit_tree_desc"]).realize()
   def attn_tree(self, q_rows, kv_rows, qnw, knw, rope, Kall, Vall, idx, treeb, NH, NKV, HD, TMAX, ROT):
     """attn_decm (attn_part + attn_comb) for a tree of `real` rows: attn_part_rg_src(tree=True) with the tree table `treeb`."""
     M = self.real; P = attn_parts(NH, HD, TMAX); assert 2 <= M <= 12, "the tree verify's attention: 2 .. 12 rows"
+    if attn_gqa_on(): return self._attn_gqa(q_rows, kv_rows, qnw, knw, rope, Kall, Vall, idx, treeb, NH, NKV, HD, TMAX, ROT)
     if "attn_part_desc" not in self.bufs: self.bufs["attn_part_desc"] = Tensor(attn_part_desc(NKV, HD), device=DEV).realize()
     kp = self.key(f"attn_partt|{TMAX}|{M}", attn_part_rg_src(NH, NKV, HD, TMAX, ROT, self.eps, M, tree=True) if M > 7 else attn_part_tree_src(NH, NKV, HD, TMAX, ROT, self.eps, M))
     part = self.run(kp, "attn_part", NH * M * P * (HD + 16), dtypes.float32, q_rows, kv_rows, qnw, knw, rope, Kall, Vall, idx, self.bufs["attn_part_desc"], treeb)
@@ -3256,6 +3824,8 @@ class Kernels:
   def attn_decm(self, q_rows, kv_rows, qnw, knw, rope, Kall, Vall, idx, NH, NKV, HD, TMAX, ROT):
     """attn_dec2 for the `real` rows at positions pos .. pos + real - 1 -> the persistent o_rows: attn_part + attn_comb (the cache
     streamed through LSRAM by (head, position slice) units); QWEN_ATTN=decm: the one-kernel attn_decm_src."""
+    if os.environ.get("QWEN_ATTN", "split") == "split" and attn_gqa_on():
+      return self._attn_gqa(q_rows, kv_rows, qnw, knw, rope, Kall, Vall, idx, None, NH, NKV, HD, TMAX, ROT)
     if os.environ.get("QWEN_ATTN", "split") == "split":
       M = self.real; P = attn_parts(NH, HD, TMAX)
       if "attn_part_desc" not in self.bufs: self.bufs["attn_part_desc"] = Tensor(attn_part_desc(NKV, HD), device=DEV).realize()
@@ -3265,6 +3835,18 @@ class Kernels:
       return self.run(kc, "o_rows", self.rows * NH * HD, dtypes.float32, part, q_rows).reshape(self.rows, NH * HD)
     kk = self.key(f"attn_decm|{TMAX}|{self.real}", attn_decm_src(NH, NKV, HD, TMAX, ROT, self.eps, self.real))
     return self.run(kk, "o_rows", self.rows * NH * HD, dtypes.float32, q_rows, kv_rows, qnw, knw, rope, Kall, Vall, idx).reshape(self.rows, NH * HD)
+  def _attn_gqa(self, q_rows, kv_rows, qnw, knw, rope, Kall, Vall, idx, treeb, NH, NKV, HD, TMAX, ROT):
+    """attn_part / attn_partt + attn_comb as the kv-head kernels (attn_gqa.py): the same records, the same o_rows, byte for byte
+    (checked on the vendor simulator). `treeb` None: the chain rule; else the tree table."""
+    import attn_gqa as AG
+    M = self.real; P = attn_parts(NH, HD, TMAX); tree = treeb is not None; nte = attn_gqa_nte(M, NH, NKV, HD, TMAX)
+    dk, ck = f"attn_gqa_desc{M}", f"attn_comb2_desc{M}"
+    if dk not in self.bufs: self.bufs[dk] = Tensor(AG.attn_gqa_desc(NH, NKV, HD, TMAX, M), device=DEV).realize()
+    if ck not in self.bufs: self.bufs[ck] = Tensor(AG.attn_comb2_desc(NH, HD, TMAX, M), device=DEV).realize()
+    kp = self.key(f"{'attn_partt' if tree else 'attn_part'}|gqa|{TMAX}|{M}|{nte}", AG.attn_gqa_src(NH, NKV, HD, TMAX, ROT, self.eps, M, tree=tree, NTE=nte))
+    part = self.run(kp, "attn_part", NH * M * P * (HD + 16), dtypes.float32, q_rows, kv_rows, qnw, knw, rope, Kall, Vall, idx, self.bufs[dk], *([treeb] if tree else []))
+    kc = self.key(f"attn_comb|dma|{TMAX}|{M}", AG.attn_comb2_src(NH, HD, TMAX, M))
+    return self.run(kc, "o_rows", self.rows * NH * HD, dtypes.float32, part, q_rows, self.bufs[ck]).reshape(self.rows, NH * HD)
   def attn_prefill(self, q_rows, kv_rows, qnw, knw, rope, Kall, Vall, idx, NH, NKV, HD, TMAX, ROT):
     """The prefill's causal attention over its `real` rows at positions 0..real-1, every row moved by DMA (attn_pkv: k / v into
     the cache of layer idx[0]; attn_ppart: the slice records; attn_pcomb: o with the gate) -> the persistent o_rows [rows, NH HD]

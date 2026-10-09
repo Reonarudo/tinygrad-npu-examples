@@ -13,10 +13,11 @@ and runs it; the text models can also be served over the OpenAI and Ollama APIs.
 
 | example | what it does | speed on the board |
 | --- | --- | --- |
-| [bonsai2-27b/](bonsai2-27b/) | PrismML's Ternary Bonsai 2 27B (Qwen3.8-27B with ternary weights) from its 5.9 GB GGUF: all 64 layers and the head on a ternary GEMM, speculative decoding with Qwen3.8-27B's MTP layer as the draft; an OpenAI- and Ollama-compatible server (`bonsai2_serve.py`) | 2.0 tok/s plain; **~5.6 tok/s** with speculative decoding (~6.7 on code) |
-| [qwen3.8-27b/](qwen3.8-27b/) | Qwen3.8-27B text generation from its FP8 checkpoint: all 64 layers, the head and the multi-token-prediction (MTP) draft head on the NPU, weights mapped zero-copy from RAM | ~0.7 tok/s plain; **~1.9-3.0 tok/s** with speculative decoding (`QWEN_SPEC=6`), same tokens |
-| [ornith-9b/](ornith-9b/) | Ornith 1.0 9B (Qwen3.5 architecture) from its GGUF Q8_0 checkpoint, on the same modules as qwen3.8-27b; speculative decoding with Qwen3.5-9B's MTP head as the draft | ~4.4 tok/s across prompts, ~5.4 tok/s on a code prompt |
-| [ideogram4/](ideogram4/) | Ideogram 4 text-to-image at full precision: both DiT transformers and the VAE decoder on the NPU | ~170 s a sampling step at 1024 x 1024 (12 steps with `V4_TURBO_12`, ~35 min an image) |
+| [bonsai2-27b/](bonsai2-27b/) | PrismML's Ternary Bonsai 2 27B (Qwen3.8-27B with ternary weights) from its 5.9 GB GGUF: all 64 layers and the head on a ternary GEMM, speculative decoding with Qwen3.8-27B's MTP layer as the draft; an OpenAI- and Ollama-compatible server (`bonsai2_serve.py`) | 2.1 tok/s plain; **~6.2 tok/s** with speculative decoding on three prompts (~7.5 on code), same tokens |
+| [qwen3.8-27b/](qwen3.8-27b/) | Qwen3.8-27B text generation from its FP8 checkpoint: all 64 layers, the head and the multi-token-prediction (MTP) draft head on the NPU, weights mapped zero-copy from RAM | 0.76 tok/s plain; **~2.2 tok/s** with speculative decoding on three prompts (3.6 on code, 2.9 on step-by-step reasoning, 1.35 on prose; `QWEN_SPEC=6`), same tokens |
+| [ornith-9b/](ornith-9b/) | Ornith 1.0 9B (Qwen3.5 architecture) from its GGUF Q8_0 checkpoint, on the same modules as qwen3.8-27b; speculative decoding with Qwen3.5-9B's MTP head as the draft | 2.1 tok/s plain; **~6.8 tok/s** with speculative decoding on three prompts (8.1-8.4 on code and step-by-step reasoning), same tokens |
+| [gemma4/](gemma4/) | Google's Gemma 4 E2B and E4B from their Q8_0 GGUFs: every layer (sliding-window and global attention, per-layer embeddings, shared KV caches) and the head with its top-1 on the NPU, the prompt 8 tokens a pass, speculative decoding with Gemma 4's MTP draft head | E2B 8.2 tok/s plain, **~18 tok/s** with speculative decoding on three prompts (~21 on code); E4B 4.3 and **11.0 tok/s**; same tokens |
+| [ideogram4/](ideogram4/) | Ideogram 4 text-to-image at full precision: both DiT transformers and the VAE decoder on the NPU | ~167 s a sampling step at 1024 x 1024 (12 steps with `V4_TURBO_12`, ~33 min an image) |
 
 Speeds are measured on the board with the NPU clocks at their defaults; text-generation speed depends on the prompt (code and
 other predictable text drafts better).
@@ -26,6 +27,8 @@ other predictable text drafts better).
   weights. The output is identical to plain greedy decoding by construction.
 - **Bonsai 2 27B:** the ternary weights cut a pass's weight traffic to ~7 GB, which streams through the same port; the GEMM works
   in tiles of 4 rows, so a verify pass costs about the same for 1 to 4 tokens and speculative decoding drafts at most 3.
+- **Gemma 4:** a token streams ~2.4 GB of weights on E2B (~5 GB on E4B), so plain decoding is bound near 10 tok/s (E4B: 5); a
+  verify pass of up to 8 rows costs ~1.1 plain steps, and the model's own MTP draft head proposes up to 6 tokens a pass.
 - **Ideogram 4:** the text encoder runs on the host CPU (~2.5 min a prompt); everything after it runs on the NPU.
 
 ## Requirements
@@ -45,18 +48,19 @@ More detail in [`tinygrad/extra/zhouyi/README.md`](tinygrad/extra/zhouyi/README.
   `libclang-NN-dev`) need `LIBCLANG_PATH=/usr/lib/llvm-NN/lib/libclang-NN.so` for the first run.
 - **The vendor's AIPU compiler toolchain library** (`libaiputoolchain.so`). Default location `/usr/share/cix/lib/onnxruntime`;
   set `ZHOUYI_TOOLCHAIN_DIR` otherwise.
-- **For the 27B models:** the driver's zero-copy weight buffers (the WBUF / SLOT ioctls). Without them the weights are copied
-  every token (~2-3 s a token).
+- **For the 27B models and Gemma 4:** the driver's zero-copy weight buffers (the WBUF / SLOT ioctls). Without them the weights
+  are copied every token (~2-3 s a token on the 27B).
 - **NPU clocks at their defaults** (`npuclk` 1.2 GHz, `npu_memclk` 750 MHz) to reproduce the numbers above.
 - **Optional, for the speeds above:** write access to `/dev/cpu_dma_latency` (see
   [bonsai2-27b/README.md](bonsai2-27b/README.md#the-cpu-latency-request)); without it the text models run slower and print a note.
 - **Disk:** Qwen3.8 about 27 GB of checkpoint + 27 GB of packed layers; Bonsai 2 about 6.4 GB of downloads + 8.2 GB packed;
-  Ideogram 4 about 45 GB, plus ~16 GB of repacked panels (set `P48_DIR` / `W13I_DIR` to a disk with room).
+  Gemma 4 E2B 5.0 GB + 2.5 GB packed (E4B: 5.0 GB packed); Ideogram 4 about 45 GB, plus ~16 GB of repacked panels (set
+  `P48_DIR` / `W13I_DIR` to a disk with room).
 
 ## Getting started
 
 ```sh
-git clone --recursive https://github.com/Reonarudo/tinygrad-npu-examples
+git clone --recursive https://github.com/Reonarudo/tinygrad-npu-examples.git
 cd tinygrad-npu-examples
 pip install -r requirements.txt
 ```
@@ -68,8 +72,8 @@ The scripts import tinygrad from the `tinygrad/` submodule. To use another check
 ### Paths
 
 The scripts default to model and cache paths under `/mnt/ssd/...` (and `~/ideogram4` for Ideogram 4). These are examples: set
-the environment variables each README lists (`BONSAI_DIR`, `BONSAI_GGUF`, `QWEN_DIR`, `QWEN_NPU`, `ORNITH_GGUF`, `IDEOGRAM4_DIR`,
-...) to your own paths, on a disk with room.
+the environment variables each README lists (`BONSAI_DIR`, `BONSAI_GGUF`, `QWEN_DIR`, `QWEN_NPU`, `ORNITH_GGUF`, `GEMMA_GGUF`,
+`GEMMA_NPU`, `IDEOGRAM4_DIR`, ...) to your own paths, on a disk with room.
 
 ### First run
 
@@ -123,8 +127,9 @@ The code in this repository is free software under the **GNU Affero General Publ
 
 Not covered by it: tinygrad, a git submodule, and its Zhouyi backend are under tinygrad's MIT licence. This repository bundles
 no third-party code: the NPU driver, the vendor toolchain library, libclang and the Python packages are installed by you from
-their own sources. The model weights are not included: each `download.sh` fetches them from Hugging Face under each model's own
-licence (Qwen3.8-27B and Ternary Bonsai 2 27B: Apache-2.0; Ideogram 4: gated, accept its licence on Hugging Face first).
+their own sources. The model weights are not included: you download them from Hugging Face (`download.sh` where the example has
+one) under each model's own licence (Qwen3.8-27B and Ternary Bonsai 2 27B: Apache-2.0; Gemma 4: see its model card; Ideogram 4:
+gated, accept its licence on Hugging Face first).
 
 ## Configuration: Qwen3.8-27B, Bonsai 2 and Ornith
 
@@ -136,9 +141,9 @@ The three text examples run the same modules (`bonsai2-27b/` sets `QWEN_MODEL=bo
 
 | variable | default | what it does |
 | --- | --- | --- |
-| `QWEN_SPEC` | `0` on qwen3.8-27b (plain decoding), `6` on ornith-9b | rows of a verify pass (1 + drafts); `0` decodes plainly. `6` is the measured setting |
+| `QWEN_SPEC` | `0` on qwen3.8-27b (plain decoding), `8` on ornith-9b (the leaf tree) | rows of a verify pass (1 + drafts); `0` decodes plainly. `6` is the measured setting on the 27B (`8` measured +10 % with the deferred-commit kernel) |
 | `QWEN_DIR` | `/mnt/ssd/qwen3.8-27b-fp8` (Ornith: `ORNITH_GGUF`) | the checkpoint. Set it to your path |
-| `QWEN_NPU` | `/mnt/ssd/qwen3.8-27b-npu-s1` (Ornith: `/mnt/ssd/ornith-9b-npu`) | the packed cache written by the pack script. Set it to your path. For Ornith, pack with `ornith_pack.py --q8f` and point `QWEN_NPU` at that cache: it is the faster format, and the one the speeds above were measured with |
+| `QWEN_NPU` | `/mnt/ssd/qwen3.8-27b-npu-s1` (Ornith: `/mnt/ssd/ornith-9b-npu`) | the packed cache written by the pack script. Set it to your path. For Ornith, the speeds above were measured on the default (exact) cache; an `ornith_pack.py --q8f` cache now measures 2-3 % slower |
 | `ORNITH_GGUF`, `ORNITH_MTP` | `/mnt/ssd/models/ornith-1.0-9b-Q8_0.gguf`, `/mnt/ssd/qbench/models/Qwen_Qwen3.5-9B-bf16.gguf` | Ornith's checkpoint and the Qwen3.5-9B GGUF its draft head comes from. Set them to your paths |
 | `QWEN_TOK` | the checkpoint folder (Ornith: the cache) | where `tokenizer.json` is |
 | `QWEN_PIN_GB` | `24` (Ornith: `12`) | GB of layers pinned in RAM |
@@ -151,10 +156,11 @@ The three text examples run the same modules (`bonsai2-27b/` sets `QWEN_MODEL=bo
 | --- | --- | --- |
 | `QWEN_DRAFT` | `mtp` | the drafter: the checkpoint's MTP head, or `none` (verify path without drafts) |
 | `QWEN_DRAFT_TAU` | `0.6` | keep drafting while the draft head's probability is at least tau; `0` always drafts `QWEN_DRAFT_MAX` |
-| `QWEN_DRAFT_MAX` | `QWEN_SPEC - 1` (Ornith: `3`) | drafts per pass at most |
+| `QWEN_DRAFT_MAX` | `QWEN_SPEC - 1` (Ornith: `5`) | drafts per pass at most |
 | `QWEN_DRAFT_PARTS` | `2,thresh:25` on qwen3.8-27b, `2` on Ornith | `<n>[,thresh:<x>]`: the draft head reads the lm head's first n column parts; with `thresh:<x>` it reads parts after the first only when the first part's top logit is at most x |
 | `QWEN_SPEC_GEOS` | `3,4,6` | verify geometries (row counts) captured; a pass rounds up to the next one |
-| `QWEN_SPEC_TREE` | `off` | `rescue2`: every pass verifies 8 rows, the 5-draft chain plus 2 "rescue" rows holding the draft head's second-choice token at the two least confident positions (`fixed:<j1,j2>` for fixed positions). About +1 % on average; see [qwen3.8-27b/README.md](qwen3.8-27b/README.md) |
+| `QWEN_GDN_FAST` | `asm` | the deferred-commit DeltaNet verify kernel (`gdn_fast_src`, every model, up to 8 rows); `c` its compiler-scheduled sweeps; `off` the per-token state banks and the full commit (`QWEN_GDN_DEFER=0` the same) |
+| `QWEN_SPEC_TREE` | `off` (Bonsai 2, Ornith: `leaf`) | `leaf`: the chain plus the drafts' rank-2/3 candidates in the spare rows (any model). `rescue2`: every pass verifies 8 rows, the 5-draft chain plus 2 "rescue" rows holding the draft head's second-choice token at the two least confident positions (`fixed:<j1,j2>` for fixed positions). About +1 % on average; see [qwen3.8-27b/README.md](qwen3.8-27b/README.md) |
 | `QWEN_SPEC_WARM` | `1` | prepare every verify and draft geometry before the first token |
 | `QWEN_SPEC_LOG` | unset | a `.jsonl` path for per-pass telemetry (drafts, acceptance, times, output ids) |
 | `QWEN_HEAD_TOP3` | `0` | also log the draft head's top-3 tokens (drafts unchanged) |
@@ -180,6 +186,7 @@ narrow down a problem; they produce the same tokens.
 | `QWEN_ATTN` | `split` | `decm` | the verify pass's attention as one kernel instead of two |
 | `QWEN_GDN_TOK` | `3` | `1`, `2` | earlier variants of the one-token DeltaNet kernel |
 | `QWEN_RMS_DMA` | `1` | `0` | RMSNorm rows read through the cache instead of streamed by DMA |
+| `QWEN_SMALL_DMA` | `1` | `had`, `0` | the rows-mode layout kernels (residual add, C unpack, SwiGLU, un-normed A, the head's top-1) streamed by DMA in every model's verify / draft / decode geometries. `had` limits that to Bonsai 2's rotated-input geometries (the previous default: Ornith, Qwen3.8 and Bonsai's drafter on the plain-load kernels); `0` uses the plain-load kernels everywhere |
 | `QWEN_HEAD` | `fp8` when packed, else `fp16` | `fp16`, `both` | the lm head for plain decoding; `both` runs both and compares |
 
 ### Diagnostics

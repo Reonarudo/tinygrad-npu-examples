@@ -7,8 +7,8 @@ float8 vectors of a token's rows (KQN: new tokens, [4-row group][token] (k rows 
 
 `modulo_schedule` places the ops of one iteration in II bundles with two stages (stage 0: loads, replics and temporaries of the
 NEXT iteration; stage 1: the accumulations and the stores of this one), so that the loop needs a prologue (stage 0 of iteration
-0) and NO epilogue: the last trip's stage-0 ops only load past the block (inside LSRAM) and write temporaries. Rules taken from
-docs/Core/TEC (ALU.md, LSRAM.md): two ALU ops a bundle (fma / mul / scalar add), two memory ops (vld / st / replic) with replic
+0) and NO epilogue: the last trip's stage-0 ops only load past the block (inside LSRAM) and write temporaries. Rules of the TEC
+(measured on the board): two ALU ops a bundle (fma / mul / scalar add), two memory ops (vld / st / replic) with replic
 and st in slot 2 only (one of them a bundle: the assembler refuses {st; replic}); a load pair must straddle bit 6 (the bank), a load beside a store must share
 it; at most two stores in any three consecutive bundles (1.5 cycles a store); latencies vld 3, replic 2, fma / mul 4, add 1;
 a loop body (+ loopend) of at most 32 bundles. Every reuse of a physical register comes strictly after the last read of its

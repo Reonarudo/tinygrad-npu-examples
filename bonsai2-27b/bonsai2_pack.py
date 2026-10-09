@@ -142,6 +142,7 @@ def pack_drafter(qdir, out):
   if os.path.exists(tok) and not os.path.exists(os.path.join(out, "tokenizer.json")): shutil.copy(tok, out)
 
 def main():
+  global TSCALE
   ap = argparse.ArgumentParser()
   ap.add_argument("--gguf", default=os.environ.get("BONSAI_GGUF", "/mnt/ssd/bonsai2/Ternary-Bonsai-2-27B-PTQ1_0.gguf"))
   ap.add_argument("--out", default=os.environ.get("QWEN_NPU", "/mnt/ssd/bonsai2-npu")); ap.add_argument("--layers", default="0-63")
@@ -150,7 +151,7 @@ def main():
   ap.add_argument("--tscale", default=TSCALE, choices=("f32", "f16"), help="the ternary scale table: fp16 s x 2^15 (default) or fp32 s x 2^18 (the older format)")
   ap.add_argument("--mtp", metavar="DIR", help="the drafter: Qwen3.8-27B-FP8's MTP layer (DIR/mtp.safetensors) into <out>/mtp, DIR/tokenizer.json into <out>")
   a = ap.parse_args(); os.makedirs(a.out, exist_ok=True); lo, hi = (int(v) for v in a.layers.split("-"))
-  global TSCALE; TSCALE = a.tscale
+  TSCALE = a.tscale
   if a.fuse: fuse_all(a.out, range(lo, hi + 1)); return
   if a.mtp:
     t0 = time.perf_counter(); pack_drafter(a.mtp, a.out); print(f"   the drafter (Qwen3.8-27B's MTP layer) packed into {os.path.join(a.out, 'mtp')} in {time.perf_counter() - t0:.0f} s", flush=True); return

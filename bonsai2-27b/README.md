@@ -9,8 +9,8 @@ layer, the embedding and the output head stored as **ternary weights**: each wei
 and its GGUF are PrismML's, under the Apache-2.0 license; see their [model card](https://huggingface.co/prism-ml/Ternary-Bonsai-2-27B-gguf),
 [website](https://prismml.com) and [whitepaper](https://github.com/PrismML-Eng/Bonsai-demo/blob/main/bonsai-2-27b-whitepaper.pdf).
 
-**Status: it generates.** Plain greedy decoding runs at 2.0 tok/s. With speculative decoding (the default) it runs at
-**~5.6 tok/s**, and ~6.7 tok/s on code, with the same tokens as plain greedy decoding.
+**Status: it generates.** Plain greedy decoding runs at 2.1 tok/s. With speculative decoding (the default) it runs at
+**~6.2 tok/s**, and ~7.5 tok/s on code, with the same tokens as plain greedy decoding.
 
 ![Bonsai 2 27B served from the board, asked through the Ollama CLI on a Mac](serve-demo.gif)
 
@@ -96,8 +96,8 @@ QWEN_SPEC=0 python3 bonsai2_generate.py "Explain why the sky is blue to a ten-ye
 ```
 
 The prompt goes through the chat template (thinking off; `--thinking` turns it on). Decoding is greedy until `<|im_end|>` or
-`--max-new`. `--raw` skips the template, and `--out ids.npz` saves the generated ids. Model set-up takes ~20 s a run, and the
-prefill runs at ~1.5 tok/s (24 tokens in 16 s).
+`--max-new`. `--raw` skips the template, and `--out ids.npz` saves the generated ids. Model set-up takes ~20 s a run (9 s for
+plain decoding), and the prefill runs at ~1.6 tok/s (24 tokens in 15 s).
 
 Without the drafter in `$QWEN_NPU/mtp`, the generator says so and decodes plainly.
 
@@ -241,15 +241,29 @@ for chunk in stream:
 - **Prompt speed.** The prompt goes through the verify path, 4 tokens a pass, at ~7 tok/s, so a long chat history delays the first
   token (each request processes the whole conversation again). Its tokens can differ from the one-pass prefill's where two
   logits nearly tie; on the Fibonacci prompt the 120 tokens equal plain greedy decoding's.
-- **Generation speed** depends on how predictable the text is: ~6.7 tok/s on code, ~4.3 tok/s on free prose.
+- **Generation speed** depends on how predictable the text is: ~7.5 tok/s on code, ~4.8 tok/s on free prose.
 - **Thinking** is off unless the request turns it on: `"chat_template_kwargs": {"enable_thinking": true}` (OpenAI) or
   `"think": true` (Ollama).
 
 ## Speed
 
-Measured on the board with the NPU clocks at their defaults, the host pinned to the NPU interrupt's CPU (`QWEN_CPUS`, the
-default) and holding the 0 µs CPU-latency request ([above](#the-cpu-latency-request)), 120 new tokens each, wall time after the
-first token, the prefill excluded. Every speculative run returned exactly the plain greedy tokens.
+Measured on the board with the NPU clocks at their defaults, the host on CPUs 0 and 1 (`QWEN_CPUS=0,1`: CPU 0 takes the NPU's
+interrupt; the default `auto` picks it and one CPU of the same speed) and holding the 0 µs CPU-latency request
+([above](#the-cpu-latency-request)), 120 new tokens each, wall time after the first token, the prefill excluded. Every
+speculative run returned exactly the plain greedy tokens.
+
+The published backend and the generator's defaults (fp16 scale tables, the leaf tree, kernel code in GM), on three of
+qwen3.8-27b's exploration prompts (plain: 40 tokens), one session, the board shared with other jobs (not running at the same
+time):
+
+| prompt | plain | speculative, default drafter |
+| --- | ---: | ---: |
+| e0 Fibonacci in Python | 2.16 | 7.47 |
+| e4 a short story's opening | 2.13 | 4.78 |
+| e8 a train journey's length, step by step | 2.13 | 6.96 |
+| **the three together** | **2.14** | **6.17** |
+
+The previous release's build, for comparison:
 
 | prompt | plain (40 tokens) | speculative, defaults |
 | --- | ---: | ---: |
@@ -258,7 +272,7 @@ first token, the prefill excluded. Every speculative run returned exactly the pl
 | a train journey's length, step by step | | 6.28 |
 | **the three together** | | **5.58** |
 
-Over ten varied prompts the defaults average 5.34 tok/s.
+Over ten varied prompts that build averaged 5.34 tok/s.
 
 Code and step-by-step reasoning draft best; free prose drafts worst.
 

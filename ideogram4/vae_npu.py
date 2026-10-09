@@ -23,7 +23,7 @@ PQ_DEV = os.environ.get("PQ_DEV", "1") == "1"                            # post_
 # solo 12-task csrc launches as ONE job, the three cores' groups overlapped behind a closing barrier task (ZHOUYI_SOLO12=chain): the
 # conv_a / conv_c / gn_silu / softmax kernels here run eagerly, outside a JIT graph, and a solo launch otherwise runs its cores one after
 # another (conv_a 1024^2 band 47 ms; the three-job WAVE 33; this 17). Safe for these kernels: no cache line is written by two tasks
-# (bulk output by DMA; stats / sums one 64 B line per task or row block) -- wave_drop_probe PAD=16 under it: 0 / 1500 (2026-09-28)
+# (bulk output by DMA; stats / sums one 64 B line per task or row block) -- a board stress test under it: 0 lost writes in 1500 runs (2026-09-28)
 os.environ.setdefault("ZHOUYI_SOLO12", "chain")
 NSLOT = int(os.environ.get("NSLOT", "3"))                             # activation slots: x, the activated copy, the conv's out
 A_MAX = int(os.environ.get("A_MB", "160")) << 20; C_MAX = int(os.environ.get("C_MB", "80")) << 20    # band scratch: 160 / 80 beat 320 / 160 (the 1024^2 GEMMs) and 80 / 40 (per-band cost)

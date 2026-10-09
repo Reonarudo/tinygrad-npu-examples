@@ -4,10 +4,11 @@ Text generation with [Qwen/Qwen3.8-27B-FP8](https://huggingface.co/Qwen/Qwen3.8-
 language-model layers, the output head and the multi-token-prediction (MTP) draft head on the NPU through the `ZHOUYI` backend.
 Text only: the vision tower is not used.
 
-**Status: it generates.** *"What is the capital of Portugal? Answer in one sentence."* is answered with
-`The capital of Portugal is Lisbon.<|im_end|>` (greedy). Measured on the board (24-token prompt, a 512-slot K/V cache): prefill
-~21 s, then **1.52 s per generated token (~0.66 tok/s)** with plain decoding, and **~1.9-3.0 tok/s** with speculative decoding
-(`QWEN_SPEC=6`), with the same tokens. What makes it run at this speed, roughly in order of effect: hand-written kernels for
+**Status: it generates, at 0.76 tok/s plain and ~2.2 tok/s with speculative decoding (1.35-3.6 by prompt).** *"What is the
+capital of Portugal? Answer in one sentence."* is answered with `The capital of Portugal is Lisbon.<|im_end|>` (greedy).
+Measured on the board (see [Speed](#speed)): model set-up 17 s (32 s with the speculative geometries), prefill ~1.6 tok/s (24
+tokens in 15 s), then **0.76 tok/s** with plain decoding and **~2.2 tok/s** with speculative decoding (`QWEN_SPEC=6`), with the
+same tokens. What makes it run at this speed, roughly in order of effect: hand-written kernels for
 everything the generic kernels did badly; decode GEMMs that compute only the real rows and prefetch their operands;
 **zero-copy weights** (the kernel driver's weight buffers and slots: the NPU reads each layer where it already sits in RAM,
 instead of the CPU copying 26 GB into the NPU's window every token); a fused decode attention and DeltaNet step (`gdn_tok3`
@@ -28,6 +29,23 @@ This folder also holds the modules the other two text examples run: [bonsai2-27b
 | Gated DeltaNet | 16 key heads x 128, 48 value heads x 128, causal conv1d (kernel 4) + SiLU, gated delta rule, gated RMSNorm |
 | vocab | 248 320, untied `lm_head` |
 | weights | fp8 (E4M3) linears with 128 x 128 block scales; `embed_tokens`, `lm_head`, norms and the DeltaNet's small parameters in bf16 |
+
+## Speed
+
+Measured on the board with the published backend, the NPU clocks at their defaults, the host on CPUs 0 and 1 (`QWEN_CPUS=0,1`;
+CPU 0 takes the NPU's interrupt) holding a 0 µs CPU-latency request (`QWEN_CPU_LATENCY`, the default), the generator's defaults
+(`QWEN_PIN_GB=24`, the fp8 head, fused projections), 40 new tokens, wall time after the first token, the prefill excluded. One
+session, on a board shared with other jobs (not running at the same time). Every speculative run returned exactly the ids of
+plain greedy decoding. This model's speed varies by ~20 % from session to session (how much of the 27 GB the page cache holds).
+
+| prompt | plain (`QWEN_SPEC=0`) | speculative (`QWEN_SPEC=6`) |
+| --- | ---: | ---: |
+| e0 Fibonacci in Python | 0.77 | 3.60 |
+| e4 a short story's opening | 0.76 | 1.35 |
+| e8 a train journey's length, step by step | 0.76 | 2.86 |
+| **the three together** | **0.76** | **2.20** |
+
+The sections below give some numbers of earlier builds, as measured then.
 
 ## What the board imposes
 
@@ -73,13 +91,17 @@ clients are described in [bonsai2-27b/README.md](../bonsai2-27b/README.md#serve-
 Decoding is bound by streaming the 26 GB of weights once per token, and a GEMM costs about the same for 1 to 8 rows. So each
 pass through the weights verifies the current token plus up to 5 drafts from the checkpoint's own multi-token-prediction head
 (`mtp.safetensors`: one attention layer + MLP, run on the NPU). The model keeps the drafts it agrees with plus its own next
-token; the output is **identical to plain greedy decoding** (checked id for id). The DeltaNet states roll back to the last
-accepted token (`gdn_tokm` keeps the state after each token; `gdn_commit` restores it); the attention caches need no rollback.
+token; the output is **identical to plain greedy decoding** (checked id for id). The DeltaNet commit is deferred: the verify
+kernel (`gdn_fast_src`: hand-scheduled fused sweeps, o_proj's A written directly) stores each token's update inputs, and the
+next pass applies the accepted ones before its own tokens -- no per-token state banks (1 GB at 8 rows); `gdn_commit` moves only
+the conv ring rows. `gdn_tokm` 1165 -> 461 us a call (4 rows, 2 pending updates), 2.63 -> 2.74 tok/s pooled (`QWEN_SPEC=6`,
+2 prompts x 80 tokens, identical ids); `QWEN_SPEC=8` measured 3.02. `QWEN_GDN_FAST=off` (or `QWEN_GDN_DEFER=0`) returns to the
+banks and the full commit. The attention caches need no rollback.
 
 **Adaptive depth.** The draft chain goes on only while the draft head's probability of its draft is >= `QWEN_DRAFT_TAU` (0.6);
 a pass verifies 3, 4 or 6 rows (`QWEN_SPEC_GEOS`, the count rounded up; rows 5.. cost nearly what 6 do). `QWEN_DRAFT_MAX` caps the
-drafts a pass (default `QWEN_SPEC` - 1 here; 3 for the Q8_0 and ternary models, whose compute-bound GEMM makes a 5-6-row pass
-costlier). Measured on 350 drafts: probability >= 0.95 -> 72 % accepted, < 0.5 -> 12 %. Every geometry's JIT is captured at
+drafts a pass (default `QWEN_SPEC` - 1 here; 3 for the ternary model and 5 for Ornith, whose compute-bound GEMMs make a
+5-6-row pass costlier). Measured on 350 drafts: probability >= 0.95 -> 72 % accepted, < 0.5 -> 12 %. Every geometry's JIT is captured at
 start-up (~15 s, `QWEN_SPEC_WARM`).
 
 The head returns only its top-1: per head part the GEMM and a `head_top` kernel (each row's max, its column and the sum of exp)
@@ -93,7 +115,9 @@ and then parts 1.. only when part 0's top logit on the row drafted from is <= x 
 `2` reads both. The 27B's default is `2,thresh:25` (Ornith keeps `2`). Verification decides the tokens, so the policies only
 change which drafts are proposed.
 
-**Tree verification (`QWEN_SPEC_TREE`, off by default).** `QWEN_SPEC_TREE=rescue2` makes every verify pass 8 rows: the chain of
+**Tree verification (`QWEN_SPEC_TREE`, off by default on this model).** `QWEN_SPEC_TREE=leaf` fills the rows the chain
+leaves free with the drafts' second and third candidates (the default of Bonsai 2 and Ornith; measured level with the chain on
+this model). `QWEN_SPEC_TREE=rescue2` makes every verify pass 8 rows: the chain of
 5 drafts plus two "rescue" rows, each holding the draft head's second-choice token at one of the two chain positions whose draft
 had the lowest top-1 - top-2 margin (`fixed:<j1,j2>`: at the positions given). A rescue row has the same parent as the chain row
 it replaces, so it attends (and its DeltaNet state follows) only its ancestors; when the chain is rejected at that position and

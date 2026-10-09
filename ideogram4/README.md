@@ -35,8 +35,8 @@ export IDEOGRAM4_DIR=~/ideogram4               # your path
 
 1. `ideogram4_text.py` — the prompt through the text encoder, once per image, host numpy: about 2.5 minutes
    (36 layers at ~4 s each). Output: `out/cat_text.npz`, the text rows the conditional transformer reads.
-2. `ideogram4_fp_1024.py` — the sampling loop on the NPU. `V4_TURBO_12` (12 steps) takes ~170 s per step at
-   1024 x 1024, so ~35 minutes; `V4_DEFAULT_20` and `V4_QUALITY_48` scale with the step count.
+2. `ideogram4_fp_1024.py` — the sampling loop on the NPU. `V4_TURBO_12` (12 steps) takes ~167 s per step at
+   1024 x 1024, so ~33 minutes; `V4_DEFAULT_20` and `V4_QUALITY_48` scale with the step count.
    Output: `out/cat_latents.npy` (packed latents [4096, 128]); `--save-every` keeps every step's latents.
 3. `vae_npu.py` — the VAE decoder on the NPU, ~20 s warm. Output: `out/cat.png`.
 
