@@ -19,14 +19,8 @@ What changes against had_a32d (opts):
     the warm second run's), "spread" (unit u on task (u % 3) * 4 + u / 3); ablations "nosw", "nodma", "dmab" (timing only).
 args as had_a32d: out, x, [w (stacked: [L, c]), [idx]], desc (had_fast_desc(mode, c, nrb, real, opts)), [dg], core_id.
 """
-import os, sys, pathlib
-try: import had_asm as hasm                                                   # the examples tree (qwen3.8-27b/had_asm.py)
-except ImportError:                                                           # a standalone copy: hasm.py beside this file
-  EX = pathlib.Path(os.environ.get("EX", "~/Developer/example-tinygrad-npu-uses")).expanduser()
-  if str(EX / "qwen3.8-27b") not in sys.path: sys.path.insert(0, str(EX / "qwen3.8-27b"))
-  sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
-  import hasm                                                                 # noqa: E402
-import qwen38_kernels as K                                                    # noqa: E402
+import had_asm as hasm                                                        # the bundles' scheduler (had_asm.py, beside this file)
+import qwen38_kernels as K
 _SCH = {}
 def sch(name, mk, nopro=False):
   if name not in _SCH: _SCH[name] = hasm.best_schedule(mk, nopro=nopro)

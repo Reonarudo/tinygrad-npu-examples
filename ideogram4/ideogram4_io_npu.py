@@ -35,10 +35,10 @@ class IOProj:
         self.tw, self.ROWS, self.n_img = tw, ROWS, n_img
         self.text = None if text_rows is None else np.ascontiguousarray(text_rows, np.float32)
         self.n_text = 0 if text_rows is None else text_rows.shape[0]; self.treal = self.n_text + n_img
-        wh, wl = _hilo(tw.input_w.astype(np.float32) * S10)                      # [4608, 128]
+        wh, wl = _hilo(tw.in_w.astype(np.float32) * S10)                      # [4608, 128]
         self.b_in = _dev(V.b_layout_ref(np.concatenate([wh, wl, wh], 1).astype(np.float32), 24, 6))
-        self.bias_in = _dev((tw.input_b + tw.ind[1]).astype(np.float32))
-        fh, fl = _hilo(tw.fin_w.astype(np.float32) * S10)                        # [128, 4608]
+        self.bias_in = _dev((tw.in_b + tw.tag[1]).astype(np.float32))
+        fh, fl = _hilo(tw.out_w.astype(np.float32) * S10)                        # [128, 4608]
         self.b_fin = _dev(V.b_layout_ref(np.concatenate([fh, fl, np.zeros((32, C_), np.float16)]).astype(np.float32), 24, 6))
         self.nrb_in = -(-n_img // 96) * 8                                        # the latents' rows padded to 96
         self.a_in = _dev(np.zeros(self.nrb_in * 12 * 3 * IN, np.uint16))
@@ -61,7 +61,7 @@ class IOProj:
             self.k_pad = OA.register_csrc("dma_copy", V.dma_copy_src(npad, self.treal * C_ * 4, nt=NT), ntasks=NT); self.d_pad = _dev(V.dma_copy_descs(npad))
         self.vrows = _dev(np.zeros(ROWS * 288, np.float32))
         self.k_vrows = OA.register_csrc("ctile_rows", V.ctile_rows_src(self.nrb, ROWS, 288, 0, 1.0 / S10, nt=NT), ntasks=NT); self.d_vrows = _dev(V.ctile_rows_descs(ROWS, 288))
-        self.bias_v = _dev(np.concatenate([tw.fin_b, np.zeros(160)]).astype(np.float32))
+        self.bias_v = _dev(np.concatenate([tw.out_b, np.zeros(160)]).astype(np.float32))
         self.ws2 = None
 
     def use_temb(self, temb, stepv):
@@ -71,7 +71,7 @@ class IOProj:
     def set_scales(self, adas):
         """The final layer's (1 + AdaLN scale) for every step, once an image (dup_quads, device)."""
         tw = self.tw
-        self.ws2 = [_dev(V.dup_quads((1.0 + (tw.fin_ada_w @ (ad / (1.0 + np.exp(-ad))) + tw.fin_ada_b)).astype(np.float32))) for ad in adas]
+        self.ws2 = [_dev(V.dup_quads((1.0 + (tw.om_w @ (ad / (1.0 + np.exp(-ad))) + tw.om_b)).astype(np.float32))) for ad in adas]
 
     def embed_dev(self, xdev, rows, big):
         """the device latents (fp32 [12 nrb_in][128]) -> rows (text rows and pad zeros restored from the templates): no host work."""
@@ -126,13 +126,13 @@ class Sampler:
     def final(self, h, ada, a_buf):
         """the last hidden rows (device fp32 [ROWS][4608]) -> the velocity [n_img, 128] (host); `a_buf` = a uint16 scratch of ROWS x 4608."""
         tw = self.tw
-        scale = (1.0 + (tw.fin_ada_w @ (ada / (1.0 + np.exp(-ada))) + tw.fin_ada_b)).astype(np.float32)
+        scale = (1.0 + (tw.om_w @ (ada / (1.0 + np.exp(-ada))) + tw.om_b)).astype(np.float32)
         OA.csrc_call(self.k_ln, a_buf, h, _dev(V.dup_quads(scale)), self.d_ln).realize()
         ct = OA.gemm_gs(a_buf, self.b_fin, ks=24, ns=6, nrb=self.nrb, nslices=C_ // 96, ngroups=3, piece=_piece(self.nrb), out=self.c_fin).realize()
         import ideogram4_fp_backend as FB
         c = FB.host_read(ct).view(np.float32)[:self.nc].reshape(3, self.nrb, 6, 3, 4, 4, 4).transpose(1, 3, 5, 0, 2, 4, 6).reshape(self.ROWS, 288)
         c = c[self.treal - self.n_img:self.treal]
-        return ((c[:, :IN] + c[:, IN:2 * IN]) / S10 + tw.fin_b).astype(np.float32)
+        return ((c[:, :IN] + c[:, IN:2 * IN]) / S10 + tw.out_b).astype(np.float32)
 
 
 class ModNPU:
@@ -183,8 +183,8 @@ class TembNPU:
             wp = np.zeros((Np, Kp), np.float32); wp[:N, :K] = w; h, l = _hilo(wp)
             return np.ascontiguousarray(V.b_layout_ref(np.concatenate([h, l]).astype(np.float32), 24, 6))
         pad = lambda v, n: np.concatenate([v.astype(np.float32), np.zeros(n - v.shape[0], np.float32)])
-        self.W = [pan(tw.t_in_w), pan(tw.t_out_w), pan(tw.ada_w, n_pad=576), pan(tw.fin_ada_w, k_pad=576)]
-        self.b = [_dev(tw.t_in_b.astype(np.float32)), _dev(tw.t_out_b.astype(np.float32)), _dev(pad(tw.ada_b, 576)), _dev(tw.fin_ada_b.astype(np.float32))]
+        self.W = [pan(tw.t1_w), pan(tw.t2_w), pan(tw.c_w, n_pad=576), pan(tw.om_w, k_pad=576)]
+        self.b = [_dev(tw.t1_b.astype(np.float32)), _dev(tw.t2_b.astype(np.float32)), _dev(pad(tw.c_b, 576)), _dev(tw.om_b.astype(np.float32))]
         self.stage = _dev(np.zeros(max(w.size for w in self.W), np.uint16))
         self.c = _dev(np.zeros(96 * 2 * H2 * 1152, np.float32)); self.c4 = _dev(np.zeros(96 * 2 * H2 * 1152, np.float32))
         self.a1, self.a2, self.a3 = (_dev(np.zeros(2 * sp * C_, np.uint16)) for _ in range(3)); self.afin = _dev(np.zeros(2 * sp * 576, np.uint16))
@@ -202,7 +202,7 @@ class TembNPU:
         """ts: the steps' model times -> a_mod (ModNPU's A: the AdaLN inputs, hi / lo rows, K 576) and self.c4 (the final scales)."""
         import ideogram4_ref as R
         sp = self.sp; E = np.zeros((2 * sp, C_), np.float16)
-        for s_, t in enumerate(ts): h, l = _hilo(R.sinusoidal(1e4 * float(t), C_)); E[s_] = h; E[sp + s_] = l
+        for s_, t in enumerate(ts): h, l = _hilo(R.t_features(float(t))); E[s_] = h; E[sp + s_] = l
         pa = G.pack_a_slices(E, 24); ctypes.memmove(_va(self.a1), pa.ctypes.data, pa.nbytes)
         OA.csrc_call(self.k_silu, self.a2, self._gemm(self.a1, 0, C_, C_, self.c), self.b[0], self.dl).realize()
         OA.csrc_call(self.k_none, self.a3, self._gemm(self.a2, 1, C_, C_, self.c), self.b[1], self.dl).realize()
@@ -218,21 +218,21 @@ class TembNPU:
 def temb_probe():
     import ideogram4_ref as R
     from ideogram4_weights import Ideogram4Weights
-    tw = R.TopWeights(Ideogram4Weights(os.path.expanduser("~/ideogram4/transformer")))
+    tw = R.Model(Ideogram4Weights(os.path.expanduser("~/ideogram4/transformer")))
     ts = np.linspace(0.00055, 0.99945, 12).astype(np.float32)
     t0 = time.perf_counter(); T = TembNPU(tw, 12); t1 = time.perf_counter()
     amod = _dev(np.zeros(2 * 12 * 576, np.uint16))
     for _ in range(2): t2 = time.perf_counter(); T.run(ts, amod); t3 = time.perf_counter()
     A = OA.host_invalidate(amod).numpy().reshape(6, 2, 24, 3, 4, 4).transpose(1, 3, 4, 0, 2, 5).reshape(24, 576).view(np.float16).astype(np.float64)
     got = A[:12, :512] + A[12:, :512]
-    want = np.stack([R.adaln_input(tw, float(t)) for t in ts]).astype(np.float64)
-    t4 = time.perf_counter(); [R.adaln_input(tw, float(t)) for t in ts]; th = time.perf_counter() - t4
+    want = np.stack([tw.cond(float(t)) for t in ts]).astype(np.float64)
+    t4 = time.perf_counter(); [tw.cond(float(t)) for t in ts]; th = time.perf_counter() - t4
     print("packing %.1f s (a process)   chain %.0f ms (an image; host %.0f ms for 12 steps)" % (t1 - t0, (t3 - t2) * 1e3, th * 1e3))
     print("AdaLN inputs: max |d| %.3g (max |want| %.3g), rel %.3g" % (np.abs(got - want).max(), np.abs(want).max(), np.abs(got - want).max() / np.abs(want).max()))
     ws2 = _dev(np.zeros(9216, np.float32)); stv = [_dev(np.array([s_] + [0] * 15, np.int32)) for s_ in range(12)]; worst = 0.0
     for s_ in range(12):
         T.fin(ws2, stv[s_]); g_ = OA.host_invalidate(ws2).numpy()
-        ad = want[s_].astype(np.float32); w_ = V.dup_quads((1.0 + (tw.fin_ada_w @ (ad / (1.0 + np.exp(-ad))) + tw.fin_ada_b)).astype(np.float32))
+        ad = want[s_].astype(np.float32); w_ = V.dup_quads((1.0 + (tw.om_w @ (ad / (1.0 + np.exp(-ad))) + tw.om_b)).astype(np.float32))
         worst = max(worst, float(np.abs(g_ - w_).max() / np.abs(w_).max()))
     print("final scales: max rel |d| %.3g over 12 steps" % worst)
 
@@ -241,10 +241,10 @@ def mod_probe():
     import ideogram4_ref as R, math
     from ideogram4_weights import Ideogram4Weights
     import ideogram4_fp_1024 as F
-    tw = R.TopWeights(Ideogram4Weights(os.path.expanduser("~/ideogram4/transformer")))
+    tw = R.Model(Ideogram4Weights(os.path.expanduser("~/ideogram4/transformer")))
     Ls = [F.Layer(l, "/mnt/ssd/ideogram4/fpcache_cond") for l in (0, 17, 33)]
     ts = np.linspace(0.02, 0.99, 12)
-    adas = [R.adaln_input(tw, float(t)) for t in ts]
+    adas = [tw.cond(float(t)) for t in ts]
     t0 = time.perf_counter(); M = ModNPU(Ls, 12); t1 = time.perf_counter(); M.setup(adas); t2 = time.perf_counter()
     print("init %.2f s (host packing, once)   setup %.0f ms for %d layers (per image)" % (t1 - t0, (t2 - t1) * 1e3, len(Ls)))
     bufs = [_dev(np.zeros(n, np.float32)) for n in (9216, 27648, 9216, 27648)]
@@ -271,13 +271,13 @@ def step_probe():
     import ideogram4_ref as R
     from ideogram4_weights import Ideogram4Weights
     import ideogram4_fp_backend as FB
-    twc = R.TopWeights(Ideogram4Weights(os.path.expanduser("~/ideogram4/transformer"))); twu = R.TopWeights(Ideogram4Weights(os.path.expanduser("~/ideogram4/unconditional_transformer")))
+    twc = R.Model(Ideogram4Weights(os.path.expanduser("~/ideogram4/transformer"))); twu = R.Model(Ideogram4Weights(os.path.expanduser("~/ideogram4/unconditional_transformer")))
     rng = np.random.RandomState(3); n_img, n_text = 4096, 525; ROWS = -(-(n_text + n_img) // 96) * 96
     text = (rng.randn(n_text, C_) * 0.5).astype(np.float32)
     ioc, iou = IOProj(twc, ROWS, n_img, text), IOProj(twu, ROWS, n_img)
     rows = _dev(np.zeros(ROWS * C_, np.float32)); big = _dev(np.zeros(ioc.nrb_in * 12 * C_, np.float32)); ab = _dev(np.zeros(ROWS * C_, np.uint16))
     x = rng.randn(n_img, IN).astype(np.float32); tm = [0.0, 0.1, 0.25, 0.4]; gw = [7.0, 7.0, 3.0]
-    adas = [R.adaln_input(twc, t) for t in tm[:3]]; adau = [R.adaln_input(twu, t) for t in tm[:3]]
+    adas = [twc.cond(t) for t in tm[:3]]; adau = [twu.cond(t) for t in tm[:3]]
     ioc.set_scales(adas); iou.set_scales(adau)
     S = Sampler(x, ioc, iou, gw, tm); xh = x.copy(); noise = [(rng.randn(ROWS, C_) * 3).astype(np.float32) for _ in range(3)]
     for i in range(3):
@@ -287,10 +287,10 @@ def step_probe():
             hr = FB.host_read(rows).view(np.float32).reshape(ROWS, C_) + noise[i]            # "the blocks"
             h = _dev(hr.ravel()); io.final_dev(h, i, ab)
             # the host: the same rows from the host latents
-            tw = io.tw; img = R.embed_image_tokens(tw, xh); hh = np.zeros((ROWS, C_), np.float32)
+            tw = io.tw; img = tw.embed(xh); hh = np.zeros((ROWS, C_), np.float32)
             if io.text is not None: hh[:n_text] = io.text
             hh[io.treal - n_img:io.treal] = img; hh += noise[i]
-            v[nm] = R.final_layer(tw, hh[io.treal - n_img:io.treal], ad).astype(np.float32)
+            v[nm] = tw.out(hh[io.treal - n_img:io.treal], ad).astype(np.float32)
             print("   step %d %s: embedded rows vs host max |d| %.3g" % (i, nm, np.abs(hr - noise[i] - (hh - noise[i])).max()))
         S.step(i); tstep = time.perf_counter() - t0
         xh = (xh + (np.float32(gw[i]) * v["c"] + np.float32(1 - gw[i]) * v["u"]) * np.float32(tm[i + 1] - tm[i])).astype(np.float32)
@@ -306,7 +306,7 @@ def step_probe():
 def probe():
     import ideogram4_ref as R
     from ideogram4_weights import Ideogram4Weights
-    tw = R.TopWeights(Ideogram4Weights(os.path.expanduser("~/ideogram4/transformer")))
+    tw = R.Model(Ideogram4Weights(os.path.expanduser("~/ideogram4/transformer")))
     rng = np.random.RandomState(1); n_img, n_text = 4096, 608; ROWS = -(-(n_text + n_img) // 96) * 96
     text = (rng.randn(n_text, C_) * 0.5).astype(np.float32)
     io = IOProj(tw, ROWS, n_img, text)
@@ -316,7 +316,7 @@ def probe():
     for rep in range(3):
         t0 = time.perf_counter(); io.embed(x, rows, big); te = time.perf_counter() - t0
     got = FB.host_read(rows).view(np.float32).reshape(ROWS, C_)
-    want = R.embed_image_tokens(tw, x)
+    want = tw.embed(x)
     print("embed: %.1f ms   image rows max |d| %.3g (max |want| %.3g), rel %.3g   text rows exact %s   pad rows zero %s" % (te * 1e3,
           np.abs(got[n_text:n_text + n_img] - want).max(), np.abs(want).max(), np.abs(got[n_text:n_text + n_img] - want).max() / np.abs(want).max(),
           np.array_equal(got[:n_text], text), not got[n_text + n_img:].any()))
@@ -325,10 +325,10 @@ def probe():
     hdev = _dev(hid.ravel()); ada = rng.randn(512).astype(np.float32)
     for rep in range(3):
         t0 = time.perf_counter(); v = io.final(hdev, ada, ab); tf = time.perf_counter() - t0
-    vw = R.final_layer(tw, hid[n_text:n_text + n_img], ada).astype(np.float32)
+    vw = tw.out(hid[n_text:n_text + n_img], ada).astype(np.float32)
     d = np.abs(v - vw)
     print("final: %.1f ms   velocity max |d| %.3g (max |want| %.3g), rel %.3g, mean rel %.3g" % (tf * 1e3, d.max(), np.abs(vw).max(), d.max() / np.abs(vw).max(), d.mean() / np.abs(vw).mean()))
-    t0 = time.perf_counter(); R.embed_image_tokens(tw, x); R.final_layer(tw, hid[n_text:n_text + n_img], ada); print("host numpy, both: %.0f ms" % ((time.perf_counter() - t0) * 1e3))
+    t0 = time.perf_counter(); tw.embed(x); tw.out(hid[n_text:n_text + n_img], ada); print("host numpy, both: %.0f ms" % ((time.perf_counter() - t0) * 1e3))
 
 
 if __name__ == "__main__":

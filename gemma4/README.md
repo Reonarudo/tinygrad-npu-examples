@@ -55,12 +55,21 @@ packed cache is 5.0 GB.
 
 ## Download
 
-Download a Q8_0 GGUF of `gemma-4-E2B-it` (the file `gemma-4-E2B-it-Q8_0.gguf`, 5.0 GB) from Hugging Face. The scripts look for it
-at `/mnt/ssd/models/gemma-4/gemma-4-E2B-it-Q8_0.gguf`; set `GEMMA_GGUF` (or `--gguf`) to your path.
+`download.sh` fetches the model's Q8_0 GGUF and its MTP draft head's GGUF from Hugging Face
+([`ggml-org/gemma-4-E2B-it-GGUF`](https://huggingface.co/ggml-org/gemma-4-E2B-it-GGUF): `gemma-4-E2B-it-Q8_0.gguf`, 5.0 GB, and
+`mtp-gemma-4-E2B-it-Q8_0.gguf`, 0.1 GB; E4B from [`ggml-org/gemma-4-E4B-it-GGUF`](https://huggingface.co/ggml-org/gemma-4-E4B-it-GGUF):
+8.0 GB and 0.1 GB; Apache-2.0) into `$GEMMA_DIR` (default `/mnt/ssd/models/gemma-4`, where the scripts look), and checks each
+file it downloads against the sha256 the repository lists. It resumes a partial download and skips a complete file:
 
-For speculative decoding you also need a GGUF of the model's MTP draft head (GGUF architecture `gemma4-assistant`, ~0.1 GB),
-saved **beside the model's GGUF** as `mtp-<the model's file name>` (e.g. `mtp-gemma-4-E2B-it-Q8_0.gguf`); `--mtp` gives another
-path. Without it the generator decodes plainly.
+```sh
+cd gemma4
+bash download.sh              # E2B (about 5.1 GB); `e4b` or `both` for E4B
+bash download.sh --dry-run    # the files, their sizes and what is already present
+```
+
+Elsewhere than the default folder, set `GEMMA_GGUF` (or `--gguf`) to the model's file. The draft head (GGUF architecture
+`gemma4-assistant`) is used for speculative decoding when it is **beside the model's GGUF** as `mtp-<the model's file name>`, as
+the script saves it; `--mtp` gives another path. Without it the generator decodes plainly.
 
 ## Pack
 
@@ -69,10 +78,9 @@ path). It takes ~15 s on the board and writes 2.43 GB. `gemma4_mtp.py` packs the
 (83 MB, a few seconds):
 
 ```sh
-cd gemma4
-export GEMMA_GGUF=/path/to/gemma-4-E2B-it-Q8_0.gguf GEMMA_NPU=/mnt/ssd/gemma4-e2b-npu
-python3 gemma4_pack.py --gguf $GEMMA_GGUF --out $GEMMA_NPU
-python3 gemma4_mtp.py --mtp /path/to/mtp-gemma-4-E2B-it-Q8_0.gguf --out $GEMMA_NPU/mtp
+export GEMMA_DIR=/mnt/ssd/models/gemma-4 GEMMA_NPU=/mnt/ssd/gemma4-e2b-npu    # download.sh's folder; the cache
+python3 gemma4_pack.py --gguf $GEMMA_DIR/gemma-4-E2B-it-Q8_0.gguf --out $GEMMA_NPU
+python3 gemma4_mtp.py --mtp $GEMMA_DIR/mtp-gemma-4-E2B-it-Q8_0.gguf --out $GEMMA_NPU/mtp
 ```
 
 Per layer the packer writes the Q8_0 GEMM streams (the layer's own q | k | v as one stream, o, gate | up, down, and the two
@@ -83,8 +91,8 @@ cache), and the generator reads the embedding rows from that GGUF, so keep the G
 E4B is packed the same way into its own folder (4.96 GB in ~2 min):
 
 ```sh
-python3 gemma4_pack.py --gguf /path/to/gemma-4-E4B-it-Q8_0.gguf --out /mnt/ssd/gemma4-e4b-npu
-python3 gemma4_mtp.py --mtp /path/to/mtp-gemma-4-E4B-it-Q8_0.gguf --out /mnt/ssd/gemma4-e4b-npu/mtp
+python3 gemma4_pack.py --gguf $GEMMA_DIR/gemma-4-E4B-it-Q8_0.gguf --out /mnt/ssd/gemma4-e4b-npu
+python3 gemma4_mtp.py --mtp $GEMMA_DIR/mtp-gemma-4-E4B-it-Q8_0.gguf --out /mnt/ssd/gemma4-e4b-npu/mtp
 ```
 
 ## Run
@@ -252,6 +260,7 @@ residual adds) ~8 ms; the launches inside the jobs ~4 ms; the host and the 9 job
 
 | file | what |
 | --- | --- |
+| `download.sh` | fetches the model's and its draft head's GGUFs (E2B, E4B) from Hugging Face, checked by sha256 |
 | `gemma4_pack.py` | the GGUF -> the per-layer NPU cache (Q8_0 GEMM streams, the head, the per-layer-input projection) |
 | `gemma4_mtp.py` | the MTP draft head: its packer (`<cache>/mtp/`) and its one-graph draft step on the NPU |
 | `gemma4_generate.py` | generation on the NPU: zero-copy weights, the kernel graphs and row geometries, the batched prefill, speculative decoding |

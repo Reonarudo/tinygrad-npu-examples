@@ -6,7 +6,7 @@ block's other math -- RMSNorm + AdaLN scale, q/k norm + MRoPE, softmax, SwiGLU, 
 adds -- as DMA-staged vector-fp32 C kernels (`ideogram4_vec.py`) that read the GEMM's fp32 tiles and write
 its fp16 operands. Nothing is quantized: the activations entering a GEMM are fp16 (RNE), the residual
 stream is fp32. The per-step scalars (the t-embedding, the AdaLN vectors, the input projection, the
-final layer, the Euler update) run in numpy on the host, as in `ideogram4_uncond_backend.py`.
+final layer, the Euler update) run in numpy on the host (`ideogram4_ref.py`).
 
 Needs the packed cache (`ideogram4_fp_pack.py`) and the checkpoint folder for the top-level tensors.
 
@@ -39,7 +39,7 @@ GATE = bool(int(os.environ.get("GATE", "0")))
 PROF = bool(int(os.environ.get("PROF", "0")))
 NT = 12
 T = 256; NRB = 24; ROWS = 12 * NRB; KS, NS = 24, 6
-C_, NH, DH, DHP, M_ = R.HID, R.NH, R.HEAD_DIM, 288, R.MLP
+C_, NH, DH, DHP, M_ = R.D, R.NH, R.HD, 288, R.FF
 TP = 288
 QA, KB, VB, QKV_TOTAL = V.qkv_a16_sizes(NH, DH, DHP, NRB, KS, NS, TP)
 HC = 3 * NRB * 1152                                       # floats per head of the attention C tiles (288 x 288)
@@ -125,8 +125,8 @@ class Kernels:
     """The six vector kernels (registered once) and their descriptor tensors."""
     def __init__(self):
         reg = lambda name, src: OA.register_csrc(name, src, ntasks=NT)
-        self.rms = reg("rms_scale_dma", V.rms_scale_dma_src(T, C_, R.NORM_EPS, KS, NRB, nt=NT)); self.d_rms = dev(V.rms_scale_dma_descs(C_, NRB))
-        self.resid = reg("resid_dma", V.resid_dma_src(T, C_, NS, NRB, R.NORM_EPS, nt=NT)); self.d_resid = dev(V.resid_dma_descs(C_, NRB))
+        self.rms = reg("rms_scale_dma", V.rms_scale_dma_src(T, C_, R.EPS, KS, NRB, nt=NT)); self.d_rms = dev(V.rms_scale_dma_descs(C_, NRB))
+        self.resid = reg("resid_dma", V.resid_dma_src(T, C_, NS, NRB, R.EPS, nt=NT)); self.d_resid = dev(V.resid_dma_descs(C_, NRB))
         self.swiglu = reg("swiglu_dma", V.swiglu_dma_src(T, M_, NRB, KS, nt=NT)); self.d_swiglu = dev(V.swiglu_dma_descs(M_, NRB, KS))
         self.qkv = reg("qkv_dma", V.qkv_dma_src(T, NH, DH, DHP, NRB, KS, NS, TP, 1e-5, nt=NT)); self.d_qkv = dev(V.qkv_dma_descs(NRB, KS, NS))
         self.softmax = reg("softmax_dma", V.softmax_dma_src(T, NH, TP, NS, NRB, KS, 1.0 / np.sqrt(DH), nt=NT)); self.d_softmax = dev(V.softmax_dma_descs(NRB, KS))
@@ -189,7 +189,7 @@ def block_fp(K: Kernels, t: dict, x, ws1, k1, ws2, k2, codes: dict, bufs: dict, 
     # the weights: E4M3 codes -> fp16 panels
     pn = {k: g_("panels_" + k, OA.e4m3_stream(codes[k], out=panels[k]), lambda k=k: G.e4m3_table()[codes[k].numpy()].astype(np.float16).view(np.uint16)) for k in W_ORDER}
     # attention
-    Ah = g_("Ah", cs(K.rms, bufs["Ah"], x, ws1, K.d_rms), lambda: V.rms_scale_a16_ref(x.numpy().reshape(ROWS, C_)[:T], np.ones(C_, np.float32), ws1.numpy().reshape(-1, 8)[:, :4].ravel(), R.NORM_EPS, KS, NRB))
+    Ah = g_("Ah", cs(K.rms, bufs["Ah"], x, ws1, K.d_rms), lambda: V.rms_scale_a16_ref(x.numpy().reshape(ROWS, C_)[:T], np.ones(C_, np.float32), ws1.numpy().reshape(-1, 8)[:, :4].ravel(), R.EPS, KS, NRB))
     Cqkv = g_("Cqkv", gm(Ah, pn["qkv"], nslices=C_ // 96, ngroups=N_QKV // 96, out=bufs["Cqkv"]), lambda: _ref_gemm(Ah, pn["qkv"], C_, N_QKV))
     QKV = g_("QKV", cs(K.qkv, bufs["QKV"], Cqkv, t["nq2"], t["nk2"], t["cs"], t["sn"], t["sc_qkv"], K.d_qkv), lambda: _ref_qkv(Cqkv, t))
     S = g_("S", gm(QKV, QKV, nslices=3, ngroups=3, heads=NH, a_stride=QA, b_stride=KB, c_stride=HC, b_off=NH * QA, out=bufs["S"]), lambda: _ref_attn_gemm(QKV, 0, NH * QA))
@@ -199,7 +199,7 @@ def block_fp(K: Kernels, t: dict, x, ws1, k1, ws2, k2, codes: dict, bufs: dict, 
     Co = g_("Co", gm(Ao, pn["o"], nslices=C_ // 96, ngroups=C_ // 96, out=bufs["Co"]), lambda: _ref_gemm(Ao, pn["o"], C_, C_))
     x1 = g_("x1", cs(K.resid, bufs["x1"], x, k1, Co, t["sc_o"], K.d_resid), lambda: _ref_resid(x, k1, Co))
     # the MLP
-    Ah2 = g_("Ah2", cs(K.rms, bufs["Ah2"], x1, ws2, K.d_rms), lambda: V.rms_scale_a16_ref(x1.numpy().reshape(ROWS, C_)[:T], np.ones(C_, np.float32), ws2.numpy().reshape(-1, 8)[:, :4].ravel(), R.NORM_EPS, KS, NRB))
+    Ah2 = g_("Ah2", cs(K.rms, bufs["Ah2"], x1, ws2, K.d_rms), lambda: V.rms_scale_a16_ref(x1.numpy().reshape(ROWS, C_)[:T], np.ones(C_, np.float32), ws2.numpy().reshape(-1, 8)[:, :4].ravel(), R.EPS, KS, NRB))
     C13 = g_("C13", gm(Ah2, pn["w13"], nslices=C_ // 96, ngroups=N_W13 // 96, out=bufs["C13"]), lambda: _ref_gemm(Ah2, pn["w13"], C_, N_W13))
     Am = g_("Am", cs(K.swiglu, bufs["Am"], C13, t["sc_w13"], K.d_swiglu), lambda: _ref_swiglu(C13, t["sc_w13"]))
     Cm = g_("Cm", gm(Am, pn["w2"], nslices=M_ // 96, ngroups=C_ // 96, out=bufs["Cm"]), lambda: _ref_gemm(Am, pn["w2"], M_, C_))
@@ -246,7 +246,7 @@ def _ref_attn_gemm(QKV, a_off, b_off, a_buf=None):
 def _ref_resid(x, k3, Ct):
     k = k3.numpy().reshape(-1, 3, 8)[:, :, :4]; w, g, sc = k[:, 0].ravel(), k[:, 1].ravel(), k[:, 2].ravel()
     c = V.c_from_tiles(Ct.numpy(), NS, NRB, C_) * sc
-    r = V.resid_ct_ref(x.numpy().reshape(ROWS, C_), w, g, c, R.NORM_EPS); r[T:] = 0
+    r = V.resid_ct_ref(x.numpy().reshape(ROWS, C_), w, g, c, R.EPS); r[T:] = 0
     return r.ravel()
 
 
@@ -336,21 +336,21 @@ def main():
     a = ap.parse_args()
     gh, gw = (int(v) for v in a.grid.split("x")); assert gh * gw == T, "this harness is built for 256 tokens"
     lo, hi = (int(v) for v in a.layers.split("-"))
-    W = Ideogram4Weights(a.weights); tw = R.TopWeights(W)
-    cos, sin = R.mrope(R.image_position_ids(gh, gw))
+    M = R.Model(Ideogram4Weights(a.weights))
+    cos, sin = R.rope_tables(R.image_positions(gh, gw))
     t0 = time.perf_counter()
     K = Kernels(); bufs = make_bufs(); pool = make_pool(); run = Runner(K, bufs, pool)
     layers = [LayerFP(l, os.path.expanduser(a.cache), cos, sin) for l in range(lo, hi + 1)]
     print("== Ideogram 4 at FULL PRECISION on the NPU: %d layers, %d steps, %dx%d tokens; set up in %.0f s ==" % (len(layers), a.steps, gh, gw, time.perf_counter() - t0), flush=True)
-    sig = R.sigmas(a.steps, R.resolution_mu(gh * 16, gw * 16, a.mu), a.std)
+    sig = R.sigmas(a.steps, R.shifted_mu(gh * 16, gw * 16, a.mu), a.std)
     rng = np.random.RandomState(a.seed)
-    x = rng.randn(T, R.IN_CH).astype(np.float32)
+    x = rng.randn(T, R.C_IN).astype(np.float32)
     ref = np.load(os.path.expanduser(a.ref), allow_pickle=True) if a.ref else None
     from zy import timing as _TMG
     for i in range(a.steps):
         t_model = 1.0 - sig[i]
-        ada = R.adaln_input(tw, t_model)
-        hp = np.zeros((ROWS, C_), np.float32); hp[:T] = R.embed_image_tokens(tw, x)
+        ada = M.cond(t_model)
+        hp = np.zeros((ROWS, C_), np.float32); hp[:T] = M.embed(x)
         h = dev(hp.ravel())
         _TMG.DEFAULT.reset(); t1 = time.perf_counter()
         dump = []
@@ -359,10 +359,9 @@ def main():
                 gate = Gate(); h = run.run(L, h, ada, gate=gate)
                 print("   layer %d: %d ops gated, bad: %s" % (L.l, gate.n, gate.bad or "none"), flush=True)
                 if os.environ.get("GATE_REF", "1") == "1":
-                    bw = R.BlockWeights(W, L.l)
                     hn = h.numpy().reshape(ROWS, C_)[:T]; xin = hp[:T] if L.l == lo else None
                     if xin is not None:
-                        want = R.block(bw, xin, cos, sin, ada)
+                        want = M.block(L.l)(xin, (cos, sin), ada)
                         cosv = float((hn * want).sum() / np.sqrt((hn * hn).sum() * (want * want).sum()))
                         print("   layer %d output vs the fp32 reference block: cosine %.6f, max |d| %.3g (max |ref| %.3g)" % (L.l, cosv, np.abs(hn - want).max(), np.abs(want).max()), flush=True)
             else: h = run.run(L, h, ada)
@@ -371,7 +370,7 @@ def main():
         hn = read_stable(h).reshape(ROWS, C_)[:T]; wall = time.perf_counter() - t1
         rep = _TMG.DEFAULT.report()["categories"]; dev_ms = sum(v["seconds"] for c, v in rep.items() if c in ("T_submit", "T_AIFF_exec")) * 1e3
         nsub = rep.get("T_submit", {}).get("count", 0)
-        v = R.final_layer(tw, hn, ada)
+        v = M.out(hn, ada)
         x = x + np.float32(sig[i + 1] - sig[i]) * (-v)
         line = "   step %2d/%d sigma %.4f -> %.4f  blocks %.2f s (device %.0f ms in %d submits)  |x| %.3f |v| %.3f" % (i + 1, a.steps, sig[i], sig[i + 1], wall, dev_ms, nsub, np.abs(x).mean(), np.abs(v).mean())
         if ref is not None and i < len(ref):

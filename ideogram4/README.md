@@ -55,7 +55,7 @@ A run cut short can continue: `ideogram4_fp_1024.py ... --resume` (same prompt, 
 | `ideogram4_text.py` | prompt conditioning: tokenizer + Qwen3-VL-8B text encoder in numpy, then the conditional transformer's text projection |
 | `ideogram4_fp_1024.py` | the sampler: both transformers on the NPU, guidance and the Euler update as device kernels |
 | `ideogram4_fp_backend.py` | the transformer blocks on the NPU (E4M3 unpack, fp16 GEMMs, attention, the vector kernels) |
-| `ideogram4_ref.py` | the numpy fp32 reference of a block (used by the `GATE=1` checks) |
+| `ideogram4_ref.py` | the numpy fp32 reference: the transformer, its blocks (used by the `GATE=1` checks) and the sampling schedule |
 | `ideogram4_weights.py` | reads the fp8 safetensors with numpy alone |
 | `ideogram4_fp_pack.py` | builds the packed weight cache a transformer needs |
 | `vae_npu.py`, `ideogram4_vae.py` | the VAE decoder on the NPU and its weights |

@@ -2,9 +2,10 @@
 """Qwen3.8-27B (Qwen3.5 architecture) language-model layers in numpy fp32: the reference every device layer is checked against.
 
 Reads the FP8 checkpoint's per-layer shards (`layers-N.safetensors`: bf16 small tensors, E4M3 linears with `weight_scale_inv`
-per 128 x 128 block) and `outside.safetensors` (embeddings, final norm, lm_head) with numpy alone. The math transcribes
-transformers' modeling_qwen3_5.py: Gated DeltaNet in its recurrent form (token by token, the exact semantics of the
-chunked kernel), full attention with the q/k norms, RoPE and the sigmoid output gate, SwiGLU MLP.
+per 128 x 128 block) and `outside.safetensors` (embeddings, final norm, lm_head) with numpy alone. Written from the model's
+published architecture (Qwen3.5: Gated DeltaNet in its recurrent form -- token by token, the exact semantics of the chunked
+form -- and every fourth layer full attention with the q/k norms, partial RoPE and the sigmoid output gate; SwiGLU MLPs); its
+numerical reference is transformers' implementation of the model, which check/truth_transformers.py runs on the same layers.
 
     W = Weights("/mnt/ssd/qwen3.8-27b-fp8")
     x = W.embed(ids)                       # [n, 5120] float32
@@ -91,7 +92,7 @@ def mm(W, sf, x, name):
 def rms(x, w, eps=EPS): return x * (1.0 / np.sqrt((x * x).mean(-1, keepdims=True) + eps)) * (1.0 + w)   # Qwen3_5RMSNorm: (1 + weight)
 def silu(x): return x / (1.0 + np.exp(-x))
 def softplus(x): return np.logaddexp(0.0, x)
-def l2norm(x, eps=1e-6): return x / np.sqrt((x * x).sum(-1, keepdims=True) + eps)   # transformers' l2norm (checked below)
+def l2norm(x, eps=1e-6): return x / np.sqrt((x * x).sum(-1, keepdims=True) + eps)   # eps inside the root, as the model's reference implementation
 
 ROT = int(HD * 0.25)   # partial_rotary_factor 0.25: the first 64 of the 256 head dims rotate, 32 frequencies over dim 64
 

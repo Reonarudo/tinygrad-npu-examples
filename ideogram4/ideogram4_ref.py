@@ -1,311 +1,230 @@
 #!/usr/bin/env python3
-"""Ideogram 4's flow-matching transformer in float32 numpy -- the REFERENCE the backend path is
-gated against, ported line for line from diffusers' `transformer_ideogram4.py` and
-`pipeline_ideogram4.py` at commit 04b197ee. No torch.
+"""Ideogram 4's diffusion transformer and its sampling schedule in float32 numpy: the reference every device block is checked
+against. No torch.
 
-  * `MRoPE(position_ids)` -> (cos, sin) `[L, 256]`; interleaved (t, h, w) sections (24, 20, 20).
-  * `block(W, l, x, cos, sin, adaln)`: RMSNorm -> * (1 + scale) -> qkv -> q/k RMSNorm -> RoPE ->
-    causal-free full attention -> o -> RMSNorm -> * tanh(gate) residual; then the SwiGLU MLP the
-    same way. A block's cost at T tokens is 2 * 255M * T FLOP: 0.13 TFLOP at T=256 (a workstation's
-    numpy: ~0.4 s; the board's, no BLAS: ~40 s -- the block gate runs there ONCE per block).
-  * `forward(W, latents, t, ...)`: the whole transformer for one branch (`unconditional=True`:
-    image tokens only, zero text features, the pipeline's `neg_v`).
-  * `sigmas(steps, mu, std)`, `euler_step`: the pipeline's logit-normal schedule and the
-    FlowMatchEuler update `x <- x + (sigma_next - sigma) * (-v)`.
-  * `generate_uncond(W, grid, steps, seed)`: the UNCONDITIONAL image's latents (the pipeline with
-    guidance from the negative branch alone is not what CFG does; this is the plain unconditional
-    sample: v = neg_v) -- the first milestone, which needs no text encoder.
+Written from the checkpoint -- its config.json and its tensors' names and shapes -- and the model's published architecture, with
+the conventions its reference implementation in diffusers (`Ideogram4Transformer2DModel` / `Ideogram4Pipeline`) fixes: the
+rotary layout, the norms' epsilons, the time embedding, the schedule. That implementation is the numerical reference.
 
-Positions: image tokens at (0, h, w) + 65536; the unconditional branch's sequence is the image
-grid alone (`neg_position_ids = position_ids[:, max_text_tokens:]`).
+The model. A sequence of tokens of width D = 4608 -- the text rows (ideogram4_text.py) then the image tokens, a 2 x 2 latent patch
+(128 channels) each; the unconditional transformer sees the image tokens alone -- goes through 34 blocks, each modulated by the
+time t (AdaLN):
+    c = silu(W_ada (W_t2 silu(W_t1 sinus(1e4 t) + b) + b) + b)                    the time's conditioning, [512]
+    (sa, ga, sf, gf) = W_mod,l c + b                                                block l's four modulation vectors, [D] each
+    x += tanh(ga) rms(W_o attn(rope(rms_head(q)), rope(rms_head(k)), v), w_a2)     (q | k | v) = W_qkv (rms(x, w_a1) (1 + sa))
+    x += tanh(gf) rms(W_2 (silu(W_1 h) * W_3 h), w_f2)                               h = rms(x, w_f1) (1 + sf)
+18 heads of 256, full (non-causal) attention over the whole sequence; then the output layer
+    v = W_out (layernorm(x) (1 + W_om silu(c) + b)) + b                             the velocity of the image tokens, [128]
+Positions are (t, h, w) triples: image token (i, j) of the grid at (0, i, j) + 65536 on every axis, text token n at (n, n, n). The
+rotary embedding turns each head's dim f with dim f + 128 by an angle that grows with one of the three coordinates (rope_tables).
+
+Sampling is flow matching: the latents start as Gaussian noise at noise level sigma = 1 (model time t = 1 - sigma = 0) and an Euler
+step moves them by (sigma_next - sigma) x (-v) -- the noise levels from a logit-normal schedule (sigmas).
+
+    W = Ideogram4Weights("~/ideogram4/unconditional_transformer"); M = Model(W)
+    v = M.velocity(latents, t, image_positions(16, 16))                 # one branch's velocity at model time t
+    python3 ideogram4_ref.py --grid 16x16 --steps 12 --seed 0 --out ~/ideogram4/ref_latents_256.npy   # an unconditional sample's
+                                                                        # per-step velocities (ideogram4_fp_backend.py --ref)
+A block's cost at T tokens is 2 x 255M x T FLOP: 0.13 TFLOP at T = 256 (a workstation's numpy: ~0.4 s; the board's, without an
+optimised BLAS: ~40 s).
 """
-import math
+import argparse, math, os, sys
 import numpy as np
 
-HEAD_DIM, NH, HID, MLP, ADALN, IN_CH = 256, 18, 4608, 12288, 512, 128
-IMAGE_POSITION_OFFSET = 65536
-MROPE = (24, 20, 20)
-ROPE_THETA = 5_000_000
-NORM_EPS = 1e-5
-
-
-# ------------------------------------------------------------------ pieces ----
-def rmsnorm(x, w, eps):
-    x = x.astype(np.float32)
-    v = (x * x).mean(-1, keepdims=True, dtype=np.float32)
-    return x * (1.0 / np.sqrt(v + np.float32(eps))) * w.astype(np.float32)
+# the shape (config.json; Model checks a checkpoint's against it)
+D, NH, HD, FF, C_IN, NL, D_C = 4608, 18, 256, 12288, 128, 34, 512      # width, heads x head dim, MLP, latent channels, blocks, AdaLN
+SECTIONS = (24, 20, 20)            # the rotary frequencies of the t, h and w axes (mrope_section)
+THETA = 5_000_000                  # rope_theta
+EPS = 1e-5                         # every RMSNorm of the blocks (norm_eps)
+IMG_POS0 = 65536                   # added to every coordinate of an image token's position
+T_MIN, T_MAX = 1.0 / (1.0 + math.exp(9.0)), 1.0 / (1.0 + math.exp(-7.5))   # the schedule's model times: log-SNR within [-15, 18]
 
 
 def silu(x): return x / (1.0 + np.exp(-x))
 
-
-def mrope(position_ids: np.ndarray):
-    """position_ids `[L, 3]` (t, h, w) int -> cos, sin `[L, 256]` (float32)."""
-    inv = (1.0 / (ROPE_THETA ** (np.arange(0, HEAD_DIM, 2, dtype=np.float32) / HEAD_DIM))).astype(np.float32)   # [128]
-    pos = position_ids.astype(np.float32)                                            # [L, 3]
-    freqs = pos.T[:, :, None] * inv[None, None, :]                                    # [3, L, 128]
-    ft = freqs[0].copy()
-    for axis, off in ((1, 1), (2, 2)):
-        idx = np.arange(off, MROPE[axis] * 3, 3)
-        ft[:, idx] = freqs[axis][:, idx]
-    emb = np.concatenate([ft, ft], -1)
-    return np.cos(emb).astype(np.float32), np.sin(emb).astype(np.float32)
+def rms(x, w, eps=EPS):
+  """RMSNorm over the last axis, in fp32: x / sqrt(mean(x^2) + eps) * w."""
+  x = x.astype(np.float32)
+  return x * (1.0 / np.sqrt((x * x).mean(-1, keepdims=True, dtype=np.float32) + np.float32(eps))) * w.astype(np.float32)
 
 
-def rotate_half(x):
-    h = x.shape[-1] // 2
-    return np.concatenate([-x[..., h:], x[..., :h]], -1)
+# ---- positions and the rotary embedding
+def image_positions(gh, gw):
+  """[gh gw, 3] int: the (t, h, w) positions of a gh x gw grid's tokens in row-major order, (0, i, j) + IMG_POS0."""
+  i, j = np.divmod(np.arange(gh * gw), gw)
+  return np.stack([np.zeros_like(i), i, j], 1) + IMG_POS0
+
+def text_positions(n): return np.repeat(np.arange(n)[:, None], 3, 1)
+
+def rope_tables(pos):
+  """(cos, sin) [L, HD] float32 for positions [L, 3]. Frequency f of the HD / 2 (theta^(-2f / HD)) belongs to one axis: the h axis
+  when f % 3 == 1 and f < 3 x SECTIONS[1], the w axis when f % 3 == 2 and f < 3 x SECTIONS[2], the t axis otherwise; its angle is
+  that coordinate times the frequency. Each table holds the HD / 2 angles' values twice (dims f and f + HD / 2 turn together)."""
+  f = np.arange(HD // 2)
+  axis = np.where((f % 3 == 1) & (f < 3 * SECTIONS[1]), 1, np.where((f % 3 == 2) & (f < 3 * SECTIONS[2]), 2, 0))
+  freq = (1.0 / (THETA ** (np.arange(0, HD, 2, dtype=np.float32) / HD))).astype(np.float32)
+  ang = pos.astype(np.float32)[:, axis] * freq
+  ang = np.concatenate([ang, ang], 1)
+  return np.cos(ang).astype(np.float32), np.sin(ang).astype(np.float32)
+
+def rotate(x, cos, sin):
+  """x [L, heads, HD] turned by the tables: dims (a, b) = (f, f + HD / 2) -> (a cos - b sin, b cos + a sin)."""
+  h = HD // 2; a, b = x[..., :h], x[..., h:]; c, s = cos[:, None, :h], sin[:, None, :h]
+  return np.concatenate([a * c - b * s, b * c + a * s], -1)
 
 
-def image_position_ids(grid_h, grid_w):
-    h = np.repeat(np.arange(grid_h), grid_w); w = np.tile(np.arange(grid_w), grid_h)
-    return np.stack([np.zeros_like(h), h, w], 1) + IMAGE_POSITION_OFFSET
+# ---- the time
+def t_features(t, dim=D):
+  """The sinusoidal features [dim] of model time t in [0, 1]: sin then cos of 1e4 t x 1e4^(-i / (dim / 2 - 1)), i < dim / 2."""
+  n = dim // 2
+  freq = np.exp(np.arange(n, dtype=np.float32) * -(math.log(1e4) / (n - 1)))
+  a = np.float32(1e4 * t) * freq
+  return np.concatenate([np.sin(a), np.cos(a)]).astype(np.float32)
 
 
-def sinusoidal(t, dim, scale=1e4):
-    half = dim // 2
-    f = np.exp(np.arange(half, dtype=np.float32) * -(math.log(scale) / (half - 1)))
-    e = np.float32(t) * f
-    return np.concatenate([np.sin(e), np.cos(e)]).astype(np.float32)
+# ---- a block
+class Block:
+  """Block l's tensors, the linears dequantised to float32 (~1 GB)."""
+  def __init__(self, W, l):
+    p = f"layers.{l}."; g = lambda n: W.get(p + n)
+    self.l = l
+    self.w_qkv, self.w_o = W.linear(p + "attention.qkv"), W.linear(p + "attention.o")          # [3 D, D], [D, D]
+    self.w_1, self.w_3, self.w_2 = (W.linear(p + "feed_forward." + n) for n in ("w1", "w3", "w2"))   # [FF, D] x 2, [D, FF]
+    self.n_q, self.n_k = g("attention.norm_q.weight"), g("attention.norm_k.weight")            # [HD]
+    self.n_a1, self.n_a2 = g("attention_norm1.weight"), g("attention_norm2.weight")            # around the attention
+    self.n_f1, self.n_f2 = g("ffn_norm1.weight"), g("ffn_norm2.weight")                        # around the MLP
+    self.w_mod, self.b_mod = W.linear(p + "adaln_modulation"), g("adaln_modulation.bias")      # [4 D, D_C], [4 D]
+
+  def modulation(self, c):
+    """(1 + sa, tanh ga, 1 + sf, tanh gf) [D] each from the time's conditioning c [D_C]."""
+    sa, ga, sf, gf = np.split(self.w_mod @ c + self.b_mod, 4)
+    return 1.0 + sa, np.tanh(ga), 1.0 + sf, np.tanh(gf)
+
+  def __call__(self, x, rope, c, hid=None):
+    """x [L, D] float32 -> the block's output. `rope` = rope_tables(positions); `hid`, a dict, collects the intermediates the
+    device's ops are checked against: h, q, k, v (after the norms and the rotation), att, ao, x1 (after the attention), h2, m."""
+    ma, ga, mf, gf = self.modulation(c)
+    L = x.shape[0]; cos, sin = rope
+    h = rms(x, self.n_a1) * ma
+    q, k, v = np.moveaxis((h @ self.w_qkv.T).reshape(L, 3, NH, HD), 1, 0)
+    q, k = rotate(rms(q, self.n_q), cos, sin), rotate(rms(k, self.n_k), cos, sin)
+    att = np.empty((L, NH, HD), np.float32); scale = np.float32(1.0 / math.sqrt(HD))
+    for j in range(NH):
+      s = (q[:, j] @ k[:, j].T) * scale
+      e = np.exp(s - s.max(-1, keepdims=True))
+      att[:, j] = (e / e.sum(-1, keepdims=True)) @ v[:, j]
+    att = att.reshape(L, D); ao = att @ self.w_o.T
+    x1 = x + ga * rms(ao, self.n_a2)
+    h2 = rms(x1, self.n_f1) * mf
+    m = (silu(h2 @ self.w_1.T) * (h2 @ self.w_3.T)) @ self.w_2.T
+    if hid is not None: hid.update(h=h, q=q, k=k, v=v, att=att, ao=ao, x1=x1, h2=h2, m=m)
+    return (x1 + gf * rms(m, self.n_f2)).astype(np.float32)
 
 
-def attention(q, k, v):
-    """q, k, v `[L, NH, D]` -> `[L, NH*D]`; full (segment = one sample) softmax attention."""
-    L = q.shape[0]
-    out = np.empty((L, NH, HEAD_DIM), np.float32)
-    s = np.float32(1.0 / math.sqrt(HEAD_DIM))
-    for h in range(NH):
-        a = (q[:, h] @ k[:, h].T) * s
-        a = a - a.max(-1, keepdims=True); e = np.exp(a); p = e / e.sum(-1, keepdims=True)
-        out[:, h] = p @ v[:, h]
-    return out.reshape(L, NH * HEAD_DIM)
+# ---- one transformer
+class Model:
+  """One of the two transformers (the checkpoint's `transformer`, conditional, or `unconditional_transformer`) on an
+  Ideogram4Weights: the tensors outside the blocks loaded here, a block's when `block(l)` is called."""
+  def __init__(self, W):
+    cfg = W.config
+    got = (cfg["num_layers"], cfg["num_attention_heads"], cfg["attention_head_dim"], cfg["intermediate_size"], cfg["in_channels"],
+           cfg["adaln_dim"], tuple(cfg["mrope_section"]), cfg["rope_theta"], cfg["norm_eps"])
+    assert got == (NL, NH, HD, FF, C_IN, D_C, SECTIONS, THETA, EPS), f"not the shape this module is written for: {got}"
+    self.W = W; lin = lambda n: (W.linear(n), W.get(n + ".bias"))
+    self.in_w, self.in_b = lin("input_proj")                                  # latents -> width: [D, C_IN]
+    self.t1_w, self.t1_b = lin("t_embedding.mlp_in")                          # the time MLP: [D, D] x 2
+    self.t2_w, self.t2_b = lin("t_embedding.mlp_out")
+    self.c_w, self.c_b = lin("adaln_proj")                                    # -> the conditioning: [D_C, D]
+    self.tag = W.get("embed_image_indicator.weight")                          # [2, D]: row 1 added to image tokens, row 0 to text
+    self.om_w, self.om_b = lin("final_layer.adaln_modulation")                # the output norm's scale: [D, D_C]
+    self.out_w, self.out_b = lin("final_layer.linear")                        # -> the velocity: [C_IN, D]
+
+  def block(self, l): return Block(self.W, l)
+
+  def cond(self, t):
+    """The time's conditioning c [D_C] at model time t (0 = noise, 1 = data)."""
+    e = silu(self.t1_w @ t_features(t) + self.t1_b)
+    return silu(self.c_w @ (self.t2_w @ e + self.t2_b) + self.c_b)
+
+  def embed(self, latents):
+    """Image tokens [L, C_IN] -> rows [L, D]: the input projection plus the image tag."""
+    return (latents.astype(np.float32) @ self.in_w.T + self.in_b + self.tag[1]).astype(np.float32)
+
+  def out(self, x, c):
+    """The image tokens' final rows [L, D] -> their velocity [L, C_IN]: LayerNorm (no affine, eps 1e-6) scaled by 1 + the
+    conditioning's modulation, then the output projection."""
+    mu = x.mean(-1, keepdims=True); var = ((x - mu) ** 2).mean(-1, keepdims=True)
+    return ((x - mu) / np.sqrt(var + 1e-6) * (1.0 + (self.om_w @ silu(c) + self.om_b))) @ self.out_w.T + self.out_b
+
+  def velocity(self, latents, t, pos, text_rows=None, blocks=None, hid=None):
+    """The velocity [L, C_IN] of the image tokens `latents` [L, C_IN] at model time t. `pos`: the sequence's positions (the text
+    tokens' first when `text_rows` [n, D] lead it). `blocks`: Block objects held by the caller, else each loaded in turn (the
+    resident set stays ~1 GB). `hid`: {l: block l's output}."""
+    c = self.cond(t); rope = rope_tables(pos)
+    x = self.embed(latents)
+    if text_rows is not None: x = np.concatenate([text_rows.astype(np.float32), x])
+    for l in range(NL):
+      x = (blocks[l] if blocks is not None else self.block(l))(x, rope, c)
+      if hid is not None: hid[l] = x
+    return self.out(x[x.shape[0] - latents.shape[0]:], c)
 
 
-# ------------------------------------------------------------------ the block ----
-class BlockWeights:
-    """One block's float32 matrices (dequantized once): ~1 GB at float32."""
-    def __init__(self, W, l):
-        p = f"layers.{l}."
-        self.qkv = W.linear(p + "attention.qkv")                 # [13824, 4608]
-        self.o = W.linear(p + "attention.o")                     # [4608, 4608]
-        self.w1 = W.linear(p + "feed_forward.w1"); self.w3 = W.linear(p + "feed_forward.w3")   # [12288, 4608]
-        self.w2 = W.linear(p + "feed_forward.w2")                # [4608, 12288]
-        self.norm_q = W.get(p + "attention.norm_q.weight"); self.norm_k = W.get(p + "attention.norm_k.weight")
-        self.an1 = W.get(p + "attention_norm1.weight"); self.an2 = W.get(p + "attention_norm2.weight")
-        self.fn1 = W.get(p + "ffn_norm1.weight"); self.fn2 = W.get(p + "ffn_norm2.weight")
-        self.ada_w = W.linear(p + "adaln_modulation"); self.ada_b = W.get(p + "adaln_modulation.bias")   # [18432, 512], [18432]
+# ---- the schedule
+def normal_quantile(p):
+  """The standard normal's inverse CDF, in float64: Newton's method on 0.5 erfc(-x / sqrt 2) = p from x = 0 (the CDF is convex
+  left of 0 and concave right of it, so the iterates approach the root from the side of 0, monotonically; once a step is below
+  1e-9 the next one lands at the float64 rounding); -inf at 0, +inf at 1. Slow only deep in the tails (the schedule's u are
+  multiples of 1 / steps)."""
+  def one(p):
+    if p <= 0.0: return -math.inf
+    if p >= 1.0: return math.inf
+    x = 0.0
+    for _ in range(10000):
+      dx = (0.5 * math.erfc(-x / math.sqrt(2.0)) - p) / (math.exp(-0.5 * x * x) / math.sqrt(2.0 * math.pi))
+      x -= dx
+      if abs(dx) < 1e-9 * max(1.0, abs(x)): break
+    dx = (0.5 * math.erfc(-x / math.sqrt(2.0)) - p) / (math.exp(-0.5 * x * x) / math.sqrt(2.0 * math.pi))
+    return x - dx
+  p = np.asarray(p, np.float64)
+  return np.vectorize(one, otypes=[np.float64])(p) if p.ndim else one(float(p))
+
+def shifted_mu(height, width, mu):
+  """The schedule's mu at an image size: mu + log(pixels / 512^2) / 2 (larger images spend more steps at high noise)."""
+  return mu + 0.5 * math.log(height * width / (512 * 512))
+
+def sigmas(steps, mu, std):
+  """The noise levels of a `steps`-step sample, [steps + 1] float64 from ~1 down to 0. The model time at u in [0, 1] is
+  1 - sigmoid(mu + std x normal_quantile(u)), clipped to [T_MIN, T_MAX]; step i starts at noise level 1 - time(1 - i / steps),
+  and the last step ends at 0."""
+  y = mu + std * normal_quantile(np.linspace(0.0, 1.0, steps + 1))
+  with np.errstate(over="ignore"): t = np.clip(1.0 - 1.0 / (1.0 + np.exp(-y)), T_MIN, T_MAX)
+  return np.append((1.0 - t)[:0:-1], 0.0)
+
+def sample_uncond(M, grid, steps=12, seed=0, mu=0.5, std=1.75, blocks=None, log=print):
+  """An unconditional sample (the unconditional transformer alone, no guidance): the latents [gh gw, C_IN] after `steps` Euler
+  steps from numpy's RandomState(seed) noise, and the per-step velocities."""
+  gh, gw = grid; pos = image_positions(gh, gw)
+  sig = sigmas(steps, shifted_mu(gh * 16, gw * 16, mu), std)
+  x = np.random.RandomState(seed).randn(gh * gw, C_IN).astype(np.float32); vs = []
+  for i in range(steps):
+    v = M.velocity(x, 1.0 - sig[i], pos, blocks=blocks)
+    x = x + np.float32(sig[i + 1] - sig[i]) * (-v); vs.append(v)
+    log("   step %2d/%d sigma %.4f -> %.4f  |x| %.3f  |v| %.3f" % (i + 1, steps, sig[i], sig[i + 1], np.abs(x).mean(), np.abs(v).mean()))
+  return x, vs
 
 
-def block_modulation(bw: BlockWeights, adaln):
-    """adaln `[512]` -> (scale_msa, gate_msa, scale_mlp, gate_mlp) `[4608]` each."""
-    mod = bw.ada_w @ adaln + bw.ada_b
-    s1, g1, s2, g2 = np.split(mod, 4)
-    return 1.0 + s1, np.tanh(g1), 1.0 + s2, np.tanh(g2)
-
-
-def block(bw: BlockWeights, x, cos, sin, adaln, parts=None):
-    """x `[L, 4608]` float32 -> the block's output; `parts` (a dict) collects the intermediates
-    the backend gates against."""
-    s1, g1, s2, g2 = block_modulation(bw, adaln)
-    h = rmsnorm(x, bw.an1, NORM_EPS) * s1
-    qkv = (h @ bw.qkv.T).reshape(-1, 3, NH, HEAD_DIM)
-    q, k, v = qkv[:, 0], qkv[:, 1], qkv[:, 2]
-    q = rmsnorm(q, bw.norm_q, 1e-5); k = rmsnorm(k, bw.norm_k, 1e-5)
-    c, s = cos[:, None, :], sin[:, None, :]
-    q = q * c + rotate_half(q) * s; k = k * c + rotate_half(k) * s
-    att = attention(q, k, v)
-    ao = att @ bw.o.T
-    x = x + g1 * rmsnorm(ao, bw.an2, NORM_EPS)
-    h2 = rmsnorm(x, bw.fn1, NORM_EPS) * s2
-    m = (silu(h2 @ bw.w1.T) * (h2 @ bw.w3.T)) @ bw.w2.T
-    out = x + g2 * rmsnorm(m, bw.fn2, NORM_EPS)
-    if parts is not None: parts.update(h=h, q=q, k=k, v=v, att=att, ao=ao, x1=x, h2=h2, m=m)
-    return out.astype(np.float32)
-
-
-# ------------------------------------------------------------------ the transformer ----
-class TopWeights:
-    def __init__(self, W):
-        self.input_w = W.linear("input_proj"); self.input_b = W.get("input_proj.bias")             # [4608, 128]
-        self.t_in_w = W.linear("t_embedding.mlp_in"); self.t_in_b = W.get("t_embedding.mlp_in.bias")
-        self.t_out_w = W.linear("t_embedding.mlp_out"); self.t_out_b = W.get("t_embedding.mlp_out.bias")
-        self.ada_w = W.linear("adaln_proj"); self.ada_b = W.get("adaln_proj.bias")                 # [512, 4608]
-        self.ind = W.get("embed_image_indicator.weight")                                            # [2, 4608]
-        self.fin_ada_w = W.linear("final_layer.adaln_modulation"); self.fin_ada_b = W.get("final_layer.adaln_modulation.bias")
-        self.fin_w = W.linear("final_layer.linear"); self.fin_b = W.get("final_layer.linear.bias")   # [128, 4608]
-        self.cond_norm = W.get("llm_cond_norm.weight") if W.has("llm_cond_norm.weight") else None
-        self.cond_w = W.linear("llm_cond_proj") if W.has("llm_cond_proj.weight") else None
-        self.cond_b = W.get("llm_cond_proj.bias") if W.has("llm_cond_proj.bias") else None
-
-
-def adaln_input(tw: TopWeights, t_model: float):
-    """The block conditioning `[512]` from the model time in [0, 1]."""
-    emb = sinusoidal(1e4 * t_model, HID)
-    e = silu(tw.t_in_w @ emb + tw.t_in_b)
-    t_cond = tw.t_out_w @ e + tw.t_out_b
-    return silu(tw.ada_w @ t_cond + tw.ada_b)
-
-
-def embed_image_tokens(tw: TopWeights, latents):
-    """Image tokens `[L, 128]` -> the stream `[L, 4608]` (input_proj + the image indicator embedding)."""
-    return (latents.astype(np.float32) @ tw.input_w.T + tw.input_b + tw.ind[1]).astype(np.float32)
-
-
-def final_layer(tw: TopWeights, x, adaln):
-    m = x.mean(-1, keepdims=True); v = ((x - m) ** 2).mean(-1, keepdims=True)
-    n = (x - m) / np.sqrt(v + 1e-6)
-    scale = 1.0 + (tw.fin_ada_w @ silu(adaln) + tw.fin_ada_b)
-    return (n * scale) @ tw.fin_w.T + tw.fin_b
-
-
-class Calib:
-    """Per-layer activation maxima over a reference run: what the backend's per-tensor int8 scales
-    are set from (`ideogram4_block_backend.QBlock` reads them instead of calibrating on one input).
-    Keys per layer: h, q, k, v, S (the scaled logits), att, h2, gl (the SwiGLU product); and the
-    K-chunk partial maxima per linear for a given chunk width (`part[l][name]`)."""
-    def __init__(self, kc: int): self.kc = kc; self.act = {}; self.part = {}
-    def note(self, l, parts, bw):
-        a = self.act.setdefault(l, {}); pm = self.part.setdefault(l, {})
-        for k in ("h", "q", "k", "v", "att", "h2"): a[k] = max(a.get(k, 0.0), float(np.abs(parts[k]).max()))
-        S = max(float(np.abs(parts["q"][:, hh] @ parts["k"][:, hh].T).max()) for hh in range(NH)) / math.sqrt(HEAD_DIM)
-        a["S"] = max(a.get("S", 0.0), S)
-        gl = silu(parts["h2"] @ bw.w1.T) * (parts["h2"] @ bw.w3.T); a["gl"] = max(a.get("gl", 0.0), float(np.abs(gl).max()))
-        for name, xin, w in (("qkv", parts["h"], bw.qkv), ("o", parts["att"], bw.o), ("w1", parts["h2"], bw.w1), ("w3", parts["h2"], bw.w3), ("w2", gl, bw.w2)):
-            m = max(float(np.abs(xin[:, c:c + self.kc] @ w[:, c:c + self.kc].T).max()) for c in range(0, w.shape[1], self.kc))
-            pm[name] = max(pm.get(name, 0.0), m)
-    def save(self, path): np.savez(path, kc=self.kc, act=np.array([self.act], dtype=object), part=np.array([self.part], dtype=object))
-    @classmethod
-    def load(cls, path):
-        d = np.load(path, allow_pickle=True); c = cls(int(d["kc"])); c.act = d["act"][0]; c.part = d["part"][0]; return c
-
-
-def forward_uncond(W, tw: TopWeights, blocks, latents, t_model, grid, cache=None, calib: "Calib|None" = None):
-    """The unconditional branch: image tokens only. `blocks`: a list of BlockWeights (loaded), or
-    None to stream them from `W` one at a time (a workstation's 17 GB). `calib` collects the maxima."""
-    gh, gw = grid
-    cos, sin = mrope(image_position_ids(gh, gw))
-    ada = adaln_input(tw, t_model)
-    x = embed_image_tokens(tw, latents)
-    for l in range(W.config["num_layers"]):
-        bw = blocks[l] if blocks is not None else BlockWeights(W, l)
-        parts = {} if calib is not None else None
-        x = block(bw, x, cos, sin, ada, parts=parts)
-        if calib is not None: calib.note(l, parts, bw)
-    return final_layer(tw, x, ada)
-
-
-# ------------------------------------------------------------------ the schedule and the loop ----
-def _ndtri(p):
-    """Inverse normal CDF (Acklam's rational approximation refined by one Newton step), float64."""
-    from math import erf, sqrt, exp, log, pi
-    p = np.asarray(p, np.float64); out = np.empty_like(p)
-    a = [-3.969683028665376e+01, 2.209460984245205e+02, -2.759285104469687e+02, 1.383577518672690e+02, -3.066479806614716e+01, 2.506628277459239e+00]
-    b = [-5.447609879822406e+01, 1.615858368580409e+02, -1.556989798598866e+02, 6.680131188771972e+01, -1.328068155288572e+01]
-    c = [-7.784894002430293e-03, -3.223964580411365e-01, -2.400758277161838e+00, -2.549732539343734e+00, 4.374664141464968e+00, 2.938163982698783e+00]
-    d = [7.784695709041462e-03, 3.224671290700398e-01, 2.445134137142996e+00, 3.754408661907416e+00]
-    for i, pi_ in np.ndenumerate(p):
-        if pi_ <= 0: out[i] = -np.inf; continue
-        if pi_ >= 1: out[i] = np.inf; continue
-        if pi_ < 0.02425:
-            q = sqrt(-2 * log(pi_)); x = (((((c[0]*q+c[1])*q+c[2])*q+c[3])*q+c[4])*q+c[5]) / ((((d[0]*q+d[1])*q+d[2])*q+d[3])*q+1)
-        elif pi_ > 1 - 0.02425:
-            q = sqrt(-2 * log(1 - pi_)); x = -(((((c[0]*q+c[1])*q+c[2])*q+c[3])*q+c[4])*q+c[5]) / ((((d[0]*q+d[1])*q+d[2])*q+d[3])*q+1)
-        else:
-            q = pi_ - 0.5; r = q * q
-            x = (((((a[0]*r+a[1])*r+a[2])*r+a[3])*r+a[4])*r+a[5])*q / (((((b[0]*r+b[1])*r+b[2])*r+b[3])*r+b[4])*r+1)
-        e = 0.5 * (1 + erf(x / sqrt(2))) - pi_; u = e * sqrt(2 * pi) * exp(x * x / 2)
-        out[i] = x - u / (1 + x * u / 2)
-    return out
-
-
-def sigmas(steps, mu, std, logsnr_min=-15.0, logsnr_max=18.0):
-    """The pipeline's `_logit_normal_sigmas`: decreasing sigmas in (0, 1], length `steps`, and the
-    terminal 0 the scheduler appends."""
-    z = _ndtri(np.linspace(0.0, 1.0, steps + 1))
-    y = mu + std * z
-    t = 1.0 - 1.0 / (1.0 + np.exp(-y))
-    t = np.clip(t, 1.0 / (1.0 + math.exp(0.5 * logsnr_max)), 1.0 / (1.0 + math.exp(0.5 * logsnr_min)))
-    s = (1.0 - t)[::-1][:-1]
-    return np.concatenate([s, [0.0]])
-
-
-def resolution_mu(height, width, base_mu):
-    return base_mu + 0.5 * math.log(height * width / (512 * 512))
-
-
-def generate_uncond(W, grid, steps=12, seed=0, mu=0.5, std=1.75, blocks=None, log=print, calib=None):
-    """Unconditional latents `[gh*gw, 128]` by the negative branch alone (v = neg_v), the pipeline's
-    FlowMatchEuler update. Returns (latents, the per-step velocities)."""
-    gh, gw = grid
-    tw = TopWeights(W)
-    sig = sigmas(steps, resolution_mu(gh * 16, gw * 16, mu), std)
-    rng = np.random.RandomState(seed)
-    x = rng.randn(gh * gw, IN_CH).astype(np.float32)
-    vs = []
-    for i in range(steps):
-        t_model = 1.0 - sig[i]                                     # diffusers' timestep = sigma * 1000; model time = 1 - sigma
-        v = forward_uncond(W, tw, blocks, x, t_model, grid, calib=calib)
-        x = x + np.float32(sig[i + 1] - sig[i]) * (-v)               # scheduler.step(-v)
-        vs.append(v)
-        log("   step %2d/%d sigma %.4f -> %.4f  |x| %.3f  |v| %.3f" % (i + 1, steps, sig[i], sig[i + 1], np.abs(x).mean(), np.abs(v).mean()))
-    return x, vs
-
-
-# ------------------------------------------------------------------ the backend's arithmetic, simulated ----
-def quantize_weights_per_unit(w, unit=128):
-    """The backend's weight quantization simulated: int8 with one scale per `unit` OUTPUT channels
-    (`quantize.quantize_weight_w8` per MTP unit), returned dequantized (float32)."""
-    out = np.empty_like(w, dtype=np.float32)
-    for o in range(0, w.shape[0], unit):
-        blk = w[o:o + unit]; s = np.abs(blk).max() / 127.0
-        out[o:o + unit] = np.clip(np.rint(blk / s), -127, 127) * s
-    return out
-
-
-class BlockWeightsQ(BlockWeights):
-    """BlockWeights with the five linears' weights quantized as the backend does (per-unit int8)."""
-    def __init__(self, W, l):
-        super().__init__(W, l)
-        for n in ("qkv", "o", "w1", "w3", "w2"): setattr(self, n, quantize_weights_per_unit(getattr(self, n)))
-
-
-def block_fakequant(bw: BlockWeights, x, cos, sin, adaln, a: dict, pm: dict, kc: int):
-    """The block with the BACKEND's quantization points simulated in float: per-tensor int8 at every
-    linear / matmul input (scales `a[k]/127` from a `Calib`), int16 partial sums per K-chunk
-    (`pm[name]*1.05/32767`), P at 1/127. Whether the NPU's deviation from fp32 is the scheme's or a
-    bug's: this reproduces the scheme without the device."""
-    q8 = lambda v, s: np.clip(np.rint(v / np.float32(s)), -127, 127).astype(np.float32) * np.float32(s)
-    def lin(xin, w, name):
-        s16 = np.float32(pm[name] * 1.05 / 32767.0); out = np.zeros((xin.shape[0], w.shape[0]), np.float32)
-        for c in range(0, w.shape[1], kc):
-            part = xin[:, c:c + kc] @ w[:, c:c + kc].T
-            out += np.clip(np.rint(part / s16), -32767, 32767).astype(np.float32) * s16
-        return out
-    s1, g1, s2, g2 = block_modulation(bw, adaln)
-    h = q8(rmsnorm(x, bw.an1, NORM_EPS) * s1, a["h"] / 127.0)
-    qkv = lin(h, bw.qkv, "qkv").reshape(-1, 3, NH, HEAD_DIM)
-    q, k, v = qkv[:, 0], qkv[:, 1], qkv[:, 2]
-    q = rmsnorm(q, bw.norm_q, 1e-5); k = rmsnorm(k, bw.norm_k, 1e-5)
-    c, s = cos[:, None, :], sin[:, None, :]
-    q = q8(q * c + rotate_half(q) * s, a["q"] / 127.0); k = q8(k * c + rotate_half(k) * s, a["k"] / 127.0); v = q8(v, a["v"] / 127.0)
-    L = q.shape[0]; out = np.empty((L, NH, HEAD_DIM), np.float32); sS = a["S"] / 127.0
-    for hh in range(NH):
-        lg = q8((q[:, hh] @ k[:, hh].T) / np.float32(math.sqrt(HEAD_DIM)), sS)
-        lg = lg - lg.max(-1, keepdims=True); e = np.exp(lg); pr = e / e.sum(-1, keepdims=True)
-        pr = np.rint(pr * 127) / 127.0
-        out[:, hh] = pr @ v[:, hh]
-    att = q8(out.reshape(L, NH * HEAD_DIM), a["att"] / 127.0)
-    ao = lin(att, bw.o, "o")
-    x = x + g1 * rmsnorm(ao, bw.an2, NORM_EPS)
-    h2 = q8(rmsnorm(x, bw.fn1, NORM_EPS) * s2, a["h2"] / 127.0)
-    gl = q8(silu(lin(h2, bw.w1, "w1")) * lin(h2, bw.w3, "w3"), a["gl"] / 127.0)
-    m = lin(gl, bw.w2, "w2")
-    return (x + g2 * rmsnorm(m, bw.fn2, NORM_EPS)).astype(np.float32)
-
-
-def forward_uncond_fakequant(W, tw, latents, t_model, grid, calib):
-    gh, gw = grid; cos, sin = mrope(image_position_ids(gh, gw)); ada = adaln_input(tw, t_model)
-    x = embed_image_tokens(tw, latents)
-    for l in range(W.config["num_layers"]):
-        x = block_fakequant(BlockWeights(W, l), x, cos, sin, ada, calib.act[l], calib.part[l], calib.kc)
-    return final_layer(tw, x, ada)
+if __name__ == "__main__":
+  sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+  from ideogram4_weights import Ideogram4Weights
+  ap = argparse.ArgumentParser(description="an unconditional sample's per-step velocities (ideogram4_fp_backend.py --ref)")
+  ap.add_argument("--weights", default="~/ideogram4/unconditional_transformer"); ap.add_argument("--grid", default="16x16")
+  ap.add_argument("--steps", type=int, default=12); ap.add_argument("--seed", type=int, default=0)
+  ap.add_argument("--mu", type=float, default=0.5); ap.add_argument("--std", type=float, default=1.75)
+  ap.add_argument("--out", default="~/ideogram4/ref_latents_256.npy", help="the velocities [steps, tokens, 128]")
+  ap.add_argument("--hold", action="store_true", help="keep the 34 dequantised blocks in memory (~34 GB) instead of reloading each step")
+  a = ap.parse_args()
+  M = Model(Ideogram4Weights(a.weights))
+  blocks = [M.block(l) for l in range(NL)] if a.hold else None
+  x, vs = sample_uncond(M, tuple(int(v) for v in a.grid.split("x")), a.steps, a.seed, a.mu, a.std, blocks)
+  out = os.path.expanduser(a.out); np.save(out, np.stack(vs)); np.save(out[:-4] + "_x.npy", x)
+  print("   the velocities -> %s, the latents -> %s" % (out, out[:-4] + "_x.npy"))

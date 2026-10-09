@@ -44,8 +44,7 @@ V48 = LIN48 and os.environ.get("V48", "1") == "1"        # P V on the 48-deep 3-
 QKV_FAST = os.environ.get("QKV_FAST", "1") == "1"         # qkv_dma(fast=True): loop-buffer bodies, the scale folded in, the half rotary tables double-buffered (bit-identical)
 B8 = LIN48 and os.environ.get("B8", "1") == "1"            # the linears read the E4M3 codes and expand them in LSRAM (k_gemm_gs b8): half the weight bytes, no fp16 panels pass; C x 2^-8, the scales x 2^8                 # the linears on the 48-deep 3-strip k_gemm_gs (weights repacked, `p48/`); LIN48=0: the 24 x 6 kernel
 GATE = bool(int(os.environ.get("GATE", "0"))); PROF = bool(int(os.environ.get("PROF", "0")))
-Q4K = False     # --q4k-cond / --q4k-uncond (experimental, not part of this example): the four linears from the GGUF Q4_K cache (`ideogram4_q4k_pack.py`), expanded to fp16 in the GEMM
-C_, NH, DH, DHP, M_ = R.HID, R.NH, R.HEAD_DIM, 288, R.MLP
+C_, NH, DH, DHP, M_ = R.D, R.NH, R.HD, 288, R.FF
 N_QKV, N_W13 = 3 * NH * DH, 2 * M_
 W_ORDER = ["qkv", "o", "w13", "w2"]
 dev, zeros = FB.dev, FB.zeros
@@ -73,8 +72,8 @@ class Kernels:
     def __init__(self, g: Geo, treal: int):
         reg = lambda name, src: OA.register_csrc(name, src, ntasks=NT)
         self.treal = treal
-        self.rms = reg("rms_scale_dma", V.rms_scale_dma_src(treal, C_, R.NORM_EPS, KS, g.NRB, nt=NT)); self.d_rms = dev(V.rms_scale_dma_descs(C_, g.NRB))
-        self.resid = reg("resid_dma", V.resid_dma_src(treal, C_, NS, g.NRB, R.NORM_EPS, nt=NT)); self.d_resid = dev(V.resid_dma_descs(C_, g.NRB))
+        self.rms = reg("rms_scale_dma", V.rms_scale_dma_src(treal, C_, R.EPS, KS, g.NRB, nt=NT)); self.d_rms = dev(V.rms_scale_dma_descs(C_, g.NRB))
+        self.resid = reg("resid_dma", V.resid_dma_src(treal, C_, NS, g.NRB, R.EPS, nt=NT)); self.d_resid = dev(V.resid_dma_descs(C_, g.NRB))
         self.swiglu = reg("swiglu_dma", V.swiglu_dma_src(treal, M_, g.NRB, KS, nt=NT, interleaved=True)); self.d_swiglu = dev(V.swiglu_dma_descs(M_, g.NRB, KS, interleaved=True))
         self.qkv = reg("qkv_dma", V.qkv_dma_src(treal, NH, DH, DHP, g.NRB, KS, NS, g.TP, 1e-5, nt=NT, v48=V48, fast=QKV_FAST)); self.d_qkv = dev(V.qkv_dma_descs(g.NRB, KS, NS))
         SGB = int(os.environ.get("SOFTMAX_GB", "2" if (g.TP // 96) % 2 == 0 else "1"))   # groups per softmax DMA request (1: the single-group kernel)
@@ -102,16 +101,13 @@ def make_bufs(g: Geo):
 
 
 def make_pool():
-    nb = (lambda n: n * 3 // 4) if Q4K else (lambda n: n)          # Q4_K streams: 0.75 B a weight (E4M3: 1)
-    mk = lambda: dict(qkv=zeros(nb(N_QKV * C_), dtypes.uint8), o=zeros(nb(C_ * C_), dtypes.uint8), w13=zeros(nb(N_W13 * C_), dtypes.uint8), w2=zeros(nb(C_ * M_), dtypes.uint8))
+    mk = lambda: dict(qkv=zeros(N_QKV * C_, dtypes.uint8), o=zeros(C_ * C_, dtypes.uint8), w13=zeros(N_W13 * C_, dtypes.uint8), w2=zeros(C_ * M_, dtypes.uint8))
     return [mk(), mk()]
 
 
 class Layer:
-    """One layer of one transformer: the packed codes (memory-mapped), the small tensors, the modulation. `q4k`: the folder of the
-    Q4_K cache -- the four linears' streams (already in the lin48 order, w13 interleaved) and their 2^-e row scales replace the E4M3
-    codes and scales; the norms and the modulation still come from the fp8 cache's small npz."""
-    def __init__(self, l, cache, q4k=None):
+    """One layer of one transformer: the packed codes (memory-mapped), the small tensors, the modulation."""
+    def __init__(self, l, cache):
         self.l = l
         sm = np.load(os.path.join(cache, f"L{l}_small.npz"))
         self.sc = {k: sm["sc_" + k] for k in W_ORDER}
@@ -120,12 +116,6 @@ class Layer:
         self.ada_b = sm["ada_b"]
         self._sm = sm
         self.norm_q, self.norm_k = sm["norm_q"], sm["norm_k"]
-        if q4k:
-            self.codes = {k: np.memmap(os.path.join(q4k, f"L{l}_{k}.bin"), np.uint8, "c") for k in W_ORDER}
-            qs = np.load(os.path.join(q4k, f"L{l}_q4k.npz")); self.sc = {k: qs["sc_" + k].astype(np.float32) for k in W_ORDER}
-            self.t = dict(sc_qkv=dev(self.sc["qkv"]), sc_o=dev(self.sc["o"]), sc_w13=dev(self.sc["w13"]), sc_w2=dev(self.sc["w2"]),
-                          nq2=dev(V.dup_quads(self._sm["norm_q"])), nk2=dev(V.dup_quads(self._sm["norm_k"])))
-            return
         self.codes = {k: np.memmap(os.path.join(cache, f"L{l}_{k}.bin"), np.uint8, "c") for k in W_ORDER}   # "c": copy-on-write, writable for ctypes (never written)
         # w1|w3 in the interleaved group order (swiglu_dma's), made once per cache (`L{l}_w13i.bin`)
         idir = os.path.join(os.path.expanduser(os.environ.get("W13I_DIR", "~/ideogram4/w13i")), os.path.basename(os.path.normpath(cache))); os.makedirs(idir, exist_ok=True)
@@ -161,8 +151,7 @@ def block_1024(g: Geo, K: Kernels, t: dict, cs, sn, x, ws1, k1, ws2, k2, codes: 
     big = bufs["big"]
     pn = dict(codes) if B8 else {k: chk("panels_" + k, OA.e4m3_stream(codes[k], out=bufs["panels"][k])) for k in W_ORDER}
     Ah = chk("Ah", cs_(K.rms, bufs["Ah"], x, ws1, K.d_rms))
-    lin = lambda a_, b_, K, N, out: OA.gemm_gs(a_, b_, ks=KS, ns=NS, nrb=g.NRB, nslices=K // 96, ngroups=N // 96, lin48=LIN48, piece=0 if LIN48 else PIECE, b8=B8, out=out,
-                                               **({"q4k": True} if Q4K else {}))
+    lin = lambda a_, b_, K, N, out: OA.gemm_gs(a_, b_, ks=KS, ns=NS, nrb=g.NRB, nslices=K // 96, ngroups=N // 96, lin48=LIN48, piece=0 if LIN48 else PIECE, b8=B8, out=out)
     Cq = chk("Cqkv", lin(Ah, pn["qkv"], C_, N_QKV, big))
     QKV = chk("QKV", cs_(K.qkv, bufs["QKV"], Cq, t["nq2"], t["nk2"], cs, sn, t["sc_qkv"], K.d_qkv))
     PV = bufs["PV"]
@@ -189,17 +178,17 @@ def block_1024(g: Geo, K: Kernels, t: dict, cs, sn, x, ws1, k1, ws2, k2, codes: 
 
 class Branch:
     """One transformer (cond or uncond) over its sequence: the layers, the kernels, the rotary tables, the JITs."""
-    def __init__(self, name, cache, weights, g: Geo, pos_ids, treal, layers, q4k=None):
+    def __init__(self, name, cache, weights, g: Geo, pos_ids, treal, layers):
         self.name, self.g, self.treal = name, g, treal
-        self.W = Ideogram4Weights(weights); self.tw = R.TopWeights(self.W)
-        cos, sin = R.mrope(pos_ids)
+        self.W = Ideogram4Weights(weights); self.tw = R.Model(self.W)
+        cos, sin = R.rope_tables(pos_ids)
         pad = lambda a: np.concatenate([a, np.zeros((g.ROWS - a.shape[0], a.shape[1]), np.float32)])
         self.cos, self.sin = cos, sin
         ct_, st_ = V.tile_rows(pad(cos), g.NRB), V.tile_rows(pad(sin), g.NRB)
         # QKV_FAST: qkv_dma's loop-buffer rewrite reads the tables' first halves packed per row group (`rope_csn`) through `cs`
         self.cs, self.sn = (dev(V.rope_csn(ct_, st_)) if QKV_FAST else dev(ct_)), dev(st_)
         self.K = Kernels(g, treal)
-        self.layers = [Layer(l, cache, q4k) for l in layers]
+        self.layers = [Layer(l, cache) for l in layers]
         self.jits = [None, None]
 
     @staticmethod
@@ -315,7 +304,7 @@ class Gate1024:
     has the reference BLAS: a full 4128-row reference GEMM takes minutes): every GEMM on `SR` rows (text
     rows, image rows spread over the sequence, the last real row), head 0 of batch 0 for the attention,
     the vector kernels on those rows through the full references where they are cheap. The layer's input
-    and output go to `GATE_DUMP` (npz) for the whole-block fp32 comparison on a workstation (`ideogram4_ref.block`)."""
+    and output go to `GATE_DUMP` (npz) for the whole-block fp32 comparison on a workstation (`ideogram4_ref.Block`)."""
     def __init__(self, br: Branch, L: Layer, hp, adaln):
         self.br, self.L, self.hp, self.ada = br, L, hp, adaln; self.bad = []; self.n = 0; self.cache = {}
         T = br.treal
@@ -370,9 +359,6 @@ class Gate1024:
 
     def _gemm(self, name, a_name, K, b_name, N):   # B8: the codes themselves, and the device's C x 2^8
         R_ = self.SR; A = self._arows(self.cache[a_name], K, R_)
-        if Q4K:                                    # the fp16 weights the kernel builds from the stream (x 2^e a row); C as the device's
-            B = G.q4k48_unpack_f16(np.asarray(self.L.codes[b_name[7:]]), N, K).astype(np.float32)
-            return self._crows(self.cache[name], N, R_), A @ B.T
         B = self._b(np.asarray(self.L.codes[b_name[7:]])[:N * K] if B8 else self.cache[b_name][:N * K], N, K, lin=True)
         return self._crows(self.cache[name], N, R_) * np.float32(256 if B8 else 1), A @ B.T
 
@@ -382,7 +368,7 @@ class Gate1024:
         s1, g1, s2, g2 = L.modulation(self.ada)
         if name.startswith("panels_"):
             k = name[7:]; return got, G.e4m3_table()[np.asarray(L.codes[k])].astype(np.float16).view(np.uint16)
-        if name == "Ah": return got, V.rms_scale_a16_ref(self.hp[:T], L.an1 * s1, np.ones(C_, np.float32), R.NORM_EPS, KS, g.NRB)
+        if name == "Ah": return got, V.rms_scale_a16_ref(self.hp[:T], L.an1 * s1, np.ones(C_, np.float32), R.EPS, KS, g.NRB)
         if name == "Cqkv": return self._gemm("Cqkv", "Ah", C_, "panels_qkv", N_QKV)
         if name == "QKV":
             cf = V.c_from_tiles(c["Cqkv"][:144 * g.NRB * 1152], NS, g.NRB, N_QKV)[:T] * q4(L.sc["qkv"])
@@ -412,7 +398,7 @@ class Gate1024:
         hn = FB.host_read(h).view(np.float32).reshape(g.ROWS, C_)[:T]
         path = os.environ.get("GATE_DUMP", "~/ideogram4/gate_%s_L%d.npz" % (self.br.name, self.L.l))
         np.savez(path, x=self.hp[:T], out=hn, ada=self.ada, cos=self.br.cos, sin=self.br.sin, layer=self.L.l)
-        print("   layer %d (%s): %d ops gated, bad: %s; input/output -> %s (for an fp32 block check on a workstation: ideogram4_ref.block)"
+        print("   layer %d (%s): %d ops gated, bad: %s; input/output -> %s (for an fp32 block check on a workstation: ideogram4_ref.Block)"
               % (self.L.l, self.br.name, self.n, self.bad or "none", path), flush=True)
 
 
@@ -421,12 +407,10 @@ def main():
     ap.add_argument("--text", required=True, help="ideogram4_text.py's npz (the text rows)")
     ap.add_argument("--cond", default="~/ideogram4/fpcache_cond"); ap.add_argument("--uncond", default="~/ideogram4/fpcache")
     ap.add_argument("--wcond", default="~/ideogram4/transformer"); ap.add_argument("--wuncond", default="~/ideogram4/unconditional_transformer")
-    ap.add_argument("--q4k-cond", default=None, help="the cond branch's Q4_K cache (ideogram4_q4k_pack.py): its four linears in 4 bits")
-    ap.add_argument("--q4k-uncond", default=None, help="the uncond branch's Q4_K cache")
     ap.add_argument("--steps", type=int, default=20); ap.add_argument("--size", type=int, default=1024); ap.add_argument("--seed", type=int, default=123)
     ap.add_argument("--mu", type=float, default=0.0); ap.add_argument("--std", type=float, default=1.5)
     ap.add_argument("--preset", default=None, choices=("V4_QUALITY_48", "V4_DEFAULT_20", "V4_TURBO_12"),
-                    help="the official sampler presets (ideogram4/sampler_configs.py): steps, CFG schedule, mu, std")
+                    help="Ideogram's published sampler presets: steps, CFG schedule, mu, std")
     ap.add_argument("--guidance", default=None, help="comma list per step (default: 7.0, the last 3 steps 3.0 -- the pipeline's schedule shape)")
     ap.add_argument("--layers", default="0-33"); ap.add_argument("--branch", default="both", choices=("both", "cond", "uncond"))
     ap.add_argument("--out", required=True); ap.add_argument("--save-every", action="store_true", help="save the latents (+ `.step`) after every step")
@@ -435,40 +419,35 @@ def main():
     ap.add_argument("--stop-after", type=int, default=None, help="stop after step K")
     ap.add_argument("--resume", action="store_true", help="continue from `--out` and its `.step` (a run cut short: the schedule, seed and guidance must match)")
     a = ap.parse_args()
-    global Q4K
-    Q4K = bool(a.q4k_cond or a.q4k_uncond)
-    assert not Q4K or (B8 and LIN48 and os.environ.get("ZHOUYI_GM", "1") == "1" and (a.branch != "both" or (a.q4k_cond and a.q4k_uncond))), \
-        "the Q4_K linears run on the staged lin48 GEMM (B8, LIN48, ZHOUYI_GM=1), both branches' caches with --branch both"
     grid = a.size // 16; n_img = grid * grid
     tx = np.load(os.path.expanduser(a.text)); text_rows = tx["rows"].astype(np.float32); n_text = text_rows.shape[0]
     g = Geo(n_img, n_text)
     lo, hi = (int(v) for v in a.layers.split("-")); layers = range(lo, hi + 1)
-    img_pos = R.image_position_ids(grid, grid)
-    txt_pos = np.repeat(np.arange(n_text)[:, None], 3, 1)
+    img_pos = R.image_positions(grid, grid)
+    txt_pos = R.text_positions(n_text)
     t0 = time.perf_counter()
     bufs = make_bufs(g); pool = make_pool()
     br = {}
-    xq = lambda p_: os.path.expanduser(p_) if p_ else None
-    if a.branch in ("both", "cond"): br["cond"] = Branch("cond", a.cond, os.path.expanduser(a.wcond), g, np.concatenate([txt_pos, img_pos]), n_text + n_img, layers, q4k=xq(a.q4k_cond))
-    if a.branch in ("both", "uncond"): br["uncond"] = Branch("uncond", os.path.expanduser(a.uncond), os.path.expanduser(a.wuncond), g, img_pos, n_img, layers, q4k=xq(a.q4k_uncond))
+    if a.branch in ("both", "cond"): br["cond"] = Branch("cond", os.path.expanduser(a.cond), os.path.expanduser(a.wcond), g, np.concatenate([txt_pos, img_pos]), n_text + n_img, layers)
+    if a.branch in ("both", "uncond"): br["uncond"] = Branch("uncond", os.path.expanduser(a.uncond), os.path.expanduser(a.wuncond), g, img_pos, n_img, layers)
     PRESETS = {"V4_QUALITY_48": (48, 3, 0.0, 1.5), "V4_DEFAULT_20": (20, 2, 0.0, 1.75), "V4_TURBO_12": (12, 1, 0.5, 1.75)}   # steps, polish steps at 3.0, mu, std
     if a.preset:
         a.steps, npol, a.mu, a.std = PRESETS[a.preset]; gw = [7.0] * (a.steps - npol) + [3.0] * npol
     else:
         gw = [float(v) for v in a.guidance.split(",")] if a.guidance else [7.0] * max(0, a.steps - 3) + [3.0] * min(3, a.steps)
     assert len(gw) == a.steps
-    # the official schedule (ideogram4/scheduler.py): model time t_k = LogitNormal(mu_res, std)(k / steps) on float32
-    # intervals, float64 math, float32 out; step i goes from t(interval[N - i]) to t(interval[N - i - 1]) -- it ends at
-    # t_max = 0.99945, not at 1 (the diffusers port's terminal sigma 0)
-    mu = R.resolution_mu(a.size, a.size, a.mu)
+    # the schedule of Ideogram's own sampler: model time t_k = LogitNormal(mu_res, std)(k / steps) on float32 intervals, float64
+    # math, float32 out; step i goes from t(interval[N - i]) to t(interval[N - i - 1]) -- it ends at t_max = 0.99945, not at 1
+    # (ideogram4_ref.sigmas ends at noise level 0, model time 1)
+    mu = R.shifted_mu(a.size, a.size, a.mu)
     iv = np.linspace(0.0, 1.0, a.steps + 1, dtype=np.float32).astype(np.float64)
     def sched(u):
-        y = mu + a.std * R._ndtri(np.array([u]))[0]; t_ = 1.0 - 1.0 / (1.0 + math.exp(-y)) if np.isfinite(y) else (0.0 if y > 0 else 1.0)
+        y = mu + a.std * R.normal_quantile(u); t_ = 1.0 - 1.0 / (1.0 + math.exp(-y)) if np.isfinite(y) else (0.0 if y > 0 else 1.0)
         return np.float32(min(max(t_, 1.0 / (1 + math.exp(9.0))), 1.0 / (1 + math.exp(-7.5))))
     tm = [sched(iv[a.steps - k]) for k in range(a.steps + 1)]           # model time, noise -> data
     sig = [1.0 - float(t) for t in tm]
-    x = torch_randn(a.seed, n_img * R.IN_CH).reshape(n_img, R.IN_CH)
-    print("== Ideogram 4 " + ("with GGUF Q4_K LINEARS" if Q4K else "at FULL PRECISION") + " on the NPU: %r, %dx%d (%d image + %d text tokens -> %d rows), %d steps, seed %d, CFG %s; "
+    x = torch_randn(a.seed, n_img * R.C_IN).reshape(n_img, R.C_IN)
+    print("== Ideogram 4 at FULL PRECISION on the NPU: %r, %dx%d (%d image + %d text tokens -> %d rows), %d steps, seed %d, CFG %s; "
           "branches %s, layers %d-%d; set up in %.0f s ==" % (str(tx["text"]).split("\n")[1] if "text" in tx else "?", a.size, a.size, n_img, n_text,
           g.ROWS, a.steps, a.seed, gw, list(br), lo, hi, time.perf_counter() - t0), flush=True)
     T0 = time.perf_counter(); start = 0
@@ -491,7 +470,7 @@ def main():
     npu_temb = npu_io and os.environ.get("NPU_MOD", "1") == "1" and os.environ.get("NPU_STEP", "1") == "1" and os.environ.get("NPU_TEMB", "1") == "1" \
         and a.diag_step is None and not os.environ.get("OPTIME")
     ada_ex = ThreadPoolExecutor(1)
-    ada_fut = {} if npu_temb else {(i_, name): ada_ex.submit(R.adaln_input, b.tw, float(tm[i_])) for i_ in range(start, a.steps) for name, b in br.items()}
+    ada_fut = {} if npu_temb else {(i_, name): ada_ex.submit(b.tw.cond, float(tm[i_])) for i_ in range(start, a.steps) for name, b in br.items()}
     # NPU_MOD (default 1, 2026-09-28): every layer's modulation for every step as one device GEMM a layer (ideogram4_io_npu.ModNPU),
     # the per-step tables made by `mod_tables` inside the layer's JIT -- no per-layer numpy mat-vec, tables or uploads
     if npu_io and os.environ.get("NPU_MOD", "1") == "1":
@@ -502,14 +481,14 @@ def main():
             if npu_temb:
                 b.temb = IOM.TembNPU(b.tw, a.steps); b.temb.run([tm[i_] for i_ in range(a.steps)], b.mod.a); b.mod.setup()
                 b.io.use_temb(b.temb, b.mod.stepv)
-            else: b.mod.setup([ada_fut[(i_, name)].result() if i_ >= start else R.adaln_input(b.tw, float(tm[i_])) for i_ in range(a.steps)])
+            else: b.mod.setup([ada_fut[(i_, name)].result() if i_ >= start else b.tw.cond(float(tm[i_])) for i_ in range(a.steps)])
         print("   NPU_MOD: every layer's modulation for %d steps on the device in %.1f s" % (a.steps, time.perf_counter() - tm0), flush=True)
     # NPU_STEP (default 1 with NPU_IO, 2026-09-28): the latents stay on the device -- lat_pack, the text / pad rows from templates,
     # the velocity as device rows, guidance + Euler by cfg_euler; the host reads the 2 MB of latents back for the log line only
     S = None
     if npu_io and os.environ.get("NPU_STEP", "1") == "1":
         if not npu_temb:
-            for name, b in br.items(): b.io.set_scales([ada_fut[(i_, name)].result() if i_ >= start else R.adaln_input(b.tw, float(tm[i_])) for i_ in range(a.steps)])
+            for name, b in br.items(): b.io.set_scales([ada_fut[(i_, name)].result() if i_ >= start else b.tw.cond(float(tm[i_])) for i_ in range(a.steps)])
         S = IOM.Sampler(x, br["cond"].io if "cond" in br else br["uncond"].io, br["uncond"].io if len(br) == 2 else None, gw, tm)
     for i in range(start, a.steps):
         ts = time.perf_counter()
@@ -527,10 +506,10 @@ def main():
                 hd = b.forward(b.io.embed(x, hin, bufs["big"]), ada, bufs, pool, dev_out=True)
                 v[name] = b.io.final(hd, ada, bufs["Ah"])
                 continue
-            img = (x @ b.tw.input_w.T + b.tw.input_b + b.tw.ind[1]).astype(np.float32)
+            img = b.tw.embed(x)
             rows = np.concatenate([text_rows, img]) if name == "cond" else img
             hn = b.forward(rows, ada, bufs, pool, gate_layer0=GATE and i == 0)
-            v[name] = R.final_layer(b.tw, hn[-n_img:], ada).astype(np.float32)
+            v[name] = b.tw.out(hn[-n_img:], ada).astype(np.float32)
         if S is not None:
             xp = x; S.step(i); x = S.read()                                        # z += v * (s - t), on the device
             vel = (x - xp) / np.float32(tm[i + 1] - tm[i])                          # (the log's |v|, from the two latents)

@@ -25,7 +25,7 @@ import gguf_read                                                               #
 from gguf_read import GGUF                                                     # noqa: E402
 
 PTQ1_0, QK, BLOCK_BYTES = 143, 128, 28
-gguf_read.GGML[PTQ1_0] = ("PTQ1_0", QK, BLOCK_BYTES)                           # gguf-py/gguf/constants.py:5676 (128, 2 + 24 + 2)
+gguf_read.GGML[PTQ1_0] = ("PTQ1_0", QK, BLOCK_BYTES)                           # the type's block: 128 weights in 2 + 24 + 2 bytes
 
 _POW3 = np.array([1, 3, 9, 27, 81], np.uint32)
 _b = np.arange(256, dtype=np.uint32)[:, None]
@@ -89,7 +89,8 @@ class Hadamard:
 Q8ACT = os.environ.get("BONSAI_Q8ACT", "0") == "1"
 
 def q8_0_roundtrip(x):
-  """x [..., K] through Q8_0 and back (quantize_row_q8_0_ref, ggml-quants.c: d = amax / 127 per 32, stored fp16; q = round(x / d))."""
+  """x [..., K] through Q8_0 and back: d = amax / 127 per 32, stored fp16; q = round(x / d) (how llama.cpp quantises the activations
+  of a Q8_0 matmul)."""
   b = np.asarray(x, np.float32).reshape(-1, 32); d = np.abs(b).max(-1, keepdims=True) / 127.0
   q = np.round(b * np.where(d == 0, 0, 1.0 / np.where(d == 0, 1, d))); d16 = d.astype(np.float16).astype(np.float32)
   return (q * d16).reshape(np.shape(x)).astype(np.float32)

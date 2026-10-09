@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Ideogram 4's prompt conditioning, once per image, on the host CPU (numpy): the Qwen3-VL-8B text
 encoder's decoder layers over the chat-formatted prompt, the hidden states tapped after layers
-(0, 3, ..., 33, 35) concatenated per token as `[n, 4096 x 13]` (feature d * 13 + tap: the pipeline's
-`stack(dim=0).permute(1, 2, 3, 0)`), then the conditional transformer's `llm_cond_norm` +
+(0, 3, ..., 33, 35) concatenated per token as `[n, 4096 x 13]` (feature d * 13 + tap: the order the conditional
+transformer's `llm_cond_proj` expects), then the conditional transformer's `llm_cond_norm` +
 `llm_cond_proj` + the text indicator embedding -> the text rows `[n, 4608]` that open the packed
 sequence. ⚠️ The pipeline left-pads to 2048 tokens; the pads are a separate attention segment and the
 encoder is causal, so dropping them is exact (the text positions are 0..n-1 either way).

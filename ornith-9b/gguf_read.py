@@ -13,9 +13,9 @@ GGML = {0: ("F32", 1, 4), 1: ("F16", 1, 2), 8: ("Q8_0", 32, 34), 12: ("Q4_K", 25
 def _f16(b): return b.copy().view(np.float16)[..., 0].astype(np.float32)
 
 def dequant_q4_k(blk):
-  """[nb, 144] Q4_K super-blocks -> float32 [nb, 256] (ggml's dequantize_row_q4_K): d, dmin, 12 bytes of eight 6-bit
-  (scale, min) pairs, 128 bytes of nibbles; sub-block j of 32: d * sc_j * q - dmin * m_j, the low nibbles then the high ones of
-  each 32 bytes."""
+  """[nb, 144] Q4_K super-blocks -> float32 [nb, 256], per the GGUF format's Q4_K layout (the values ggml's own dequantisation
+  gives): d, dmin, 12 bytes of eight 6-bit (scale, min) pairs, 128 bytes of nibbles; sub-block j of 32: d * sc_j * q - dmin * m_j,
+  the low nibbles then the high ones of each 32 bytes."""
   d, dmin, sc, qs = _f16(blk[:, 0:2]), _f16(blk[:, 2:4]), blk[:, 4:16].astype(np.int32), blk[:, 16:144]
   s = np.empty((blk.shape[0], 8), np.int32); m = np.empty_like(s)
   s[:, :4], m[:, :4] = sc[:, 0:4] & 63, sc[:, 4:8] & 63
@@ -24,8 +24,8 @@ def dequant_q4_k(blk):
   return (d[:, None, None] * s[..., None] * q - dmin[:, None, None] * m[..., None]).reshape(-1, 256)
 
 def dequant_q6_k(blk):
-  """[nb, 210] Q6_K super-blocks -> float32 [nb, 256] (ggml's dequantize_row_q6_K): 128 bytes of low nibbles, 64 of high
-  2-bit pairs, 16 int8 scales (one per 16 weights), d; w = d * sc * (q - 32)."""
+  """[nb, 210] Q6_K super-blocks -> float32 [nb, 256], per the GGUF format's Q6_K layout (the values ggml's own dequantisation
+  gives): 128 bytes of low nibbles, 64 of high 2-bit pairs, 16 int8 scales (one per 16 weights), d; w = d * sc * (q - 32)."""
   ql, qh, sc, d = blk[:, 0:128].astype(np.int32), blk[:, 128:192].astype(np.int32), blk[:, 192:208].copy().view(np.int8).astype(np.float32), _f16(blk[:, 208:210])
   out = np.empty((blk.shape[0], 256), np.float32)
   for n in range(2):                                                          # two halves of 128 weights

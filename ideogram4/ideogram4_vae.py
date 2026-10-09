@@ -1,19 +1,18 @@
 #!/usr/bin/env python3
-"""Ideogram 4's VAE DECODER (`AutoencoderKLFlux2`, diffusers' generic `Decoder`) in float32 numpy:
-packed latents `[T, 128]` -> an RGB image. The pipeline's tail, ported from `pipeline_ideogram4.py`
-(the BatchNorm un-normalization and the un-patchify) and diffusers' `vae.Decoder` /
-`ResnetBlock2D` / `UNetMidBlock2D` / `UpDecoderBlock2D` / `Upsample2D` at commit 04b197ee.
+"""Ideogram 4's VAE decoder in float32 numpy: packed latents `[T, 128]` -> an RGB image. Written from the checkpoint's `vae`
+folder -- its config.json (`AutoencoderKLFlux2`: latent_channels 32, patch_size 2 x 2, block_out_channels, layers_per_block)
+and its tensors' names and shapes -- and the standard KL-VAE decoder architecture they describe:
 
-    z = latents * bn_std + bn_mean                       (per packed channel, running stats)
-    z: [T, 128] -> [32, gh*2, gw*2]                      (patch 2x2, channel-major)
+    z = latents x sqrt(running_var + eps) + running_mean   (the latents' per-channel BatchNorm statistics, undone)
+    z: [T, 128] -> [32, gh*2, gw*2]                      (a token holds a 2 x 2 patch: channel (py * 2 + px) * 32 + c)
     post_quant_conv (1x1) -> conv_in (3x3, 32 -> 512)
     mid: resnet, attention (1 head of 512, GroupNorm, residual), resnet
     up blocks over [512, 512, 256, 128]: 3 resnets each, nearest 2x + 3x3 conv between blocks
     GroupNorm(32, eps 1e-6) -> silu -> conv_out (3x3, 128 -> 3) -> (x/2 + 0.5) clipped to [0, 1]
 
-ResnetBlock2D: GN -> silu -> conv1 -> GN -> silu -> conv2, + the input (1x1 `conv_shortcut` when
-the width changes), output_scale_factor 1. Convolutions by im2col on a workstation's BLAS: a 256 px
-image decodes in seconds; the board's numpy (no BLAS) would take minutes.
+A resnet: GN -> silu -> conv1 -> GN -> silu -> conv2, + the input (through the 1x1 `conv_shortcut` when the width changes).
+Convolutions by im2col on a workstation's BLAS: a 256 px image decodes in seconds; the board's numpy (no BLAS) would take
+minutes.
 """
 import os, sys
 import numpy as np
@@ -56,7 +55,8 @@ class VAEDecoder:
     def __init__(self, folder="~/ideogram4/vae"):
         self.W = W = Ideogram4Weights(folder)
         self.cfg = W.config
-        self.bn_mean = W.get("bn.running_mean"); self.bn_std = np.sqrt(W.get("bn.running_var") + self.cfg["batch_norm_eps"])
+        # a packed channel's statistics: the latents are stored normalised by them
+        self.lat_mean, self.lat_scale = W.get("bn.running_mean"), np.sqrt(W.get("bn.running_var") + self.cfg["batch_norm_eps"])
         self.patch = tuple(self.cfg["patch_size"]); self.latent_channels = self.cfg["latent_channels"]
 
     def _w(self, n): return self.W.get(n)
@@ -81,10 +81,13 @@ class VAEDecoder:
         return x + o.T.reshape(c, h, w)
 
     def unpack(self, latents, grid):
-        """`[T, 128]` packed -> `[32, gh*2, gw*2]` (the pipeline's bn un-normalization + un-patchify)."""
-        gh, gw = grid; ph, pw = self.patch; c = self.latent_channels
-        z = latents.astype(np.float32) * self.bn_std + self.bn_mean
-        z = z.reshape(gh, gw, ph, pw, c).transpose(4, 0, 2, 1, 3).reshape(c, gh * ph, gw * pw)
+        """`[T, 128]` packed -> `[32, gh*2, gw*2]`: the statistics restored, then each token's patch put in its place -- the
+        token of grid cell (i, j) holds pixel (i ph + py, j pw + px) of channel c at (py pw + px) C + c."""
+        gh, gw = grid; ph, pw = self.patch; C = self.latent_channels
+        tok = (latents.astype(np.float32) * self.lat_scale + self.lat_mean).reshape(gh, gw, ph * pw, C)
+        z = np.empty((C, gh * ph, gw * pw), np.float32)
+        for py in range(ph):
+            for px in range(pw): z[:, py::ph, px::pw] = tok[:, :, py * pw + px].transpose(2, 0, 1)
         return z
 
     def decode(self, latents, grid, log=None):

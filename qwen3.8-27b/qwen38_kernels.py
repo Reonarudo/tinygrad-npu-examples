@@ -3325,7 +3325,7 @@ __kernel void attn_comb(__global float* restrict o_rows, __global float* restric
   }}
 }}"""
 
-# ---- the full-attention PREFILL without cached row traffic (QWEN_ATTN_PREFILL=csrc; generate.py). The tinygrad prefill attention
+# ---- the full-attention PREFILL without cached row traffic (QWEN_ATTN_PREFILL=csrc; qwen38_generate.py). The tinygrad prefill attention
 # (the score kernel r_2_8_8_4_3_3_3_64_4 / r_2_16_16_4_3_3_3_64_4 and o = softmax(s) V * gate, r_2_24_64_4_4_3_24) runs as 4 tasks
 # on one core and walks rows at pitches that are multiples of 8 KiB (q 24 / 48 KiB, k 4 KiB, v 8 KiB, o 24 KiB) with stack spills
 # beside them: the 4-TEC same-set load + write-back burst of gdn_tokm's hang (a data-cache set-conflict hazard). Here

@@ -319,7 +319,8 @@ __kernel void {name}(__global float* restrict o_rows, __global float* restrict p
 
 
 def bench_arm(kern, NH, NKV, HD, TMAX, ROT, eps, M, opts, I, desc, part):
-  """abench.py's hook: (src, kernel name, output floats, input tensors) for kern gqa / comb2 with opts (tree, BT<n>, NTE<n>)."""
+  """A benchmark harness's hook (the harness is not part of this repository): (src, kernel name, output floats, input tensors) for
+  kern gqa / comb2 with opts (tree, BT<n>, NTE<n>)."""
   K = _K(); from tinygrad import Tensor; DEV = "ZHOUYI"
   o = {x.rstrip("0123456789"): (int(x[len(x.rstrip("0123456789")):]) if x[-1].isdigit() else True) for x in opts}
   P = K.attn_parts(NH, HD, TMAX); PW = HD + 16
