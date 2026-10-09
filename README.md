@@ -4,6 +4,10 @@
 
 *Ternary Bonsai 2 27B on the board's NPU, served over the Ollama API ([how](bonsai2-27b/README.md#serve-openai--and-ollama-compatible-api)) and asked with `ollama run --verbose` from a Mac: 208 tokens at 4.8 tok/s.*
 
+![Gemma 4 E2B served from a Radxa Orion O6N's NPU, asked through the Ollama CLI on a Mac](gemma4/serve-demo.gif)
+
+*Gemma 4 E2B on the board's NPU, served over the Ollama API ([how](gemma4/README.md#serve-openai--and-ollama-compatible-api)) and asked with `ollama run --verbose` from a Mac: 230 tokens at 23 tok/s with speculative decoding.*
+
 Worked examples that run real models on the Arm China Zhouyi X2 NPU of the CIX P1 (CD8180), as found on the Radxa Orion O6N,
 through the `ZHOUYI` backend of [tinygrad](https://github.com/Reonarudo/tinygrad/tree/zhouyi). The backend is included as the
 `tinygrad/` submodule (branch `zhouyi`). Each example downloads its model, packs the weights into the layout the NPU streams,

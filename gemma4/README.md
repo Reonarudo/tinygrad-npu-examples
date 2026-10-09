@@ -97,9 +97,9 @@ python3 gemma4_mtp.py --mtp $GEMMA_DIR/mtp-gemma-4-E4B-it-Q8_0.gguf --out /mnt/s
 
 ## Run
 
-The generator takes the prompt as **token ids** with Gemma's chat template already applied (there is no tokenizer in this
-example yet), and prints the generated ids. Without ids it runs a built-in prompt (*"What is the capital of Portugal? Answer in
-one sentence."*). The Fibonacci prompt the speeds below were measured on
+The generator takes the prompt as **token ids** with Gemma's chat template already applied (`gemma4_tokenize.py` prints them for a
+prompt; the [server](#serve-openai--and-ollama-compatible-api) takes text), and prints the generated ids. Without ids it runs a built-in prompt (*"What is the capital of
+Portugal? Answer in one sentence."*). The Fibonacci prompt the speeds below were measured on
 (`<bos><|turn>user\nWrite a Python function that returns the n-th Fibonacci number.<turn|>\n<|turn>model\n`):
 
 ```sh
@@ -116,6 +116,29 @@ must fit; a 1074-token prompt needs `--tmax 2048`), `--json out.json` (the ids a
 greedy ids alongside: slow, a reference forward pass on the host).
 
 Every token id prints when the run ends; decode them with any Gemma 4 tokenizer.
+
+## Serve (OpenAI- and Ollama-compatible API)
+
+![Gemma 4 E2B served from the board, asked through the Ollama CLI](serve-demo.gif)
+
+*Gemma 4 E2B served from the board and asked with `ollama run --verbose` from another machine: 230 tokens at 23 tok/s
+(speculative decoding, a code prompt). Recorded without anyone at the keyboard by [`demo/make_demo.sh`](demo/make_demo.sh).*
+
+`gemma4_serve.py` serves the model over HTTP with Qwen3.8's server (`../qwen3.8-27b/qwen38_serve.py`): the OpenAI routes
+(`/v1/chat/completions`, `/v1/completions`, `/v1/models`) and Ollama's (`/api/chat`, `/api/generate`, `/api/tags`, ...), one
+request at a time, greedy, the text streamed as the verify passes accept it. It takes text: the tokenizer and the chat template
+come from the GGUF itself (`gemma4_tokenize.py`, the same ids as llama.cpp's tokenizer), with thinking off.
+
+```sh
+python3 gemma4_serve.py --host 0.0.0.0 --port 8000         # E2B; --cache /mnt/ssd/gemma4-e4b-npu for E4B (gemma4-e4b)
+OLLAMA_HOST=http://<board>:8000 ollama run --verbose gemma4-e2b "Hello"
+curl <board>:8000/v1/chat/completions -H 'Content-Type: application/json' \
+     -d '{"model": "gemma4-e2b", "messages": [{"role": "user", "content": "Hello"}], "stream": true}'
+```
+
+Options: `--cache`, `--tmax` (prompt + output, default 1024), `--spec` / `--tau` / `--prefill-m` as the generator's. The set-up
+(weights, graphs of every verify geometry, the drafter) takes ~50 s before the first request. `python3 gemma4_tokenize.py
+"prompt"` prints a prompt's ids for the generator.
 
 ## Speed
 
@@ -233,7 +256,7 @@ residual adds) ~8 ms; the launches inside the jobs ~4 ms; the host and the 9 job
 
 ## Limits, not yet
 
-- **Token ids in and out:** no tokenizer or chat template yet.
+- **Thinking off:** the chat template's thinking mode is not wired into the server.
 - **E2B and E4B only.** The 12B and the 26B mixture of experts need more than this example has.
 - **The GGUF stays on disk** next to the cache: the host reads each token's embedding and per-layer-embedding rows from it.
 
@@ -268,6 +291,9 @@ residual adds) ~8 ms; the launches inside the jobs ~4 ms; the host and the 9 job
 | `gemma4_kernels.py` | the hand-written kernels Gemma 4 adds to the Qwen family's: attention, the post-norm residual, the per-layer-embedding gate and inputs |
 | `gemma4_ref.py` | the numpy reference forward pass, straight from the GGUF (and the draft head's) |
 | `check/mtp_accept.py` | the draft head's acceptance against its target, in numpy |
+| `gemma4_tokenize.py` | the tokenizer and the chat template, from the GGUF |
+| `gemma4_serve.py` | the OpenAI- and Ollama-compatible server |
+| `demo/` | `serve-demo.gif`'s recording: `make_demo.sh` and its VHS tape |
 | `check/mtp_npu.py` | the draft head on the NPU against numpy |
 | `check/spec_numpy.py` | `spec_generate` on the numpy reference: its ids against plain greedy decoding |
 | `check/geo_bench.py` | the time of a pass at each row geometry, and of a draft step (`--draft`) |

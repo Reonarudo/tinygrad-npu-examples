@@ -261,15 +261,17 @@ class Model:
     if timing is not None: timing.update(prefill_s=t1 - t0, decode_s=dt, steps=ts)
     return out
 
-  def spec_generate(self, ids, n_new, dr, kmax, tau=0.0, stop=(1, 106), timing=None, pm=8, stats=None, geos=None):
+  def spec_generate(self, ids, n_new, dr, kmax, tau=0.0, stop=(1, 106), timing=None, pm=8, stats=None, geos=None, on_new=None):
     """Greedy speculative decoding with the MTP drafter `dr` (gemma4_mtp.Drafter): each pass verifies [cur, d1 .. dk] (k <= kmax
     drafts chained at cur's position; the chain stops after a draft below tau) on geometry 1 + k, keeps the drafts the model agrees
     with plus its own next token. The commit is the K / V rows alone: the accepted rows stay, the rejected ones sit at positions
     the next pass rewrites before any row reads them (the local rings hold W + 16 >= W + 11 rows; the KV-shared layers read their
-    sources' rows of the same pass). The ids are those of plain greedy decoding up to the geometries' rounding (near-ties)."""
+    sources' rows of the same pass). The ids are those of plain greedy decoding up to the geometries' rounding (near-ties).
+    on_new(tokens): called with the first token, then with each pass's new tokens (gemma4_serve streams them)."""
     st = {} if stats is None else stats; t0 = time.perf_counter(); ids = list(ids)
     nxt = self.prefill(ids, pm); pos = len(ids); h = self.hidden(*self.last_rows); out, cur = [nxt], nxt; t1 = time.perf_counter()
     print(f"   prefill {len(ids)} tokens: {t1 - t0:.2f} s ({pm} tokens a pass; {len(ids) / (t1 - t0):.1f} tok/s)", flush=True)
+    if on_new: on_new([nxt])
     st.update(passes=0, accepted=0, drafted=0, rows=[], draft_log=[], t_draft=0.0, t_verify=0.0)
     while len(out) < n_new and cur not in stop:
       td = time.perf_counter(); d, pr = dr.chain(cur, h, pos, kmax, tau); td = time.perf_counter() - td
@@ -281,9 +283,11 @@ class Model:
       new = toks[1:a] + [int(g[a - 1])]
       st["draft_log"].extend((j, pr[j], j < a - 1) for j in range(len(d))); st["rows"].append(m)
       st["passes"] += 1; st["accepted"] += a - 1; st["drafted"] += len(d); st["t_draft"] += td; st["t_verify"] += tv
+      n0 = len(out)
       for t in new:
         out.append(t)
         if t in stop or len(out) >= n_new: break
+      if on_new: on_new(out[n0:])
       if out[-1] in stop: break                                            # (an accepted draft can be the end of turn)
       cur = int(g[a - 1]); h = self.hidden(m, a - 1); pos += a
     dt = time.perf_counter() - t1; nt = len(out) - 1

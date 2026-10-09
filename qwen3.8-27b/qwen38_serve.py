@@ -25,7 +25,6 @@ os.environ.setdefault("QWEN_PREFILL", "chunked")
 os.environ.setdefault("QWEN_SPEC", "6")                   # the server runs the verify path: speculative decoding up to 6 rows unless set
                                                           # (bonsai2_serve / ornith set their own defaults before this import)
 import numpy as np                                                        # noqa: E402
-import qwen38_generate as G                                               # noqa: E402
 from qwen38_tokenize import Tok, chat_messages, EOS                       # noqa: E402
 
 class Stop(Exception): pass
@@ -35,6 +34,7 @@ OLLAMA_DETAILS = {"format": "npu", "family": "qwen35", "families": ["qwen35"], "
 class Engine:
   """The model and its one-request-at-a-time generation (`run` yields text deltas)."""
   def __init__(self, a):
+    import qwen38_generate as G                                           # (imported here: gemma4_serve uses this module for its HTTP side only)
     self.cpus, self.lat = G.pin_cpus(), G.hold_cpu_latency()
     self.tok = Tok(os.environ.get("QWEN_TOK", a.dir)); self.tmax, self.lock, self.jobs = a.tmax, threading.Lock(), queue.Queue()
     t0 = time.perf_counter(); self.M = G.Model(12, a.cache, a.dir, a.tmax, a.pin_gb)
@@ -80,7 +80,7 @@ class Engine:
       except Stop: pass
     return min(len(out), max_new), finish[0]
 
-def make_handler(eng, name):
+def make_handler(eng, name, chat_messages=chat_messages, details=OLLAMA_DETAILS):
   class H(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
     def log_message(self, fmt, *args): print("   " + fmt % args, flush=True)
@@ -100,7 +100,7 @@ def make_handler(eng, name):
       try: req = json.loads(self.rfile.read(int(self.headers.get("Content-Length", 0))) or b"{}")
       except ValueError: return self._json(400, {"error": "the body is not JSON"})
       if route == "/api/show":
-        return self._json(200, {"modelfile": "", "parameters": "", "template": "", "details": OLLAMA_DETAILS, "model_info": {}, "capabilities": ["completion"]})
+        return self._json(200, {"modelfile": "", "parameters": "", "template": "", "details": details, "model_info": {}, "capabilities": ["completion"]})
       if (route == "/api/generate" and not req.get("prompt")) or (route == "/api/chat" and not req.get("messages")):   # a client's "load the model" call
         return self._json(200, {"model": name, "created_at": time.strftime("%Y-%m-%dT%H:%M:%S.000Z", time.gmtime()), "done": True, "done_reason": "load",
                                 **({"message": {"role": "assistant", "content": ""}} if route == "/api/chat" else {"response": ""})})
@@ -136,9 +136,9 @@ def make_handler(eng, name):
     def do_GET(self):
       route = self._route()
       if route == "/api/tags":
-        return self._json(200, {"models": [{"name": name, "model": name, "modified_at": "2026-10-05T00:00:00Z", "size": 0, "digest": "0" * 64, "details": OLLAMA_DETAILS}]})
+        return self._json(200, {"models": [{"name": name, "model": name, "modified_at": "2026-10-05T00:00:00Z", "size": 0, "digest": "0" * 64, "details": details}]})
       if route == "/api/version": return self._json(200, {"version": "0.5.0"})
-      if route == "/api/ps": return self._json(200, {"models": [{"name": name, "model": name, "size": 0, "digest": "0" * 64, "details": OLLAMA_DETAILS}]})
+      if route == "/api/ps": return self._json(200, {"models": [{"name": name, "model": name, "size": 0, "digest": "0" * 64, "details": details}]})
       if route == "/": return self._json(200, {"status": "ok"})
       if self.path.rstrip("/") in ("/v1/models", "/models"):
         return self._json(200, {"object": "list", "data": [{"id": name, "object": "model", "created": 0, "owned_by": "local"}]})
