@@ -26,6 +26,7 @@ from gguf_read import GGUF                                                     #
 
 PTQ1_0, QK, BLOCK_BYTES = 143, 128, 28
 gguf_read.GGML[PTQ1_0] = ("PTQ1_0", QK, BLOCK_BYTES)                           # the type's block: 128 weights in 2 + 24 + 2 bytes
+gguf_read.GGML[142] = ("PQ2_0", 128, 34)                                       # the MTP files' trunk (2-bit codes + fp16 d; not decoded here)
 
 _POW3 = np.array([1, 3, 9, 27, 81], np.uint32)
 _b = np.arange(256, dtype=np.uint32)[:, None]
@@ -62,12 +63,15 @@ class Hadamard:
   """The prism.hadamard.* contract of a GGUF: `latent(x)` maps an activation to the folded weights' basis (Hb (s * x)), `primal(z)`
   undoes it for the latent embedding (s * (Hb z)). Both act on the last axis, blockwise; x may be any [..., K]."""
   def __init__(self, meta):
-    self.version = int(meta["prism.hadamard.version"]); assert self.version == 1, self.version   # v2 (tied output) not handled
+    self.version = int(meta["prism.hadamard.version"]); assert self.version in (1, 2), self.version
+    self.tied = bool(meta.get("prism.hadamard.tied_output", False)); assert self.tied == (self.version == 2), (self.version, self.tied)
     self.block = int(meta["prism.hadamard.block_size"])
     assert meta["prism.hadamard.transform"] == "normalized-sylvester-walsh-hadamard"
     assert meta["prism.hadamard.axis"] == "input-last-dimension"
     self.sign_mode = meta["prism.hadamard.sign_mode"]
     self.weights = set(meta["prism.hadamard.weight_names"]); self.inverse = set(meta.get("prism.hadamard.inverse_weight_names", []))
+    if self.tied:                                         # v2: the latent embedding z = Hb (s * e) is also the head, a folded weight
+      assert "token_embd.weight" in self.inverse; self.weights.add("token_embd.weight")   # (row v of W diag(s) Hb is Hb (s * e_v))
     self.gdn_v_grouped = bool(meta.get("prism.hadamard.gdn_v_grouped", False))
     self.signs = {}
     if self.sign_mode == "explicit":                                            # one +-1 vector per input width, concatenated

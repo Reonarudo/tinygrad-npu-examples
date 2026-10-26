@@ -225,7 +225,7 @@ class Model:
       for stack, key in ((self.Win_a, "input_layernorm_weight"), (self.Wpost_a, "post_attention_layernorm_weight")):
         stack[i * R.H:(i + 1) * R.H].assign(dev(np.ascontiguousarray(small[key]).reshape(-1))).realize()
     self.xb = [K.rows_buf("xio0", R.H), K.rows_buf("xio1", R.H)]                             # decode: the residual stream ping-pongs between two persistent buffers
-    self.jit_gdn, self.jit_att = [None, None], [None, None]
+    self.jit_gdn, self.jit_att = {}, {}                                   # keyed (parity, the layer's kind: Layers.kind(l), None unless the streams differ by layer)
     self.cos_dec, self.sin_dec = {}, {}
     # speculative decoding: M rows (the token + M - 1 drafts) a verify pass; the Q8_0 models prefill through the same geometries
     self.M = int(os.environ.get("QWEN_SPEC", spec_default))
@@ -807,12 +807,12 @@ class Model:
         slot, meta, sm = L.load(l); par = l % 2
         if R.LAYER_TYPES[l] == "full":
           self.meta_att = meta
-          if (M, par) not in self.jit_vatt: self.jit_vatt[(M, par)] = TinyJit(functools.partial(self.vatt_step, M, par))
-          self.jit_vatt[(M, par)](self.aix[self.aidx[l]], *[slot[k] for k in self.ATT_LIN])
+          if (kp := (M, par, L.kind(l))) not in self.jit_vatt: self.jit_vatt[kp] = TinyJit(functools.partial(self.vatt_step, M, par))
+          self.jit_vatt[kp](self.aix[self.aidx[l]], *[slot[k] for k in self.ATT_LIN])
         else:
           self.meta_gdn = meta
-          if (M, par) not in self.jit_vgdn: self.jit_vgdn[(M, par)] = TinyJit(functools.partial(self.vgdn_step, M, par))
-          self.jit_vgdn[(M, par)](self.sidx[self.gidx[l]], *[slot[k] for k in self.GDN_LIN])
+          if (kp := (M, par, L.kind(l))) not in self.jit_vgdn: self.jit_vgdn[kp] = TinyJit(functools.partial(self.vgdn_step, M, par))
+          self.jit_vgdn[kp](self.sidx[self.gidx[l]], *[slot[k] for k in self.GDN_LIN])
         if late: L.after_submit(l)
       if late: zc["late_refill"] = False
     if not NPU_IDS or self.dump is not None or getattr(self, "_prompt_pass", False): self.v_hidden = OA.host_invalidate(xbv[0]).numpy()[:M].copy()   # the MTP draft head's input
@@ -1112,12 +1112,12 @@ class Model:
       slot, meta, sm = L.load(l); par = l % 2
       if R.LAYER_TYPES[l] == "full":
         self.meta_att = meta
-        if self.jit_att[par] is None: self.jit_att[par] = TinyJit(functools.partial(self.att_step, par))
-        self.jit_att[par](self.aix[self.aidx[l]], self.cos_dec[pos], self.sin_dec[pos], *[slot[k] for k in self.ATT_LIN], *[sm[k] for k in self.ATT_SMALL])
+        if (kp := (par, L.kind(l))) not in self.jit_att: self.jit_att[kp] = TinyJit(functools.partial(self.att_step, par))
+        self.jit_att[kp](self.aix[self.aidx[l]], self.cos_dec[pos], self.sin_dec[pos], *[slot[k] for k in self.ATT_LIN], *[sm[k] for k in self.ATT_SMALL])
       else:
         self.meta_gdn = meta
-        if self.jit_gdn[par] is None: self.jit_gdn[par] = TinyJit(functools.partial(self.gdn_step, par))
-        self.jit_gdn[par](self.sidx[self.gidx[l]], *[slot[k] for k in self.GDN_LIN], *[sm[k] for k in self.GDN_SMALL])
+        if (kp := (par, L.kind(l))) not in self.jit_gdn: self.jit_gdn[kp] = TinyJit(functools.partial(self.gdn_step, par))
+        self.jit_gdn[kp](self.sidx[self.gidx[l]], *[slot[k] for k in self.GDN_LIN], *[sm[k] for k in self.GDN_SMALL])
     if self.dump is not None: self.dump.append(OA.host_invalidate(self.xb[0]).numpy()[0].copy())
     return self.logits(L, self.xb[0], 0)                                   # 64 layers: the last (parity 1) wrote xb[0]
 

@@ -12,7 +12,7 @@ sys.path.insert(0, os.path.expanduser(os.environ.get("TG", os.path.join(os.path.
 from tinygrad import Tensor, dtypes                                      # noqa: E402
 from zy import OA, gemm_plan as GP                                       # noqa: E402
 import qwen38_ref as R                                                   # noqa: E402
-from qwen38_kernels import Kernels, NT, gdn_hpt, ring_pitch                       # noqa: E402
+from qwen38_kernels import Kernels, NT, HAD_B, gdn_hpt, ring_pitch                       # noqa: E402
 GDN_TOK = os.environ.get("QWEN_GDN_TOK", "3")      # the decode DeltaNet step: 3 = gdn_tok3 (folded), 2 = gdn_tok2, 1 = gdn_tok
 
 # Q8MODE (the Q8_0 models): 1 = gemm_gs(q8) -- a K-slice one 32-weight scale block, corrected and scaled per slice --; 2 = the
@@ -112,6 +112,7 @@ class Layers:
     if self.had:                 # rotated linear inputs: the producers transform (Kernels.had), the norms' 1 + w carry the signs (_meta)
       assert TERN, f"{cache}: QWEN_MODEL={R.MODEL} needs its ternary cache (a `tern` marker; set QWEN_NPU to it)"
       self.signs, self.K.had_post = had_signs(cache); self.K.had = {w: dev(v) for w, v in self.signs.items()}
+      self.K.had_b = min(R.HADB, HAD_B); self.K.had_g = R.HADB // self.K.had_b; assert self.K.had_g * self.K.had_b == R.HADB, R.HADB
     self.piece = self.nrb if self.nrb < 4 else 0     # rows mode (decode, the fp8 head): one piece; full row blocks ask gemm_plan (lin_ct)
     inv = 1.0 / (R.THETA ** (np.arange(0, R.ROT, 2, dtype=np.float64) / R.ROT)); f = np.arange(self.R, dtype=np.float64)[:, None] * inv[None]
     emb = np.concatenate([f, f], -1)
@@ -147,6 +148,7 @@ class Layers:
         meta = dict(fused, _sub=sub)
       self._metas[l] = (meta, small)
     return self._metas[l]
+  def kind(self, l): return None                                           # a layer's kernel kind (the JIT keys): None when every layer of a type has the same streams
   @staticmethod
   def files(meta): return [k for k in meta if not k.startswith("_")]        # the linears with a stream file (a fused one for its parts)
   def _slot_buf(self, l, k, size):
@@ -169,7 +171,10 @@ class Layers:
     from tinygrad import Device
     raw = Device[DEV].raw; t0 = time.perf_counter(); zc = self.zc
     packs = {l: self._pack(l) for l in range(R.NL)}; tot = {l: p_[2] for l, p_ in packs.items()}; big = max(tot.values())
-    try: slots = [raw.slot_alloc(big) for _ in range(2)]
+    # the head's parts map into these slots too: the larger of a layer and a part (Bonsai 2 9B: a part 67.7 MB, a layer 63)
+    heads = [os.path.join(self.cache, f) for f in os.listdir(self.cache) if f.startswith(f"{R.HEAD}_") and f.endswith(".bin")]
+    slot = max([big] + [os.path.getsize(f) for f in heads])
+    try: slots = [raw.slot_alloc(slot) for _ in range(2)]
     except OSError as e: print(f"   zero-copy unavailable ({e}); copying the weights", flush=True); return False
     budget = gb * 1e9 - 2 * big                                                   # the two staging buffers are inside the budget
     staging = [raw.wbuf_alloc(big) for _ in range(2)]                            # first, while contiguous memory is plentiful
@@ -195,7 +200,7 @@ class Layers:
       for lt in ("linear", "full"):
         l0 = R.LAYER_TYPES.index(lt); sizes, offs, _ = packs[l0]
         views[(par, lt)] = {k_: Tensor.from_blob(slots[par][1] + offs[k_], (sz,), dtype=dtypes.uint8, device=DEV) for k_, sz in sizes.items()}
-    zc.update(raw=raw, slots=slots, views=views, packs=packs, wbufs=wbufs, stream=stream, staging=staging, st_layer=[None, None],
+    zc.update(raw=raw, slot=slot, slots=slots, views=views, packs=packs, wbufs=wbufs, stream=stream, staging=staging, st_layer=[None, None],
               st_thread=[None, None], st_free=[], st_next=0)
     for i in range(len(staging)): self._stage_fill(i)
     if DEBUG_LOAD: print(f"   zero-copy: {len(wbufs)} layers in weight buffers, {held / 1e9:.1f} GB in {time.perf_counter() - t0:.0f} s; streamed "
@@ -231,7 +236,7 @@ class Layers:
     """The 2 k block slots (allocated once, shared with the other geometries through `zc`) -> {(bp, j): (sid, pa)}."""
     zc = self.zc
     if zc.get("bslots") is None or len(zc["bslots"]) != 2 * k:
-      big = max(p_[2] for p_ in zc["packs"].values()); raw = zc["raw"]
+      big = zc.get("slot") or max(p_[2] for p_ in zc["packs"].values()); raw = zc["raw"]
       zc["bslots"] = {(bp, j): (zc["slots"][bp] if j == 0 else raw.slot_alloc(big)) for bp in range(2) for j in range(k)}
       zc["bviews"], zc["bsize"] = {}, big
     return zc["bslots"]

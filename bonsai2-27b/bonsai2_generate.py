@@ -13,12 +13,16 @@ Options: QWEN_MTP_HEAD=qwen drafts through Qwen3.8-27B's fp8 head (QWEN_MTP_CACH
 and --lm-head-fp8; +3 %), QWEN_MTP_EMBED=qwen through its embedding table (QWEN_MTP_DIR = the Qwen3.8-27B-FP8 folder). The drafting
 defaults below were tuned on the board for each head (README); each can be overridden."""
 import os, sys
-os.environ.setdefault("QWEN_MODEL", "bonsai2-27b")
+os.environ.setdefault("QWEN_MODEL", "bonsai2-27b")       # or bonsai2-9b / -4b / -2b (their drafters: bonsai2_pack.py --mtp-gguf)
+HERE = os.path.dirname(os.path.abspath(__file__)); sys.path.insert(0, HERE); sys.path.insert(0, os.path.join(HERE, "..", "qwen3.8-27b"))
+from bonsai2_weights import PATHS                       # noqa: E402
+import qwen38_ref as R                                  # noqa: E402  (the profile: NL, the MTP layer's index)
 os.environ.setdefault("DEV", "ZHOUYI")                  # tinygrad's default device
-os.environ.setdefault("QWEN_NPU", "/mnt/ssd/bonsai2-npu")
-os.environ.setdefault("QWEN_DIR", os.environ.get("BONSAI_GGUF", "/mnt/ssd/bonsai2/Ternary-Bonsai-2-27B-PTQ1_0.gguf"))
+os.environ.setdefault("QWEN_NPU", PATHS[os.environ["QWEN_MODEL"]][1])
+os.environ.setdefault("QWEN_DIR", os.environ.get("BONSAI_GGUF", PATHS[os.environ["QWEN_MODEL"]][0]))
 os.environ.setdefault("QWEN_TOK", os.environ["QWEN_NPU"])
-os.environ.setdefault("QWEN_NPU_IDS", "1")                 # the decode loop's token ids chosen, embedded, accepted and drafted on the NPU
+if os.environ["QWEN_MODEL"] != "bonsai2-27b":           # the one-pass prefill's DeltaNet kernel (gdn_lsr) splits 48 value heads over 12 TECs;
+  os.environ.setdefault("QWEN_PREFILL", "chunked")      # 32 (9B / 4B) or 16 (2B) take the chunked prefill, as Ornith-9B does
 os.environ.setdefault("ZHOUYI_TEXT_GM", "1")              # kernel code fetched from the cluster's GM, not DDR (4.4x cheaper cold fetch; -17 ms a verify pass)
 os.environ.setdefault("ZHOUYI_CHAIN_MAX", "16")           # a layer's launches as one job (8: two); -16 ms a 4-row verify pass
 os.environ.setdefault("QWEN_LAYER_BLOCK", "4")            # the verify pass's layers 4 at a time, a block one job (and the head one job)
@@ -33,10 +37,15 @@ QHEAD = os.environ["QWEN_MTP_HEAD"] == "qwen"            # Qwen3.8-27B's fp8 hea
 os.environ.setdefault("QWEN_DRAFT_TAU", "0.4" if QHEAD else "0.2")
 os.environ.setdefault("QWEN_DRAFT_PARTS", "2,thresh:20" if QHEAD else "2")
 mtp = os.path.expanduser(os.environ.get("QWEN_MTP_CACHE", os.path.join(os.environ["QWEN_NPU"], "mtp")))
-if os.environ["QWEN_SPEC"] != "0" and not os.path.exists(os.path.join(mtp, "L64_small.npz")):
+drafter = os.path.exists(os.path.join(mtp, f"L{R.NL}_small.npz"))
+if os.environ["QWEN_SPEC"] != "0" and not drafter:
   print(f"   no drafter in {mtp} (bonsai2_pack.py --mtp <Qwen3.8-27B-FP8 folder>, or QWEN_MTP_CACHE): plain decoding", flush=True)
-  os.environ["QWEN_SPEC"] = "0"
-HERE = os.path.dirname(os.path.abspath(__file__)); sys.path.insert(0, os.path.join(HERE, "..", "qwen3.8-27b")); sys.path.insert(0, HERE)
+  # the 27B prefills in one pass; the smaller sizes' chunked prefill runs on the verify geometries, so they stay (no MTP layer loaded)
+  if os.environ["QWEN_MODEL"] == "bonsai2-27b": os.environ["QWEN_SPEC"] = "0"
+  else: os.environ.setdefault("QWEN_DRAFT", "none")
+# the decode loop's token ids chosen, embedded, accepted and drafted on the NPU: with the drafter, on the 27B (its embedding kernel
+# holds one 1024 block; the 9B's is 4096)
+os.environ.setdefault("QWEN_NPU_IDS", "1" if os.environ["QWEN_SPEC"] != "0" and drafter and os.environ["QWEN_MODEL"] == "bonsai2-27b" else "0")
 import qwen38_generate                                                   # noqa: E402
 
 if __name__ == "__main__": qwen38_generate.main()

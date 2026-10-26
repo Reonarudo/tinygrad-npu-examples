@@ -300,18 +300,25 @@ __kernel void {stem}_a32d(__global half* restrict out, __global float* restrict 
 
 HAD_B = 1024                                                                # had_a32: the Walsh-Hadamard block (along K)
 
-def had_a32_src(mode, c, nrb, eps, real=None, compact=False, stacked=False, post=1.0):
+def had_a32_src(mode, c, nrb, eps, real=None, compact=False, stacked=False, post=1.0, g=1, hb=HAD_B):
   """The A producers of a model whose linears take their input rotated (QWEN_MODEL=bonsai2-27b: W' = W diag(s) Hb, fed Hb (s * x)):
-  the row values as rms_a32 / swiglu_a32 make them, then the unnormalised Walsh-Hadamard transform over each HAD_B-wide block of
+  the row values as rms_a32 / swiglu_a32 make them, then the unnormalised Walsh-Hadamard transform over each B-wide block of
   K (natural Sylvester order: y[r] = sum_c (-1)^popcount(r & c) x[c]), times `post`, in the A layout (`compact` as rms_a32).
     mode "rms":    v = x * rsqrt(mean(x^2) + eps) * w          (w = (1 + weight) * s: the signs folded into the norm weight)
     mode "plain":  v = x * w                                   (w = s, the signs of K = c)
     mode "swiglu": v = silu(g) * u from the gate | up tiles     (N = 2 c; the signs folded into the up rows' scales)
-  The normalisation 1 / sqrt(HAD_B) is `post` or the GEMM's scale table's (1.0 here). A unit = (row block, block of K); for each of
-  the row block's quads in turn the quad's rows of the block go into LSRAM ([4 rows][HAD_B] fp32, 16 KiB), the 10 butterfly stages
+  The normalisation 1 / sqrt(B) is `post` or the GEMM's scale table's (1.0 here). A unit = (row block, block of K); for each of
+  the row block's quads in turn the quad's rows of the block go into LSRAM ([4 rows][B] fp32, 16 KiB), the 10 butterfly stages
   run there (the 3 in-vector stages by lane shuffles, then radix-4 passes), and the block's 8 K-slices are written. Rows past `real` are written as zeros.
+  `g` > 1: the model's block is g B-blocks (Bonsai 2 9B: 4096 = 4 x 1024), whose transform in natural Sylvester order is
+  H_g (x) H_B = (H_g (x) I)(I (x) H_B): sub-block a of a group is loaded as sum_j (-1)^popcount(a & j) v_j over the group's
+  g sub-blocks (the cross-block stage, fp32, in the load), then transformed as above. The normalisation is the whole block's.
   args: out (half), x (float rows, pitch c; "swiglu": the C tiles), w (float [c]; stacked: [L, c]) [, idx], core_id."""
-  assert mode in ("rms", "plain", "swiglu") and c % HAD_B == 0; nb = c // HAD_B; rbr, iqr = _real(real, nrb)
+  B = hb; assert B in (512, 1024) and (B == HAD_B or g == 1)       # `hb`: the transformed block (Bonsai 2 4B / 2B: 512 = 3 + 3 radix-4 pairs, no last stage)
+  assert mode in ("rms", "plain", "swiglu") and c % (g * B) == 0 and g in (1, 2, 4); nb = c // B; rbr, iqr = _real(real, nrb)
+  # the sub-blocks mixed into block b: (column offset of sub-block j, its sign in row a = b % g); g = 1: block b alone
+  mix = [(f"(b / {g} * {g} + {j}) * {B}", f"sg{j}") for j in range(g)] if g > 1 else [(f"b * {B}", None)]
+  sgs = "".join(f" float sg{j} = ((((b % {g}) & {j}) ^ (((b % {g}) & {j}) >> 1)) & 1) ? -1.0f : 1.0f;" for j in range(g)) if g > 1 else ""
   rows = 12 * rbr if real is None else real; assert not compact or rbr == 1
   # a unit = (row block, block of K) and runs the block's row quads in turn (iqr compact, else 3): the A layout interleaves the
   # quads' 32-byte pieces inside 64-byte lines, and two TECs storing into one line lose one's bytes on the board (resid32_src's
@@ -322,24 +329,28 @@ def had_a32_src(mode, c, nrb, eps, real=None, compact=False, stacked=False, post
     return f"x + ((({col}) / 48 * {nrb} + rb) * 3 + (({col}) % 48) / 16) * 192 + (i * 4 + (({col}) % 16) / 4) * 16"
   if mode == "swiglu":
     load = f"""
-    for (int k = 0; k < {HAD_B}; k += 4) {{
-      int col = b * {HAD_B} + k; __global float* g = {tile("col")}; __global float* p = {tile("col + %d" % c)};
-      float8 t01 = sw(*(__global float8*)(g), *(__global float8*)(p)), t23 = sw(*(__global float8*)(g + 8), *(__global float8*)(p + 8));
-      *(__global float4*)(L + k) = __builtin_shufflevector(t01, t01, 0, 1, 2, 3); *(__global float4*)(L + {HAD_B} + k) = __builtin_shufflevector(t01, t01, 4, 5, 6, 7);
-      *(__global float4*)(L + {2 * HAD_B} + k) = __builtin_shufflevector(t23, t23, 0, 1, 2, 3); *(__global float4*)(L + {3 * HAD_B} + k) = __builtin_shufflevector(t23, t23, 4, 5, 6, 7);
+    for (int k = 0; k < {B}; k += 4) {{{f"""
+      int col = b * {B} + k; __global float* g = {tile("col")}; __global float* p = {tile("col + %d" % c)};
+      float8 t01 = sw(*(__global float8*)(g), *(__global float8*)(p)), t23 = sw(*(__global float8*)(g + 8), *(__global float8*)(p + 8));""" if g == 1 else
+      "\n      float8 t01, t23;" + "".join(f"""
+      {{ int col = {o} + k; __global float* g = {tile("col")}; __global float* p = {tile("col + %d" % c)};
+        float8 u01 = sw(*(__global float8*)(g), *(__global float8*)(p)), u23 = sw(*(__global float8*)(g + 8), *(__global float8*)(p + 8));
+        {"t01 = u01 * BC(%s); t23 = u23 * BC(%s);" % (sj, sj) if j == 0 else "t01 += u01 * BC(%s); t23 += u23 * BC(%s);" % (sj, sj)} }}""" for j, (o, sj) in enumerate(mix))}
+      *(__global float4*)(L + k) = __builtin_shufflevector(t01, t01, 0, 1, 2, 3); *(__global float4*)(L + {B} + k) = __builtin_shufflevector(t01, t01, 4, 5, 6, 7);
+      *(__global float4*)(L + {2 * B} + k) = __builtin_shufflevector(t23, t23, 0, 1, 2, 3); *(__global float4*)(L + {3 * B} + k) = __builtin_shufflevector(t23, t23, 4, 5, 6, 7);
     }}
-    for (int r = nr; r < 4; r++) for (int k = 0; k < {HAD_B}; k += 8) *(__global float8*)(L + r * {HAD_B} + k) = BC(0.0f);"""
+    for (int r = nr; r < 4; r++) for (int k = 0; k < {B}; k += 8) *(__global float8*)(L + r * {B} + k) = BC(0.0f);"""
   else:
     inv = (f"""float8 acc = BC(0.0f); for (int k = 0; k < {c}; k += 8) {{ float8 v = *(__global float8*)(xr + k); acc += v * v; }}
         float inv = 1.0f / __builtin_sqrtf(hsum8(acc) * {1.0 / c!r}f + {eps!r}f);""" if mode == "rms" else "float inv = 1.0f;")
     load = f"""
     for (int r = 0; r < 4; r++) {{
-      __global float* Lr = L + r * {HAD_B};
+      __global float* Lr = L + r * {B};
       if (r < nr) {{
         __global float* xr = x + (4 * q + r) * {c};
         {inv}
-        for (int k = 0; k < {HAD_B}; k += 8) *(__global float8*)(Lr + k) = *(__global float8*)(xr + b * {HAD_B} + k) * BC(inv) * *(__global float8*)(w + b * {HAD_B} + k);
-      }} else for (int k = 0; k < {HAD_B}; k += 8) *(__global float8*)(Lr + k) = BC(0.0f);
+        for (int k = 0; k < {B}; k += 8) *(__global float8*)(Lr + k) = {" + ".join(f"*(__global float8*)(xr + {o} + k) * BC(inv) * *(__global float8*)(w + {o} + k)" + ("" if g == 1 else f" * BC({sj})") for o, sj in mix)};
+      }} else for (int k = 0; k < {B}; k += 8) *(__global float8*)(Lr + k) = BC(0.0f);
     }}"""
   scale = "" if post == 1.0 else f" * BC({post!r}f)"
   return V.FULL_H + TILE + (EXP if mode == "swiglu" else "") + f"""
@@ -355,29 +366,29 @@ __kernel void had_a32(__global half* restrict out, __global float* restrict x{""
 {"  w += idx[0] * %d;" % c if stacked else ""}
   __global float* L = LSF(0);
   for (int u = core_id; u < {nub * nb}; u += {NT}) {{
-    int rb = u / {nb}, b = u % {nb};
+    int rb = u / {nb}, b = u % {nb};{sgs}
     for (int i = 0; i < {qpu}; i++) {{                 /* the unit's row quads in turn: one TEC writes all of a block's A lines */
     int q = rb * 3 + i; int nr = {rows} - 4 * q; nr = nr < 0 ? 0 : nr > 4 ? 4 : nr;
     {load}
     for (int r = 0; r < nr; r++) {{
-      __global float* Lr = L + r * {HAD_B};
-      for (int k = 0; k < {HAD_B}; k += 8) *(__global float8*)(Lr + k) = h8(*(__global float8*)(Lr + k));
-      for (int h = 8; h < {HAD_B // 2}; h *= 4) for (int j0 = 0; j0 < {HAD_B}; j0 += 4 * h) for (int k = j0; k < j0 + h; k += 8) {{   /* stages h, 2h */
+      __global float* Lr = L + r * {B};
+      for (int k = 0; k < {B}; k += 8) *(__global float8*)(Lr + k) = h8(*(__global float8*)(Lr + k));
+      for (int h = 8; h < {B // 2}; h *= 4) for (int j0 = 0; j0 < {B}; j0 += 4 * h) for (int k = j0; k < j0 + h; k += 8) {{   /* stages h, 2h */
         float8 a = *(__global float8*)(Lr + k), bb = *(__global float8*)(Lr + k + h), cc = *(__global float8*)(Lr + k + 2 * h), d = *(__global float8*)(Lr + k + 3 * h);
         float8 s0 = a + bb, s1 = a - bb, s2 = cc + d, s3 = cc - d;
         *(__global float8*)(Lr + k) = s0 + s2; *(__global float8*)(Lr + k + h) = s1 + s3; *(__global float8*)(Lr + k + 2 * h) = s0 - s2; *(__global float8*)(Lr + k + 3 * h) = s1 - s3;
-      }}
-      for (int k = 0; k < {HAD_B // 2}; k += 8) {{                                     /* stage HAD_B / 2 */
-        float8 a = *(__global float8*)(Lr + k), bb = *(__global float8*)(Lr + k + {HAD_B // 2});
-        *(__global float8*)(Lr + k) = a + bb; *(__global float8*)(Lr + k + {HAD_B // 2}) = a - bb;
-      }}
+      }}{f'''
+      for (int k = 0; k < {B // 2}; k += 8) {{                                     /* stage HAD_B / 2 */
+        float8 a = *(__global float8*)(Lr + k), bb = *(__global float8*)(Lr + k + {B // 2});
+        *(__global float8*)(Lr + k) = a + bb; *(__global float8*)(Lr + k + {B // 2}) = a - bb;
+      }}''' if (B.bit_length() - 1 - 3) % 2 else ""}
     }}
-    for (int s = 0; s < {HAD_B // 128}; s++) {{
-      int sl = b * {HAD_B // 128} + s; __global half* o = out + {obase};
+    for (int s = 0; s < {B // 128}; s++) {{
+      int sl = b * {B // 128} + s; __global half* o = out + {obase};
       for (int kq = 0; kq < 32; kq++) {{
         int k = s * 128 + 4 * kq;
-        float8 t01 = F8(*(__global float4*)(L + k), *(__global float4*)(L + {HAD_B} + k)){scale};
-        float8 t23 = F8(*(__global float4*)(L + {2 * HAD_B} + k), *(__global float4*)(L + {3 * HAD_B} + k)){scale};
+        float8 t01 = F8(*(__global float4*)(L + k), *(__global float4*)(L + {B} + k)){scale};
+        float8 t23 = F8(*(__global float4*)(L + {2 * B} + k), *(__global float4*)(L + {3 * B} + k)){scale};
         *(__global half16*)(o + {oel}) = CVT16(t01, t23);
       }}
     }}
@@ -3525,6 +3536,8 @@ class Kernels:
     # become had_a32 (rms / plain / swiglu), a plain one multiplying by these signs; `had_post` the factor after the transform
     # (1.0: the 1 / sqrt(HAD_B) is in the GEMM's scale tables). None: every producer as before (the other models)
     self.had, self.had_post = None, 1.0
+    self.had_g = 1         # the model's block in HAD_B-blocks (had_a32_src's g): the DMA / fast producers hold one HAD_B block, so g = 1 only
+    self.had_b = HAD_B     # the transformed block (had_a32_src's hb: 512 for Bonsai 2 4B / 2B); the DMA / fast producers: HAD_B only
     # small2 (Layers sets it from QWEN_SMALL2, default on; other users of Kernels, gemma4, keep the previous kernels): the RMSNorm
     # producers read a record of the rows' norms (rms_rec + rms_a32f, or the residual's own resid32q), head_top3[r] by DMA
     self.small2 = False
@@ -3592,7 +3605,7 @@ class Kernels:
         d = self.desc(f"had_a32d_desc|fast|rec|{mode}|{c}", lambda: HF.had_fast_desc(mode, c, self.nrb, self.real, opts=op))
         return self.run(k, tag, self.a_size(c), dtypes.uint16, x, *ws, self.bufs[rs[0]], d)
       if self.had_dma(): return self.run(self.had_d(mode, c, st and norm), tag, self.a_size(c), dtypes.uint16, x, *ws, self.had_desc(mode, c))
-      k = self.key(f"had_a32|{mode}|{c}|{self.real}|{self.compact}|{st}|{self.had_post}", had_a32_src(mode, c, self.nrb, self.eps, real=self.real, compact=self.compact, stacked=st and norm, post=self.had_post))
+      k = self.key(f"had_a32|{mode}|{c}|{self.real}|{self.compact}|{st}|{self.had_post}|{self.had_g}|{self.had_b}", had_a32_src(mode, c, self.nrb, self.eps, real=self.real, compact=self.compact, stacked=st and norm, post=self.had_post, g=self.had_g, hb=self.had_b))
       return self.run(k, tag, self.a_size(c), dtypes.uint16, x, *ws)
     # rows mode with the norm: the rows through LSRAM by DMA (rms_a32d: -0.26 ms a call at 4 rows, bit-identical; never implicated
     # in the hang of gdn_tokm_src's note). QWEN_RMS_DMA=0: plain. Without the norm (the o / fc inputs): rms_a32d's phase 2 alone
@@ -3621,7 +3634,7 @@ class Kernels:
     return self.run(k, tag, self.a_size(c), dtypes.uint16, x, *(w1 if st else (w1 if norm else x,)))
   # rows mode: had_a32d (every operand by DMA, lane-extract butterflies; at 4 rows rms 0.58 -> 0.075 ms a call, plain 0.29 -> 0.039,
   # swiglu 0.65 -> 0.106 on the board; the same bits as had_a32 on the simulator). QWEN_HAD_DMA=0: had_a32
-  def had_dma(self): return self.compact and os.environ.get("QWEN_HAD_DMA", "1") == "1"
+  def had_dma(self): return self.compact and os.environ.get("QWEN_HAD_DMA", "1") == "1" and self.had_g == 1 and self.had_b == HAD_B
   # QWEN_HAD_FAST (default 1): had_fast.py's kernel (compact asm loops for the instruction fetch, no row re-fetch in rms's sums,
   # swiglu's sub-tiles by exact bytes; 4 rows on the board: rms 75 -> 46 us a call, plain 38 -> 25, swiglu 111 -> 78) with the
   # same bits as had_a32d (simulator and board gates). 0: had_a32d. "v2": the same
@@ -3656,7 +3669,7 @@ class Kernels:
       return self.run(k, tag, self.a_size(m_), dtypes.uint16, ct)
     if self.had is not None and self.had_dma(): return self.run(self.had_d("swiglu", m_, False), tag, self.a_size(m_), dtypes.uint16, ct, self.had_desc("swiglu", m_))
     if self.had is not None:                     # rotated inputs: the down projection's signs are in the up rows' scales
-      k = self.key(f"had_a32|swiglu|{m_}|{self.real}|{self.compact}|{self.had_post}", had_a32_src("swiglu", m_, self.nrb, self.eps, real=self.real, compact=self.compact, post=self.had_post))
+      k = self.key(f"had_a32|swiglu|{m_}|{self.real}|{self.compact}|{self.had_post}|{self.had_g}|{self.had_b}", had_a32_src("swiglu", m_, self.nrb, self.eps, real=self.real, compact=self.compact, post=self.had_post, g=self.had_g, hb=self.had_b))
       return self.run(k, tag, self.a_size(m_), dtypes.uint16, ct)
     if self.small_dma():                         # rows mode: by DMA (swiglu_a32d)
       dk = f"swiglu_a32d_desc{m_}"

@@ -14,10 +14,11 @@ Writes <o>.logits (float32 [n, vocab]) and with --layers <o>.l_out-<l> (float32 
 from its FP8 checkpoint instead (profile qwen3.8-27b), for a comparison of the two models' residual bases."""
 import argparse, os, sys, time
 _Q38 = next((sys.argv[i + 1] for i, v in enumerate(sys.argv[:-1]) if v == "--qwen38"), None)
-os.environ["QWEN_MODEL"] = "qwen3.8-27b" if _Q38 else "bonsai2-27b"
-HERE = os.path.dirname(os.path.abspath(__file__)); sys.path.insert(0, os.path.join(HERE, "..", "qwen3.8-27b"))
+os.environ["QWEN_MODEL"] = "qwen3.8-27b" if _Q38 else os.environ.get("QWEN_MODEL", "bonsai2-27b")
+HERE = os.path.dirname(os.path.abspath(__file__)); sys.path.insert(0, os.path.join(HERE, "..", "qwen3.8-27b")); sys.path.insert(0, HERE)
 import numpy as np
 import qwen38_ref as R                                                      # noqa: E402
+from bonsai2_weights import PATHS                                           # noqa: E402
 
 def read_tokens(path):
   """A reference dump's .tokens: the prompt ("p id") and the greedy tokens ("g id"); the sequence fed is prompt + gen[:-1]."""
@@ -28,7 +29,7 @@ def read_tokens(path):
 
 def main():
   ap = argparse.ArgumentParser()
-  ap.add_argument("--gguf", default="/mnt/ssd/bonsai2/Ternary-Bonsai-2-27B-PTQ1_0.gguf")
+  ap.add_argument("--gguf", default=os.environ.get("BONSAI_GGUF", PATHS.get(R.MODEL, ("",))[0]))
   ap.add_argument("--tokens"); ap.add_argument("--ids"); ap.add_argument("-o", required=True)
   ap.add_argument("--layers", action="store_true", help="also write every layer's output")
   ap.add_argument("--nl", type=int, default=R.NL, help="run only the first NL layers (debugging)")

@@ -37,17 +37,20 @@ subfolder `mtp` (the runtime's default QWEN_MTP_CACHE): its streams are block-sc
 (`scales` = single, as the trunk's, and no `tern`). DIR's tokenizer.json (Qwen3.5's tokenizer, the same ids) is copied into <out>.
 """
 import argparse, os, sys, time
-os.environ["QWEN_MODEL"] = "bonsai2-27b"
+os.environ.setdefault("QWEN_MODEL", "bonsai2-27b")                      # or bonsai2-9b / -4b / -2b
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.expanduser(os.environ.get("TG", os.path.join(HERE, "..", "tinygrad")))); sys.path.insert(0, HERE); sys.path.insert(0, os.path.join(HERE, "..", "qwen3.8-27b"))
 import numpy as np
 from zy import gemm_fp16 as G                                             # noqa: E402
 import qwen38_ref as R                                                    # noqa: E402
 from qwen38_pack import LINEARS, SMALL, fuse_all                          # noqa: E402
-from bonsai2_weights import Weights, OUT_ROWS                            # noqa: E402
+from bonsai2_weights import Weights, PATHS                               # noqa: E402
 
 NS, KS, QK = 3, 32, 128
-FOLD = np.float32(2.0 ** -5)                                              # 1 / sqrt(block 1024), exact in the fp32 table
+# 1 / sqrt(block) in the scale tables when it is a power of two (1024: 2^-5, 4096: 2^-6: exact); 512's 2^-4.5 is not (the fp16 table
+# would round every scale), so it stays the A producers' `post` factor (fp32, before the fp16 A): hadamard.npz fold_norm = 0
+FOLD_NORM = (R.HADB.bit_length() - 1) % 2 == 0
+FOLD = np.float32(1.0 / np.sqrt(R.HADB)) if FOLD_NORM else np.float32(1.0)
 HEAD_PARTS = 4                                                            # as the fp8 head: 1296 groups (62 208 columns) a part, the last shorter
 assert R.HAD and R.HEAD == "lm_head_tern"
 
@@ -81,7 +84,7 @@ def signs(W):
 def ternary(W, hf):
   """An HF-named linear -> (trits int8 [N, K], d float32 [N, K / 128]) in the HF row order (the DeltaNet's V heads grouped)."""
   t_, rest = W.gguf_name(hf); t, d = W.g.ptq(t_)
-  if rest in OUT_ROWS: r = OUT_ROWS[rest]; t, d = t[r], d[r]
+  if rest in W.OUT_ROWS: r = W.OUT_ROWS[rest]; t, d = t[r], d[r]
   return t, d.astype(np.float32)
 
 def folded(W, hf, sg):
@@ -102,7 +105,7 @@ def pack_layer(W, l, out, sg):
 
 def pack_head(W, out):
   """output.weight (ternary [248320, 5120], folded: its input is the final norm's, width 5120) in HEAD_PARTS files of whole groups."""
-  name = "output.weight"; assert W.g.folded(name); K, N = W.g.tensors[name][0][:2]
+  name = W.head; assert W.g.folded(name); K, N = W.g.tensors[name][0][:2]
   gs = 16 * NS; ngroups = -(-N // gs); per = -(-ngroups // HEAD_PARTS); per = -(-per // 8) * 8; parts = []
   for p_ in range(HEAD_PARTS):
     g0, g1 = p_ * per, min(ngroups, (p_ + 1) * per); f = os.path.join(out, f"{R.HEAD}_{p_}.bin")
@@ -125,7 +128,7 @@ def markers(out, W):
   open(os.path.join(out, "scales"), "w").write("single\nthe ternary stream's single-layout scale table (gemm_gs scales='single')\n")
   if TSCALE == "f16": open(ft, "w").write("f16\nthe ternary scale tables as fp16 s x 2^15 (gemm_fp16.pack_b_group_tern(tscale='f16'), gemm_gs(tscale='f16')); bonsai2_pack.py --tscale f16\n")
   h = W.g.had
-  np.savez(os.path.join(out, "hadamard.npz"), block=np.array(h.block), fold_norm=np.array(1), **{f"s{w}": v for w, v in signs(W).items()})
+  np.savez(os.path.join(out, "hadamard.npz"), block=np.array(h.block), fold_norm=np.array(int(FOLD_NORM)), **{f"s{w}": v for w, v in signs(W).items()})
 
 def pack_drafter(qdir, out):
   """Qwen3.8-27B-FP8's MTP layer (qdir/mtp.safetensors) -> out/mtp (layer 64, single-layout scales); qdir/tokenizer.json -> out."""
@@ -141,21 +144,69 @@ def pack_drafter(qdir, out):
   tok = os.path.join(qdir, "tokenizer.json")
   if os.path.exists(tok) and not os.path.exists(os.path.join(out, "tokenizer.json")): shutil.copy(tok, out)
 
+class NativeMTP:
+  """Bonsai 2's own MTP head (the 9B / 4B `*-PQ2_0-MTP-Q8_0.gguf`: its trunk bit-identical to the PTQ1_0 file's, the head `blk.NL.*`
+  Q8_0 and not Hadamard-folded) served as the E4M3 `mtp.safetensors` qwen38_pack.pack_mtp reads: every linear re-quantised to E4M3
+  with 128 x 128 block scales (amax / 448, as pack_mtp does for mtp.fc), the norms through ornith_weights.MTP (stored as 1 + w)."""
+  def __init__(self, path):
+    import ornith_weights
+    self.M, self.c = (path if isinstance(path, BF16MTP) else ornith_weights.MTP(path)), {}
+  def _q(self, base):
+    if base not in self.c:
+      import qwen38_pack as QP
+      w = self.M.linear(base); N, K = w.shape; nb = N // 128
+      sinv = np.maximum(np.abs(w.reshape(nb, 128, K // 128, 128)).max((1, 3)), 1e-12).astype(np.float32) / 448.0
+      self.c[base] = (QP.e4m3_encode(w / np.repeat(np.repeat(sinv, 128, 0), 128, 1)), sinv)
+    return self.c[base]
+  def codes(self, name): return self._q(name[:-len(".weight")])[0]
+  def f32(self, name):
+    if name.endswith(".weight_scale_inv"): return self._q(name[:-len(".weight_scale_inv")])[1]
+    if name == "mtp.fc.weight": return self.M.linear("mtp.fc")
+    return self.M.f32(name)
+
+class BF16MTP:
+  """An MTP head from a bf16 safetensors file under the HF names (mtp.fc.weight, mtp.layers.0.*, mtp.norm.weight ...; the 2B's drafter
+  is Qwen3.5-2B's own MTP layer, the only tensors fetched from its checkpoint): the interface ornith_weights.MTP gives NativeMTP --
+  `linear(base)` fp32 [N, K], `f32(name)` the norms as stored (zero-centred: HF's convention, which pack_mtp expects)."""
+  def __init__(self, path):
+    import json, struct
+    self.f = open(os.path.expanduser(path), "rb"); n = struct.unpack("<Q", self.f.read(8))[0]; self.h = json.loads(self.f.read(n)); self.base = 8 + n
+  def _t(self, name):
+    v = self.h[name]; assert v["dtype"] == "BF16", (name, v["dtype"]); lo, hi = v["data_offsets"]; self.f.seek(self.base + lo)
+    u = np.frombuffer(self.f.read(hi - lo), np.uint16).astype(np.uint32) << 16; return u.view(np.float32).reshape(v["shape"])
+  def linear(self, base): return self._t(base + ".weight")
+  def f32(self, name): return self._t(name)
+
+
+def pack_native_drafter(path, out):
+  """The size's own MTP head -> out/mtp as layer NL (the runtime's QWEN_MTP_CACHE default), single-layout scales."""
+  import qwen38_pack as QP
+  d = os.path.join(out, "mtp"); os.makedirs(d, exist_ok=True)
+  QP.SCALES = "single"; QP.scales_marker(d, "single"); QP.MTP_L = R.NL
+  sf = NativeMTP(BF16MTP(path) if path.endswith(".safetensors") else path)
+  class _W:
+    def file(self, name): assert name == "mtp.safetensors", name; return sf
+  QP.pack_mtp(_W(), d)
+
 def main():
   global TSCALE
   ap = argparse.ArgumentParser()
-  ap.add_argument("--gguf", default=os.environ.get("BONSAI_GGUF", "/mnt/ssd/bonsai2/Ternary-Bonsai-2-27B-PTQ1_0.gguf"))
-  ap.add_argument("--out", default=os.environ.get("QWEN_NPU", "/mnt/ssd/bonsai2-npu")); ap.add_argument("--layers", default="0-63")
+  ap.add_argument("--gguf", default=os.environ.get("BONSAI_GGUF", PATHS[R.MODEL][0]))
+  ap.add_argument("--out", default=os.environ.get("QWEN_NPU", PATHS[R.MODEL][1])); ap.add_argument("--layers", default=f"0-{R.NL - 1}")
   ap.add_argument("--head", action="store_true", help="the final norm and the head only")
   ap.add_argument("--fuse", action="store_true", help="the fused q | k|v and qkv | z stream files alongside (qwen38_pack.fuse_all; no GGUF read)")
   ap.add_argument("--tscale", default=TSCALE, choices=("f32", "f16"), help="the ternary scale table: fp16 s x 2^15 (default) or fp32 s x 2^18 (the older format)")
+  ap.add_argument("--mtp-gguf", metavar="GGUF", help="the drafter: this size's own MTP head (its *-PQ2_0-MTP-Q8_0.gguf), or a bf16 .safetensors of the base model's mtp.* tensors (the 2B: Qwen3.5-2B's), into <out>/mtp")
   ap.add_argument("--mtp", metavar="DIR", help="the drafter: Qwen3.8-27B-FP8's MTP layer (DIR/mtp.safetensors) into <out>/mtp, DIR/tokenizer.json into <out>")
   a = ap.parse_args(); os.makedirs(a.out, exist_ok=True); lo, hi = (int(v) for v in a.layers.split("-"))
   TSCALE = a.tscale
   if a.fuse: fuse_all(a.out, range(lo, hi + 1)); return
+  if a.mtp_gguf:
+    t0 = time.perf_counter(); pack_native_drafter(a.mtp_gguf, a.out); print(f"   the drafter ({os.path.basename(a.mtp_gguf)}'s MTP head) packed into {os.path.join(a.out, 'mtp')} in {time.perf_counter() - t0:.0f} s", flush=True); return
   if a.mtp:
     t0 = time.perf_counter(); pack_drafter(a.mtp, a.out); print(f"   the drafter (Qwen3.8-27B's MTP layer) packed into {os.path.join(a.out, 'mtp')} in {time.perf_counter() - t0:.0f} s", flush=True); return
   W = Weights(a.gguf); markers(a.out, W); sg = signs(W)
+  assert W.g.had.block == R.HADB and (W.NK, W.NV) == (R.NK, R.NV), (W.g.had.block, W.NK, W.NV, R.MODEL)
   assert set(sg) == {R.H, R.NV * R.DV, R.INTER} and R.NV * R.DV == R.NH * R.HD, sorted(sg)
   if a.head:
     t0 = time.perf_counter(); pack_head(W, a.out); print(f"   head + final norm packed in {time.perf_counter() - t0:.0f} s", flush=True); return

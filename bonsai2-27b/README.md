@@ -346,6 +346,50 @@ python3 check/emulate_layer.py --cache $QWEN_NPU --layers 0,3
 QWEN_SPEC=8 QWEN_SPEC_GEOS=3,4,6,8 python3 check/verify_oracle.py
 ```
 
+## The smaller sizes: Ternary Bonsai 2 2B, 4B and 9B
+
+The same runtime with `QWEN_MODEL=bonsai2-2b | -4b | -9b` (`bonsai2_weights.PATHS` holds each size's GGUF and cache; the Hadamard block is
+the GGUF's: 512 / 512 / 4096). Their drafters are MTP layers of their own size: the 9B's and 4B's from PrismML's
+`Ternary-Bonsai-2-{9B,4B}-PQ2_0-MTP-Q8_0.gguf` (`bonsai2_pack.py --mtp-gguf`), the 2B's from Qwen3.5-2B's own `mtp.*` tensors
+(the Bonsai 2 2B is Qwen3.5-2B's shape exactly; the 122 MB of bf16 tensors fetched from its checkpoint by range requests into a
+safetensors file, then `--mtp-gguf` on that file). Board o6n, 2026-10-26, three prompts (a 9-token answer, a 64-token code answer, a
+~60-token explanation), the speculative ids identical to plain greedy's on every prompt:
+
+| size | resident | prefill tok/s | decode plain | decode speculative | drafts accepted a pass |
+| --- | --- | --- | --- | --- | --- |
+| 2B | 0.6 GB | 50-60 | 10.0-10.1 | **23.6-29.5** (~26 pooled) | 1.1-1.9 of 3 (leaf tree, 4 rows) |
+| 4B | 1.5 GB | 29-35 | 6.9 | **16.2-21.4** | 1.0-2.0 |
+| 9B | 2.7 GB | 15-17 | 4.5 | **9.2-10.7** | 1.5-1.9 |
+
+The prompt goes through the verify path (`QWEN_PREFILL=chunked`: the one-pass prefill's DeltaNet kernel wants 48 value heads). Plain
+decoding on these sizes is `QWEN_DRAFT=none` (the verify path without drafts); `QWEN_SPEC=0` has no geometries for the chunked prefill.
+
+## Batched decode: several requests a step (`bonsai2_batch.py`)
+
+N independent requests through one decode step: the linears -- the weight bytes -- run once for all N rows on the GEMM's rows mode (a
+Layers(N) geometry of the runtime: its A producers, residuals and dense MLP as the verify pass uses them), and the sequence mixers run
+as ONE launch a layer on batched one-token kernels: `gdn_tokb` (qwen3.8-27b/gdn_batch.py) and `attn_decb` (attn_batch.py) are the
+one-row kernels gdn_tok3 / attn_dec3 over M independent rows -- units (row, head group) / (row, kv head) over the 12 tasks, row r
+reading tile row r of the C tiles, its own input row, its user's state / ring / cache (the per-layer stacks replicated per user, index =
+user x layers + layer) and position, writing row r of the output rows. Each row's results are the one-row kernel's bits (simulator
+gates gdn_batch_sim.py / attn_batch_sim.py), so each user is plain greedy decoding of its own request: user 0's ids equal the
+single-request run's at every N. One JIT graph a layer per (type, parity). `BATCH_KERNELS=0`: the first form, the mixers per user on
+the one-row kernels joined by scatter / gather kernels. Board o6n, 2026-10-26, Bonsai 2 2B, prompts of 17 tokens in lockstep, 24 new tokens:
+
+| users | a step | aggregate tok/s | a user | prefill (lockstep) | per-user mixers (BATCH_KERNELS=0) |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 | 53 ms | 18.8 | 18.8 | 8.4 tok/s | 52 ms, 19.2 |
+| 2 | | | | | 61 ms, 33.0 |
+| 4 | 80 ms | **50.1** | 12.5 | 32.9 | 108 ms, 37.1 |
+| 8 | 123 ms | **64.8** | 8.1 | 38.6 | 182 ms, 43.9 |
+| 12 | 216 ms | 55.7 | 4.6 | 37.2 | |
+
+Eight users is the sweet spot: 3.4x one stream's throughput. Past 8 the GEMM's third row tile (rows 9-12) and the 96 DeltaNet units
+over 12 tasks cost more than the extra rows return. The remaining growth, ~9 ms a user a step at 4-8 users, is the DeltaNet units
+(each ~0.3 ms: the a | b projection and the 1 MB state through LSRAM, 8 head groups a user over 12 tasks) and the GEMMs' second row
+tile; the single-user step (53 ms, 18.8 tok/s) is also the 2B's best plain decode (the plain path through the 4-row verify
+geometry measured 100 ms).
+
 ## How it works
 
 - **The ternary GEMM.** The backend's `gemm_gs(tern=True)` streams each weight as a 2-bit code with one fp16 scale per row and

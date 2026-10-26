@@ -15,16 +15,22 @@ import numpy as np
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from bonsai2_gguf import Bonsai2GGUF
 
-NK, DK, NV, DV = 16, 128, 48, 128
-REP = NV // NK
-PERM = np.array([(h % REP) * NK + h // REP for h in range(NV)])            # HF (grouped) head h <- GGUF (tiled) head PERM[h]
-def _rows(D): return (PERM[:, None] * D + np.arange(D)[None]).ravel()
-QK = 2 * NK * DK
+DK, DV = 128, 128
+# QWEN_MODEL -> (the checkpoint, the packed NPU cache): the scripts' defaults
+PATHS = {"bonsai2-27b": ("/mnt/ssd/bonsai2/Ternary-Bonsai-2-27B-PTQ1_0.gguf", "/mnt/ssd/bonsai2-npu"),
+         **{f"bonsai2-{s}": (f"/mnt/ssd/bonsai2-{s}/Ternary-Bonsai-2-{s.upper()}-PTQ1_0.gguf", f"/mnt/ssd/bonsai2-{s}-npu") for s in ("9b", "4b", "2b")}}
+
+def heads(meta):
+  """The DeltaNet's (key heads, value heads) from the GGUF (27B 16, 48; 9B / 4B 16, 32; 2B 16, 16)."""
+  return int(meta["qwen35.ssm.group_count"]), int(meta["qwen35.ssm.time_step_rank"])
+
+def perm(NK, NV):
+  """HF (grouped) value head h <- GGUF (tiled) head perm[h] (the identity when NV == NK)."""
+  REP = NV // NK; return np.array([(h % REP) * NK + h // REP for h in range(NV)])
 
 LIN = {"linear_attn.in_proj_qkv": "attn_qkv", "linear_attn.in_proj_z": "attn_gate", "linear_attn.out_proj": "ssm_out",
        "self_attn.q_proj": "attn_q", "self_attn.k_proj": "attn_k", "self_attn.v_proj": "attn_v", "self_attn.o_proj": "attn_output",
        "mlp.gate_proj": "ffn_gate", "mlp.up_proj": "ffn_up", "mlp.down_proj": "ffn_down"}
-OUT_ROWS = {"linear_attn.in_proj_qkv": np.concatenate([np.arange(QK), QK + _rows(DV)]), "linear_attn.in_proj_z": _rows(DV)}
 VEC = {"input_layernorm.weight": ("attn_norm.weight", -1), "post_attention_layernorm.weight": ("post_attention_norm.weight", -1),
        "self_attn.q_norm.weight": ("attn_q_norm.weight", -1), "self_attn.k_norm.weight": ("attn_k_norm.weight", -1),
        "linear_attn.norm.weight": ("ssm_norm.weight", 0)}
@@ -36,7 +42,12 @@ class Weights:
     path = os.path.expanduser(path)
     if os.path.isdir(path): path = next(os.path.join(path, f) for f in sorted(os.listdir(path)) if f.endswith("PTQ1_0.gguf"))
     self.g = Bonsai2GGUF(path); h = self.g.had
-    assert h is not None and h.gdn_v_grouped and h.sign_mode == "explicit", "expected the Bonsai 2 Hadamard contract"
+    self.NK, self.NV = heads(self.g.meta); self.PERM = perm(self.NK, self.NV); self.QK = 2 * self.NK * DK
+    assert h is not None and (h.gdn_v_grouped or self.NV == self.NK) and h.sign_mode == "explicit", "expected the Bonsai 2 Hadamard contract"
+    self.head = "token_embd.weight" if h.tied else "output.weight"         # v2 (4B / 2B): the head is the tied embedding
+    self.OUT_ROWS = {"linear_attn.in_proj_qkv": np.concatenate([np.arange(self.QK), self.QK + self._rows(DV)]),
+                     "linear_attn.in_proj_z": self._rows(DV)}
+  def _rows(self, D): return (self.PERM[:, None] * D + np.arange(D)[None]).ravel()
   def shard(self, l): return self
   @staticmethod
   def _split(name):
@@ -47,20 +58,20 @@ class Weights:
   def mm(self, sf, x, name):
     t, rest = self.gguf_name(name); assert self.g.folded(t), t      # every trunk linear is folded in this checkpoint
     y = self.g.matmul(np.asarray(x, np.float32), t)
-    return y[:, OUT_ROWS[rest]] if rest in OUT_ROWS else y
+    return y[:, self.OUT_ROWS[rest]] if rest in self.OUT_ROWS else y
   def linear(self, sf, name):
     raise NotImplementedError("Bonsai 2 linears are stored in a rotated basis: use mm()")
   def f32(self, name):
     if name == "model.language_model.norm.weight": return self.g.f32("output_norm.weight") - 1.0
     l, rest = self._split(name)
     if rest in VEC: t, off = VEC[rest]; return self.g.f32(f"blk.{l}.{t}") + off
-    if rest == "linear_attn.in_proj_a.weight": return self.g.f32(f"blk.{l}.ssm_alpha.weight")[PERM]
-    if rest == "linear_attn.in_proj_b.weight": return self.g.f32(f"blk.{l}.ssm_beta.weight")[PERM]
-    if rest == "linear_attn.A_log": return np.log(-self.g.f32(f"blk.{l}.ssm_a"))[PERM].astype(np.float32)
-    if rest == "linear_attn.dt_bias": return self.g.f32(f"blk.{l}.ssm_dt.bias")[PERM]
+    if rest == "linear_attn.in_proj_a.weight": return self.g.f32(f"blk.{l}.ssm_alpha.weight")[self.PERM]
+    if rest == "linear_attn.in_proj_b.weight": return self.g.f32(f"blk.{l}.ssm_beta.weight")[self.PERM]
+    if rest == "linear_attn.A_log": return np.log(-self.g.f32(f"blk.{l}.ssm_a"))[self.PERM].astype(np.float32)
+    if rest == "linear_attn.dt_bias": return self.g.f32(f"blk.{l}.ssm_dt.bias")[self.PERM]
     if rest == "linear_attn.conv1d.weight":
       c = self.g.f32(f"blk.{l}.ssm_conv1d.weight")                         # [C, 4]
-      return np.concatenate([c[:QK], c[QK:][_rows(DV)]])[:, None, :]       # [C, 1, 4]
+      return np.concatenate([c[:self.QK], c[self.QK:][self._rows(DV)]])[:, None, :]       # [C, 1, 4]
     raise KeyError(name)
   # ---- outside the layers
   def embed(self, ids):                                                    # the latent rows, then s * (Hb z): ~2.7 ms a row on the host,
@@ -72,4 +83,4 @@ class Weights:
     return np.stack([c[t] for t in ids])
   def final_norm(self, x):
     w = self.f32("model.language_model.norm.weight"); return x * (1.0 / np.sqrt((x * x).mean(-1, keepdims=True) + 1e-6)) * (1.0 + w)
-  def lm_head(self, x): return self.g.matmul(np.asarray(x, np.float32), "output.weight", chunk=8192)
+  def lm_head(self, x): return self.g.matmul(np.asarray(x, np.float32), self.head, chunk=8192)

@@ -356,7 +356,7 @@ def qgemvk_src(kind, N, K, heads=1, act_heads=1, split=0, yoff=0, nt=12, nbuf=3,
   skipped, not written). Column n of head h at y[yoff + h NP + n], or with `split` (one head; a multiple of 16) columns >= split
   at y2[n - split]. A task a run of (head, group) units; a (group, slice) chunk a DMA, `nbuf` deep; the 6 accumulators of a group
   (3 strips x 2 halves) in LSRAM across the slices, in registers across a strip's 4 sub-blocks. `act`, the package's source:
-    pkg     `pkg` by DMA (package h for head h with act_heads > 1)
+    pkg     `pkg` by DMA (package h // (heads / act_heads) for head h with act_heads > 1: a row's package shared by its experts)
     norm    built by every task from xs (fp32 [K]) and nw (the norm's weight): rms(xs) nw, before the weights stream (nw staged in
             their buffers); `export`: each task also writes its share of the records to `pkg`
     swiglu  built per head h from xs = the gate | up GEMV's rows (fp32 [2 heads][gu_np]): silu(xs[h]) xs[heads + h]
@@ -430,7 +430,8 @@ def qgemvk_src(kind, N, K, heads=1, act_heads=1, split=0, yoff=0, nt=12, nbuf=3,
     }}"""
   else:
     produce0 = prefetch
-    load_act = f"""if ({"h" if per_head else "0"} != hact) {{ hact = {"h" if per_head else "0"}; DMA_FILL(3, DESC(desc, 1), 0, (int)(pkg + hact * {AB})); DMA_WAIT(3); }}"""
+    hsel = f"(h / {heads // act_heads})" if per_head else "0"                     # package h // (heads / act_heads): act_heads rows, heads / act_heads experts each
+    load_act = f"""if ({hsel} != hact) {{ hact = {hsel}; DMA_FILL(3, DESC(desc, 1), 0, (int)(pkg + hact * {AB})); DMA_WAIT(3); }}"""
   def zp(e, hi): return f"__builtin_aipu_cvtue_tfp32_tfp16(__builtin_aipu_zip{'h' if hi else 'l'}_tfp16_tfp16({e}, {e}))"
   xs_ = ["x"] + (["z"] if LEV == 2 else [])
   regs = "" if kind == "q6n" else "".join(f"""

@@ -19,13 +19,18 @@ import numpy as np
 # checkpoint: ../ornith-9b) has the same layer types at smaller sizes; its weights come through ornith_weights.Weights.
 # bonsai2-27b (PrismML Ternary Bonsai 2 27B: Qwen3.8-27B's shapes, PTQ1_0 ternary linears with Hadamard-folded inputs:
 # ../bonsai2-27b) comes through bonsai2_weights.Weights, whose `mm` applies each linear (the activation transform included).
+# bonsai2-9b / -4b / -2b are the same format at the smaller sizes (HADB: the GGUF's prism.hadamard.block_size).
 MODEL = os.environ.get("QWEN_MODEL", "qwen3.8-27b")
 _P = {"qwen3.8-27b": dict(H=5120, INTER=17408, NH=24, NKV=4, NK=16, NV=48, NL=64, Q8=False),
       "ornith-9b":   dict(H=4096, INTER=12288, NH=16, NKV=4, NK=16, NV=32, NL=32, Q8=True),
-      "bonsai2-27b": dict(H=5120, INTER=17408, NH=24, NKV=4, NK=16, NV=48, NL=64, Q8=False, HAD=True),
+      "bonsai2-27b": dict(H=5120, INTER=17408, NH=24, NKV=4, NK=16, NV=48, NL=64, Q8=False, HAD=True, HADB=1024),
+      "bonsai2-9b":  dict(H=4096, INTER=12288, NH=16, NKV=4, NK=16, NV=32, NL=32, Q8=False, HAD=True, HADB=4096),
+      "bonsai2-4b":  dict(H=2560, INTER=9216,  NH=16, NKV=4, NK=16, NV=32, NL=32, Q8=False, HAD=True, HADB=512),
+      "bonsai2-2b":  dict(H=2048, INTER=6144,  NH=8,  NKV=2, NK=16, NV=16, NL=24, Q8=False, HAD=True, HADB=512),
       # Qwen3.5-35B-A3B / Qwen3.6-35B-A3B (GGUF `qwen35moe`, ../qwen35moe): the 9B's DeltaNet layout at H 2048, 16 / 2 attention heads,
       # 40 layers; the MLP is a 256-expert MoE (top 8 + a gated shared expert, INTER its expert width), served by the Weights' `moe`
       "qwen3.5-35b-a3b": dict(H=2048, INTER=512, NH=16, NKV=2, NK=16, NV=32, NL=40, Q8=True, MOE=True)}[MODEL]
+BONSAI = MODEL.startswith("bonsai2-")
 H, INTER, NH, NKV, HD, VOCAB, EPS, THETA = _P["H"], _P["INTER"], _P["NH"], _P["NKV"], 256, 248320, 1e-6, 1e7
 NK, DK, NV, DV, CONV = _P["NK"], 128, _P["NV"], 128, 4       # Gated DeltaNet: key heads x 128, value heads x 128, conv kernel 4
 NL = _P["NL"]                                                  # layers
@@ -33,6 +38,7 @@ Q8 = _P["Q8"]                                                  # linears as GGUF
 # HAD: every linear's input is rotated (bonsai2-27b: a 1024-block Walsh-Hadamard transform with per-width signs, folded into the
 # stored weights), so the device's A producers apply the transform (qwen38_kernels.had_a32_src) and the head is ternary
 HAD = _P.get("HAD", False)
+HADB = _P.get("HADB", 1024)                                    # the transform's block along K
 HEAD = "lm_head_q8" if Q8 else "lm_head_tern" if HAD else "lm_head_fp8"   # the packed block-scaled head's files
 LAYER_TYPES = ["full" if (l + 1) % 4 == 0 else "linear" for l in range(NL)]
 
@@ -177,7 +183,7 @@ if MODEL == "qwen3.5-35b-a3b":                                 # the MoE GGUF un
   _sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "qwen35moe"))
   from qwen35moe_weights import Weights                        # noqa: E402,F811
 
-if MODEL == "bonsai2-27b":                                     # the PTQ1_0 / Hadamard GGUF under the HF names
+if BONSAI:                                                     # the PTQ1_0 / Hadamard GGUF under the HF names
   import sys as _sys
   _sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "bonsai2-27b"))
   from bonsai2_weights import Weights                          # noqa: E402,F811
