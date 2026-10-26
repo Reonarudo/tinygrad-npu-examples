@@ -22,7 +22,10 @@ import numpy as np
 MODEL = os.environ.get("QWEN_MODEL", "qwen3.8-27b")
 _P = {"qwen3.8-27b": dict(H=5120, INTER=17408, NH=24, NKV=4, NK=16, NV=48, NL=64, Q8=False),
       "ornith-9b":   dict(H=4096, INTER=12288, NH=16, NKV=4, NK=16, NV=32, NL=32, Q8=True),
-      "bonsai2-27b": dict(H=5120, INTER=17408, NH=24, NKV=4, NK=16, NV=48, NL=64, Q8=False, HAD=True)}[MODEL]
+      "bonsai2-27b": dict(H=5120, INTER=17408, NH=24, NKV=4, NK=16, NV=48, NL=64, Q8=False, HAD=True),
+      # Qwen3.5-35B-A3B / Qwen3.6-35B-A3B (GGUF `qwen35moe`, ../qwen35moe): the 9B's DeltaNet layout at H 2048, 16 / 2 attention heads,
+      # 40 layers; the MLP is a 256-expert MoE (top 8 + a gated shared expert, INTER its expert width), served by the Weights' `moe`
+      "qwen3.5-35b-a3b": dict(H=2048, INTER=512, NH=16, NKV=2, NK=16, NV=32, NL=40, Q8=True, MOE=True)}[MODEL]
 H, INTER, NH, NKV, HD, VOCAB, EPS, THETA = _P["H"], _P["INTER"], _P["NH"], _P["NKV"], 256, 248320, 1e-6, 1e7
 NK, DK, NV, DV, CONV = _P["NK"], 128, _P["NV"], 128, 4       # Gated DeltaNet: key heads x 128, value heads x 128, conv kernel 4
 NL = _P["NL"]                                                  # layers
@@ -120,7 +123,11 @@ def attention_layer(W, l, x, pos=None):
   x = x + mm(W, sf, o.reshape(n, NH * HD), p + "self_attn.o_proj")
   return x + mlp(W, sf, p, rms(x, sf.f32(p + "post_attention_layernorm.weight")))
 
+MOE = _P.get("MOE", False)
+
 def mlp(W, sf, p, h):
+  """The MLP block's output (not added). A Weights object with a `moe` (the MoE models) computes the expert block itself."""
+  if hasattr(W, "moe"): return W.moe(sf, p, h)
   return mm(W, sf, silu(mm(W, sf, h, p + "mlp.gate_proj")) * mm(W, sf, h, p + "mlp.up_proj"), p + "mlp.down_proj")
 
 def gdn_layer(W, l, x, state=None, conv_state=None):
@@ -164,6 +171,11 @@ if MODEL == "ornith-9b":                                       # the GGUF checkp
   import sys as _sys
   _sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "ornith-9b"))
   from ornith_weights import Weights                           # noqa: E402,F811
+
+if MODEL == "qwen3.5-35b-a3b":                                 # the MoE GGUF under the HF names (the DeltaNet / attention parts as Ornith's)
+  import sys as _sys
+  _sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "qwen35moe"))
+  from qwen35moe_weights import Weights                        # noqa: E402,F811
 
 if MODEL == "bonsai2-27b":                                     # the PTQ1_0 / Hadamard GGUF under the HF names
   import sys as _sys

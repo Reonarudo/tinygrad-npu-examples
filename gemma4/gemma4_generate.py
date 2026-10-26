@@ -261,7 +261,7 @@ class Model:
     if timing is not None: timing.update(prefill_s=t1 - t0, decode_s=dt, steps=ts)
     return out
 
-  def spec_generate(self, ids, n_new, dr, kmax, tau=0.0, stop=(1, 106), timing=None, pm=8, stats=None, geos=None, on_new=None):
+  def spec_generate(self, ids, n_new, dr, kmax, tau=0.0, stop=(1, 106), timing=None, pm=8, stats=None, geos=None, on_new=None, sched=None):
     """Greedy speculative decoding with the MTP drafter `dr` (gemma4_mtp.Drafter): each pass verifies [cur, d1 .. dk] (k <= kmax
     drafts chained at cur's position; the chain stops after a draft below tau) on geometry 1 + k, keeps the drafts the model agrees
     with plus its own next token. The commit is the K / V rows alone: the accepted rows stay, the rejected ones sit at positions
@@ -272,16 +272,18 @@ class Model:
     nxt = self.prefill(ids, pm); pos = len(ids); h = self.hidden(*self.last_rows); out, cur = [nxt], nxt; t1 = time.perf_counter()
     print(f"   prefill {len(ids)} tokens: {t1 - t0:.2f} s ({pm} tokens a pass; {len(ids) / (t1 - t0):.1f} tok/s)", flush=True)
     if on_new: on_new([nxt])
-    st.update(passes=0, accepted=0, drafted=0, rows=[], draft_log=[], t_draft=0.0, t_verify=0.0)
+    st.update(passes=0, accepted=0, drafted=0, rows=[], draft_log=[], pass_log=[], t_draft=0.0, t_verify=0.0); p_cur = 1.0
     while len(out) < n_new and cur not in stop:
-      td = time.perf_counter(); d, pr = dr.chain(cur, h, pos, kmax, tau); td = time.perf_counter() - td
+      k_now = kmax if sched is None else sched(p_cur)
+      td = time.perf_counter(); d, pr = dr.chain(cur, h, pos, k_now, tau); td = time.perf_counter() - td
       nr = 1 + len(d); m = min(x for x in (geos or [nr]) if x >= nr); toks = [cur] + d + [d[-1]] * (m - nr)   # (padded to a kept geometry)
       if pos + m > self.tmax: break
-      tv = time.perf_counter(); g, _ = self.forward(toks, pos); tv = time.perf_counter() - tv
+      tv = time.perf_counter(); g, gp = self.forward(toks, pos); tv = time.perf_counter() - tv
       a = 1
       while a < nr and toks[a] == int(g[a - 1]): a += 1
       new = toks[1:a] + [int(g[a - 1])]
       st["draft_log"].extend((j, pr[j], j < a - 1) for j in range(len(d))); st["rows"].append(m)
+      st["pass_log"].append((float(p_cur), len(d), a - 1, m, [float(v) for v in pr])); p_cur = float(gp[a - 1])   # (the target's top-1 probability of the token the next pass drafts from)
       st["passes"] += 1; st["accepted"] += a - 1; st["drafted"] += len(d); st["t_draft"] += td; st["t_verify"] += tv
       n0 = len(out)
       for t in new:
@@ -303,18 +305,19 @@ def GM_default_mtp(gguf):
   return GM.default_mtp(gguf)
 
 def main():
+  os.environ.setdefault("QWEN_HEAD_TOPV", "1")        # the head's top-1 in one vector pass a row (2.0 -> 1.25 ms on a 7-row pass, the same ids)
   cpus = pin_cpus(); lat = hold_cpu_latency()
   ap = argparse.ArgumentParser(); ap.add_argument("--cache", default=DEFAULT_CACHE); ap.add_argument("--n-new", type=int, default=40)
   ap.add_argument("--tmax", type=int, default=1024); ap.add_argument("--check", action="store_true", help="the numpy reference's greedy ids alongside")
   ap.add_argument("--prefill-m", type=int, default=int(os.environ.get("GEMMA_PREFILL_M", "8")), help="prompt tokens a pass (1..12; 1: one token a pass)")
   ap.add_argument("--spec", type=int, default=None, help="speculative decoding: the MTP drafter's drafts a pass at most (0: plain greedy; default "
-                  "GEMMA_SPEC, else 6 when the drafter's GGUF is found beside the model)")
-  ap.add_argument("--tau", type=float, default=float(os.environ.get("GEMMA_DRAFT_TAU", "0.5")), help="the draft chain stops after a draft below this probability")
+                  "GEMMA_SPEC, else 7 when the drafter's GGUF is found beside the model)")
+  ap.add_argument("--tau", type=float, default=float(os.environ.get("GEMMA_DRAFT_TAU", "0.65")), help="the draft chain stops after a draft below this probability")
   ap.add_argument("--mtp", default=None, help="the drafter's GGUF (default: mtp-<the target's GGUF name> beside it)")
   ap.add_argument("--json", help="write ids and timings here"); ap.add_argument("ids", nargs="*", type=int)
   a = ap.parse_args(); meta = json.load(open(os.path.join(a.cache, "gemma4.json")))
-  if a.spec is None:                             # speculative by default when the drafter is there (k 6, tau 0.5: the measured best)
-    a.spec = int(os.environ["GEMMA_SPEC"]) if "GEMMA_SPEC" in os.environ else 6 if os.path.exists(a.mtp or GM_default_mtp(meta["gguf"])) else 0
+  if a.spec is None:                             # speculative by default when the drafter is there (k 7, tau 0.65: the measured best, check/sched_an.py)
+    a.spec = int(os.environ["GEMMA_SPEC"]) if "GEMMA_SPEC" in os.environ else 7 if os.path.exists(a.mtp or GM_default_mtp(meta["gguf"])) else 0
   if a.spec and "E4B" in os.path.basename(meta["gguf"]):   # E4B: the window holds ~5 captured geometries next to its weight slots
     os.environ.setdefault("GEMMA_LAYER_BLOCK", "4"); os.environ.setdefault("GEMMA_SPEC_GEOS", "3,5,7")
   M = GR.Model(meta["gguf"], cache_layers=os.environ.get("GEMMA_PLE", "dev") == "host"); ids = a.ids or GN.PROMPT
@@ -326,6 +329,7 @@ def main():
     # every 2 .. spec + 1. Each geometry's graphs take launch arenas in the NPU window: E4B (2 x 4 block slots of 122 MB + its head)
     # captures at most ~5 geometries and the drafter
     sg = sorted({int(x) for x in os.environ.get("GEMMA_SPEC_GEOS", ",".join(str(x) for x in range(2, a.spec + 2))).split(",")} | {a.spec + 1})
+    if os.environ.get("GEMMA_QDRAFT", "1") == "1": import gemma4_draft as GD; GD.default_mtp = GM.default_mtp; GD.Drafter = GD.QDrafter; GM = GD   # the qdot drafter (default; 0: the matrix-unit one)
     dr = GM.Drafter(m, a.mtp or GM.default_mtp(meta["gguf"]), os.path.join(a.cache, "mtp")); m.warmup(sorted({a.prefill_m} | set(sg)))
     t0 = time.perf_counter(); dr.chain(2, np.zeros(m.c.H, np.float32), 1, 2); print(f"   drafter graph captured in {time.perf_counter() - t0:.1f} s", flush=True)
     out = m.spec_generate(ids, a.n_new, dr, a.spec, a.tau, timing=tm, pm=a.prefill_m, geos=sg); print("NPU speculative: ", out, flush=True)

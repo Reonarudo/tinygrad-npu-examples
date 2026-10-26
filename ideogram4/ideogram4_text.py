@@ -9,6 +9,7 @@ encoder is causal, so dropping them is exact (the text positions are 0..n-1 eith
 
     python3 ideogram4_text.py --prompt "..." --out ~/ideogram4/text_rows.npz
         --te ~/ideogram4/text_encoder --tok ~/ideogram4/tokenizer --weights ~/ideogram4/transformer
+    TG=... python3 ideogram4_text.py --npu --cache ~/ideogram4/te_p48 ...     # the same on the NPU (ideogram4_text_npu.py), ~10 s
 
 Weights: E4M3 codes with per-row F32 `weight_scale` (the fp8 checkpoint), BF16 norms and embeddings;
 computed in float32 (the pipeline runs bf16: expect ~1e-2 relative differences in the features).
@@ -55,8 +56,9 @@ def rms(x, w, eps): return (x * (1.0 / np.sqrt((x * x).mean(-1, keepdims=True) +
 def rot_half(x): h = x.shape[-1] // 2; return np.concatenate([-x[..., h:], x[..., :h]], -1)
 
 
-def encode(te_dir, token_ids, log=print):
-    """Token ids `[n]` -> the 13 tapped hidden states `[13, n, 4096]` (float32)."""
+def encode(te_dir, token_ids, log=print, states=None):
+    """Token ids `[n]` -> the 13 tapped hidden states `[13, n, 4096]` (float32). `states` (a list): x0 and every layer's output
+    appended (`--dump-states`: the NPU encoder's layer-by-layer gate)."""
     cfg = json.load(open(os.path.join(te_dir, "config.json")))["text_config"]
     H, NHq, NKV, D = cfg["hidden_size"], cfg["num_attention_heads"], cfg["num_key_value_heads"], cfg["head_dim"]
     eps, theta, L = cfg["rms_norm_eps"], cfg["rope_parameters"]["rope_theta"], cfg["num_hidden_layers"]
@@ -66,29 +68,37 @@ def encode(te_dir, token_ids, log=print):
     row = emb_shape[1] * 2
     x = np.stack([bf16_to_f32(np.frombuffer(emb_raw[t * row:(t + 1) * row], np.uint16)) for t in token_ids]).astype(np.float32)
     n = len(token_ids)
+    if states is not None: states.append(x.copy())
     inv = 1.0 / (theta ** (np.arange(0, D, 2, dtype=np.float64) / D))
     f = np.arange(n, dtype=np.float64)[:, None] * inv[None]            # text positions: t = h = w, so the interleaved MRoPE is plain RoPE
     emb = np.concatenate([f, f], -1); cos, sin = np.cos(emb).astype(np.float32), np.sin(emb).astype(np.float32)
     causal = np.triu(np.full((n, n), -np.inf, np.float32), 1)
     taps = {}
+    T = encode.times = {"dequant": 0.0, "matmul": 0.0, "attention": 0.0}
+    def lin(name):                       # the weight's fp32 copy (E4M3 x scale), timed apart from the products
+        t_ = time.perf_counter(); w = S.linear(name); T["dequant"] += time.perf_counter() - t_; return w
+    def mm(a, name):
+        w = lin(name); t_ = time.perf_counter(); r = a @ w.T; T["matmul"] += time.perf_counter() - t_; return r
     for l in range(L):
         t0 = time.perf_counter(); q_ = f"{p}layers.{l}."
         h = rms(x, S.get(q_ + "input_layernorm.weight"), eps)
-        q = (h @ S.linear(q_ + "self_attn.q_proj").T).reshape(n, NHq, D)
-        k = (h @ S.linear(q_ + "self_attn.k_proj").T).reshape(n, NKV, D)
-        v = (h @ S.linear(q_ + "self_attn.v_proj").T).reshape(n, NKV, D)
+        q = mm(h, q_ + "self_attn.q_proj").reshape(n, NHq, D)
+        k = mm(h, q_ + "self_attn.k_proj").reshape(n, NKV, D)
+        v = mm(h, q_ + "self_attn.v_proj").reshape(n, NKV, D)
         q = rms(q, S.get(q_ + "self_attn.q_norm.weight"), eps); k = rms(k, S.get(q_ + "self_attn.k_norm.weight"), eps)
         q = q * cos[:, None] + rot_half(q) * sin[:, None]; k = k * cos[:, None] + rot_half(k) * sin[:, None]
-        o = np.empty((n, NHq, D), np.float32); g = NHq // NKV
+        ta = time.perf_counter(); o = np.empty((n, NHq, D), np.float32); g = NHq // NKV
         for hh in range(NHq):
             a = (q[:, hh] @ k[:, hh // g].T) / np.float32(math.sqrt(D)) + causal
             a = np.exp(a - a.max(-1, keepdims=True)); a /= a.sum(-1, keepdims=True)
             o[:, hh] = a @ v[:, hh // g]
-        x = x + o.reshape(n, NHq * D) @ S.linear(q_ + "self_attn.o_proj").T
+        T["attention"] += time.perf_counter() - ta
+        x = x + mm(o.reshape(n, NHq * D), q_ + "self_attn.o_proj")
         h = rms(x, S.get(q_ + "post_attention_layernorm.weight"), eps)
-        gt = h @ S.linear(q_ + "mlp.gate_proj").T; up = h @ S.linear(q_ + "mlp.up_proj").T
-        x = x + ((gt / (1.0 + np.exp(-gt))) * up) @ S.linear(q_ + "mlp.down_proj").T
+        gt = mm(h, q_ + "mlp.gate_proj"); up = mm(h, q_ + "mlp.up_proj")
+        x = x + mm((gt / (1.0 + np.exp(-gt))) * up, q_ + "mlp.down_proj")
         if l in TAPS: taps[l] = x.copy()
+        if states is not None: states.append(x.copy())
         log("   text encoder layer %2d: %.1f s  |x| max %.3g" % (l, time.perf_counter() - t0, float(np.abs(x).max())))
     return np.stack([taps[l] for l in TAPS])
 
@@ -106,12 +116,27 @@ def main():
     ap.add_argument("--te", default="~/ideogram4/text_encoder"); ap.add_argument("--tok", default="~/ideogram4/tokenizer")
     ap.add_argument("--weights", default="~/ideogram4/transformer", help="the conditional transformer's checkpoint folder, or a `cond_proj.npz` (norm, codes, scale, bias, ind)")
     ap.add_argument("--prompt-file", default=None, help="read the prompt (e.g. a JSON caption) from a file")
+    ap.add_argument("--ids", default=None, help="the token ids of an earlier text npz instead of a prompt")
+    ap.add_argument("--npu", action="store_true", help="the encoder and the projection on the NPU (ideogram4_text_npu.py; needs TG and --cache)")
+    ap.add_argument("--cache", default="~/ideogram4/te_p48", help="--npu: ideogram4_te_pack.py's packed weights")
+    ap.add_argument("--dump-states", default=None, help="numpy: save x0 and every layer's output, fp32 [37, n, 4096] (the NPU gate's reference)")
     a = ap.parse_args()
+    a.te, a.tok, a.weights = (os.path.expanduser(v) for v in (a.te, a.tok, a.weights))      # the defaults are ~ paths
     if a.prompt_file: a.prompt = open(os.path.expanduser(a.prompt_file)).read().strip()
-    ids, text = tokenize(a.tok, a.prompt)
+    if a.ids: z = np.load(os.path.expanduser(a.ids)); ids, text = [int(i) for i in z["ids"]], str(z["text"]) if "text" in z.files else ""
+    else: ids, text = tokenize(a.tok, a.prompt)
     print("== prompt %r -> %d tokens: %s" % (a.prompt, len(ids), ids), flush=True)
     t0 = time.perf_counter()
-    taps = encode(a.te, ids, log=lambda s: print(s, flush=True))                 # [13, n, 4096]
+    if a.npu:
+        import ideogram4_text_npu as NPU
+        rows = NPU.encode(ids, a.cache, a.te, log=lambda s: print(s, flush=True))
+        np.savez(os.path.expanduser(a.out), rows=rows.astype(np.float32), ids=np.array(ids), text=text)
+        print("   text rows %s (|max| %.3g) in %.1f s -> %s" % (rows.shape, float(np.abs(rows).max()), time.perf_counter() - t0, a.out), flush=True)
+        return
+    states = [] if a.dump_states else None
+    taps = encode(a.te, ids, log=lambda s: print(s, flush=True), states=states)  # [13, n, 4096]
+    if states is not None: np.save(os.path.expanduser(a.dump_states), np.stack(states)); print("   states [%d, %d, 4096] -> %s" % (len(states), len(ids), a.dump_states), flush=True)
+    print("   text encoder: %d tokens in %.0f s = %s" % (len(ids), time.perf_counter() - t0, ", ".join("%s %.0f s" % kv for kv in encode.times.items())), flush=True)
     feat = np.ascontiguousarray(taps.transpose(1, 2, 0)).reshape(len(ids), -1)    # [n, 4096 * 13]: feature d * 13 + tap
     if a.weights.endswith(".npz"):
         z = np.load(os.path.expanduser(a.weights))

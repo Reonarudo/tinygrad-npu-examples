@@ -7,10 +7,21 @@ dequantised float32 [N, K] (GGUF lists dims ne0 first: a [ne0=K, ne1=N] tensor i
 import struct
 import numpy as np
 
-GGML = {0: ("F32", 1, 4), 1: ("F16", 1, 2), 8: ("Q8_0", 32, 34), 12: ("Q4_K", 256, 144), 14: ("Q6_K", 256, 210), 30: ("BF16", 1, 2)}
+GGML = {0: ("F32", 1, 4), 1: ("F16", 1, 2), 7: ("Q5_1", 32, 24), 8: ("Q8_0", 32, 34), 12: ("Q4_K", 256, 144), 13: ("Q5_K", 256, 176), 14: ("Q6_K", 256, 210), 30: ("BF16", 1, 2), 39: ("MXFP4", 32, 17)}
 
 
 def _f16(b): return b.copy().view(np.float16)[..., 0].astype(np.float32)
+
+def dequant_q5_1(blk):
+  """[nb, 24] Q5_1 blocks -> float32 [nb, 32]: d, m (fp16), qh (32 high bits), 16 bytes of nibbles; w_j = d q_j + m with q_j = the low
+  nibble of byte j | bit j of qh << 4 (j < 16), q_{16 + j} = the high nibble of byte j | bit 16 + j of qh << 4 (ggml's dequantize_row_q5_1)."""
+  u, d, m = q51_split(blk); return (d[:, None] * u.astype(np.float32) + m[:, None]).astype(np.float32)
+
+def q51_split(blk):
+  """[nb, 24] Q5_1 blocks -> (u uint8 [nb, 32] 0..31, d float32 [nb], m float32 [nb])."""
+  d, m = _f16(blk[:, 0:2]), _f16(blk[:, 2:4]); qh = blk[:, 4:8].copy().view(np.uint32)[:, 0]; qs = blk[:, 8:24].astype(np.uint8)
+  hi = np.stack([(qh >> j) & 1 for j in range(32)], 1).astype(np.uint8)
+  return (np.concatenate([qs & 15, qs >> 4], 1) | (hi << 4)).astype(np.uint8), d, m
 
 def dequant_q4_k(blk):
   """[nb, 144] Q4_K super-blocks -> float32 [nb, 256], per the GGUF format's Q4_K layout (the values ggml's own dequantisation
@@ -22,6 +33,27 @@ def dequant_q4_k(blk):
   s[:, 4:] = (sc[:, 8:12] & 0xF) | ((sc[:, 0:4] >> 6) << 4); m[:, 4:] = (sc[:, 8:12] >> 4) | ((sc[:, 4:8] >> 6) << 4)
   q = qs.reshape(-1, 4, 32); q = np.stack([q & 0xF, q >> 4], 2).reshape(-1, 8, 32).astype(np.float32)   # sub-block 2i: low nibbles of chunk i
   return (d[:, None, None] * s[..., None] * q - dmin[:, None, None] * m[..., None]).reshape(-1, 256)
+
+def dequant_q5_k(blk):
+  """[nb, 176] Q5_K super-blocks -> float32 [nb, 256] (ggml's dequantize_row_q5_K): d, dmin, the 12 bytes of 6-bit (scale, min) pairs
+  as Q4_K, 32 bytes of high bits (sub-block j's bit is 1 << j of byte l), 128 bytes of low nibbles (chunk c = j / 2: the low nibbles
+  for even j, the high for odd); w = d sc (q + 16 h) - dmin m."""
+  d, dmin, sc, qh, qs = _f16(blk[:, 0:2]), _f16(blk[:, 2:4]), blk[:, 4:16].astype(np.int32), blk[:, 16:48].astype(np.int32), blk[:, 48:176].astype(np.int32)
+  s = np.empty((blk.shape[0], 8), np.int32); m = np.empty_like(s)
+  s[:, :4], m[:, :4] = sc[:, 0:4] & 63, sc[:, 4:8] & 63
+  s[:, 4:] = (sc[:, 8:12] & 0xF) | ((sc[:, 0:4] >> 6) << 4); m[:, 4:] = (sc[:, 8:12] >> 4) | ((sc[:, 4:8] >> 6) << 4)
+  q = qs.reshape(-1, 4, 32); q = np.stack([q & 0xF, q >> 4], 2).reshape(-1, 8, 32)             # [nb][j][l]: the low / high nibbles of chunk j / 2
+  h = np.stack([(qh >> j) & 1 for j in range(8)], 1)                                           # [nb][j][l]
+  q = (q + 16 * h).astype(np.float32)
+  return (d[:, None, None] * s[..., None] * q - dmin[:, None, None] * m[..., None]).reshape(-1, 256)
+
+KV_FP4 = np.array([0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12], np.float32)   # e2m1 values x 2 (ggml's kvalues_fp4)
+
+def dequant_mxfp4(blk):
+  """[nb, 17] MXFP4 blocks -> float32 [nb, 32] (ggml's dequantize_row_mxfp4): an E8M0 scale e (2^(e - 127), halved for the x2 table),
+  16 bytes of e2m1 nibbles: the low nibbles are weights 0..15, the high 16..31."""
+  e = blk[:, 0].astype(np.int32); d = np.ldexp(1.0, e - 128).astype(np.float32); qs = blk[:, 1:17].astype(np.int32)
+  return (d[:, None] * np.concatenate([KV_FP4[qs & 15], KV_FP4[qs >> 4]], 1)).astype(np.float32)
 
 def dequant_q6_k(blk):
   """[nb, 210] Q6_K super-blocks -> float32 [nb, 256], per the GGUF format's Q6_K layout (the values ggml's own dequantisation
@@ -70,9 +102,9 @@ class GGUF:
     if kind == "F32": return raw.view(np.float32).reshape(shape).copy()
     if kind == "F16": return raw.view(np.float16).reshape(shape).astype(np.float32)
     if kind == "BF16": return (raw.view(np.uint16).astype(np.uint32) << 16).view(np.float32).reshape(shape)
-    if kind in ("Q4_K", "Q6_K"):
+    if kind in ("Q4_K", "Q5_K", "Q6_K", "MXFP4", "Q5_1"):
       nb = raw.size // GGML[self.tensors[name][1]][2]; bb = raw.reshape(nb, -1)
-      return (dequant_q4_k(bb) if kind == "Q4_K" else dequant_q6_k(bb)).reshape(shape)
+      return {"Q4_K": dequant_q4_k, "Q5_K": dequant_q5_k, "Q6_K": dequant_q6_k, "MXFP4": dequant_mxfp4, "Q5_1": dequant_q5_1}[kind](bb).reshape(shape)
     q, d = self.q8(name); return (q.astype(np.float32).reshape(q.shape[0], -1, 32) * d[..., None]).reshape(shape)
   def q8_rows(self, name, rows):
     """Rows of a Q8_0 matrix, dequantised (the embedding lookup): float32 [len(rows), K]."""

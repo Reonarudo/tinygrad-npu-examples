@@ -20,7 +20,14 @@ and runs it; the text models can also be served over the OpenAI and Ollama APIs.
 | [bonsai2-27b/](bonsai2-27b/) | PrismML's Ternary Bonsai 2 27B (Qwen3.8-27B with ternary weights) from its 5.9 GB GGUF: all 64 layers and the head on a ternary GEMM, speculative decoding with Qwen3.8-27B's MTP layer as the draft; an OpenAI- and Ollama-compatible server (`bonsai2_serve.py`) | 2.1 tok/s plain; **~6.2 tok/s** with speculative decoding on three prompts (~7.5 on code), same tokens |
 | [qwen3.8-27b/](qwen3.8-27b/) | Qwen3.8-27B text generation from its FP8 checkpoint: all 64 layers, the head and the multi-token-prediction (MTP) draft head on the NPU, weights mapped zero-copy from RAM | 0.76 tok/s plain; **~2.2 tok/s** with speculative decoding on three prompts (3.6 on code, 2.9 on step-by-step reasoning, 1.35 on prose; `QWEN_SPEC=6`), same tokens |
 | [ornith-9b/](ornith-9b/) | Ornith 1.0 9B (Qwen3.5 architecture) from its GGUF Q8_0 checkpoint, on the same modules as qwen3.8-27b; speculative decoding with Qwen3.5-9B's MTP head as the draft | 2.1 tok/s plain; **~6.8 tok/s** with speculative decoding on three prompts (8.1-8.4 on code and step-by-step reasoning), same tokens |
-| [gemma4/](gemma4/) | Google's Gemma 4 E2B and E4B from their Q8_0 GGUFs: every layer (sliding-window and global attention, per-layer embeddings, shared KV caches) and the head with its top-1 on the NPU, the prompt 8 tokens a pass, speculative decoding with Gemma 4's MTP draft head | E2B 8.2 tok/s plain, **~18 tok/s** with speculative decoding on three prompts (~21 on code); E4B 4.3 and **11.0 tok/s**; same tokens |
+| [qwen3-30b-a3b/](qwen3-30b-a3b/) | Qwen3-30B-A3B (128-expert MoE, 3.3 B active) from the Radxa forum's benchmark GGUF, Q4_K_M: all 48 layers, the routing and the head on the NPU in the checkpoint's own Q4_K / Q6_K; prompts in 512-token chunks with the experts grouped by token, the attention on the matrix unit; decode on integer dot products (`qdot`) over the same streams, the Q6_K linears and the attention from decode-only 6.6- / 4.75-bit copies | **prefill 62.4 tok/s** (llama.cpp on the same board's CPU: 31.3); decode 9.6 tok/s (CPU: 17.4) |
+| [gemma4/](gemma4/) | Google's Gemma 4 E2B and E4B from their Q8_0 GGUFs: every layer (sliding-window and global attention, per-layer embeddings, shared KV caches) and the head with its top-1 on the NPU, the prompt 8 tokens a pass, speculative decoding with Gemma 4's MTP draft head | E2B 8.4 tok/s plain, **~22 tok/s** with speculative decoding (7 drafts a pass; ~13.6 on prose); E4B 4.3 and **11.0 tok/s**; same tokens; prefill 46 tok/s on a 1074-token prompt |
+| [qwen35moe/](qwen35moe/) | Qwen3.6-35B-A3B (and Qwen3.5-35B-A3B; 256-expert MoE with a shared expert, 3 B active, Gated DeltaNet + full attention every 4th layer) from the UD-Q4_K_M GGUF, nothing requantised (a native 5-bit stream for its Q5_K experts): all 40 layers, the routing and the head on the NPU, one kernel graph a layer | **4.7 tok/s** decode, llama.cpp's tokens; prefill 3.3 tok/s (the decode path a token) |
+| [ringmini/](ringmini/) | inclusionAI's Ring-mini-2.0 (256-expert MoE, ~1.4 B active, grouped sigmoid router) from its Q4_K_M GGUF: an all-GEMV layer, the routing on the device, one kernel graph a layer | **12.5 tok/s** decode, the reference's tokens; prefill 9.1 tok/s |
+| [lfm25/](lfm25/) | Liquid's LFM2.5-24B-A2B (short-conv + attention hybrid, 64 experts top 4, ~2.2 B active) from its Q4_K_M GGUF: the conv as one row kernel with its state on the device, the dense 11776-wide FFN on the matrix unit | **9.2 tok/s** decode, llama.cpp's tokens; prefill 5.1 tok/s |
+| [gptoss/](gptoss/) | OpenAI's gpt-oss-20b (MXFP4 experts, attention sinks, sliding windows, YaRN) from its GGUF: the experts repacked losslessly into a 5.75-bit integer stream (the FP4 decoder ran at 5 GB/s), the library's sinks attention (`seqmix/attn.py`) | **4.9 tok/s** decode, llama.cpp's tokens but one near tie in 24; prefill 3.3 tok/s |
+| [gemma26/](gemma26/) | Google's Gemma 4 26B-A4B (128 experts top 8 beside a dense FFN, local / global attention with head dimension 256 / 512) from unsloth's UD-Q4_K_M GGUF: a new exact 6-bit stream for its Q5_1 experts, the gemma4 example's attention kernels | **3.7 tok/s** decode, the reference's tokens; prefill 2.3 tok/s |
+| [seqmix/](seqmix/) | the sequence-mixer kernel library the ports draw on: Mamba-2, MLA, KDA, CCA, attention with sinks and windows, the device routing and the row kernels, each with a numpy contract and a simulator gate | per layer on the board: Mamba-2 532 us, MLA 447, KDA 253, CCA 101, sinks attention 147 / 262, routing 69 |
 | [ideogram4/](ideogram4/) | Ideogram 4 text-to-image at full precision: both DiT transformers and the VAE decoder on the NPU | ~167 s a sampling step at 1024 x 1024 (12 steps with `V4_TURBO_12`, ~33 min an image) |
 
 Speeds are measured on the board with the NPU clocks at their defaults; text-generation speed depends on the prompt (code and
@@ -29,13 +36,47 @@ other predictable text drafts better).
 - **Qwen3.8-27B / Ornith:** the host only tokenises, embeds and picks tokens. Decoding is bound by streaming the weights through
   the NPU's ~24 GB/s DDR port (27 GB a pass for the 27B), so speculative decoding verifies up to 6 tokens per pass through the
   weights. The output is identical to plain greedy decoding by construction.
-- **Bonsai 2 27B:** the ternary weights cut a pass's weight traffic to ~7 GB, which streams through the same port; the GEMM works
-  in tiles of 4 rows, so a verify pass costs about the same for 1 to 4 tokens and speculative decoding drafts at most 3.
+- **Bonsai 2 27B:** the ternary weights cut a token's weight traffic to ~8 GB, but expanding them makes the GEMM compute-bound, so
+  a verify pass is cheap up to 4 rows and speculative decoding drafts at most 3 tokens.
+- **Qwen3-30B-A3B:** a prompt chunk of 512 tokens reads each expert about twice and is GEMMs on the matrix unit, so prefill beats the
+  CPU; a decode token reads ~2.1 GB through the NPU's 24 GB/s port (~10.8 tok/s at best with the prefill's streams), so decode stays
+  the CPU's -- its GEMVs run as integer dot products at the port's rate, 9.6 tok/s.
 - **Gemma 4:** a token streams ~2.4 GB of weights on E2B (~5 GB on E4B), so plain decoding is bound near 10 tok/s (E4B: 5); a
-  verify pass of up to 8 rows costs ~1.1 plain steps, and the model's own MTP draft head proposes up to 6 tokens a pass.
+  verify pass of up to 8 rows costs ~1.1 plain steps, and the model's own MTP draft head proposes up to 7 tokens a pass.
 - **Ideogram 4:** the text encoder runs on the host CPU (~2.5 min a prompt); everything after it runs on the NPU.
 
-## Requirements
+## Small MoE models side by side
+
+The five models of the small-MoE survey's NPU-fit ranking run on the same recipe: the checkpoint's own quantisation streamed
+as integer dot products on the TECs (nothing requantised), the weights pinned in RAM and mapped two layers at a time, one kernel graph a
+layer with the expert routing on the device, and no host sync inside a token. Board: Radxa Orion O6N (Zhouyi X2, 3 cores x 4 TECs, one
+~23 GB/s DDR port, 29 GB RAM), greedy decoding, the prompt through the decode path a token. "Reference" is the numpy reference built
+from the GGUF, which reproduces llama.cpp's greedy output where that was checked.
+
+| model | active / total params | resident weights | decode tok/s | prefill tok/s | byte floor at 23 GB/s | layer gate (worst rel. err.) | output |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| [Ring-mini-2.0](ringmini/) | ~1.4 B / 16 B | 11 GB | **12.5** | 9.1 | ~31 tok/s | 8e-4 | = reference |
+| [LFM2.5-24B-A2B](lfm25/) | ~2.2 B / 24 B | 16.0 GB | **9.2** | 5.1 | ~21 | 1.1e-3 | = reference |
+| [gpt-oss-20b](gptoss/) | ~3.6 B / 21 B | 14.6 GB | **4.9** | 3.3 | ~9.5 | 1.3e-4 | 23 of 24 ids (one near tie) |
+| [Qwen3.6-35B-A3B](qwen35moe/) | ~3 B / 35 B | 23.6 GB | **4.7** | 3.3 | ~8.8 | 1.05e-3 (all 40 layers) | = llama.cpp |
+| [Gemma 4 26B-A4B](gemma26/) | ~4 B / 26 B | 18.1 GB | **3.7** | 2.3 | ~6.8 | 2.2e-4 | = reference |
+
+A token's time is close to `bytes / 23 GB/s + ~2.3 ms x layers`: the weights through the DDR port, plus a fixed cost a layer (20-30
+kernel launches, the fp32 router GEMV, the plain-load row kernels). Ring is fastest on both counts: the fewest active parameters and the
+fewest layers (20). The byte floor is what the format allows; the gap to it is the fixed cost, which fusing the layer's kernels and a
+DMA router GEMV would cut. None of these ports has a speculative or batched-prefill path yet; the dense examples above show what those
+add (Gemma 4 E2B 8.4 -> 22 tok/s).
+
+For comparison, the dense models on the same board: Bonsai 2 27B (ternary, ~8 GB a token) 2.1 tok/s plain / 6.2 speculative;
+Qwen3-30B-A3B (MoE, Q4_K_M) 9.6 tok/s decode.
+
+## Getting started
+
+```sh
+git clone --recurse-submodules <repository-url>
+cd example-tinygrad-npu-uses
+pip install -r requirements.txt
+```
 
 - A Radxa Orion O6N (or another CIX P1 board) running Linux with the Zhouyi NPU kernel driver (details below).
 - **Python 3.12 or newer** with `numpy` and `tokenizers` (`pip install -r requirements.txt`). tinygrad comes from the submodule;
@@ -55,29 +96,8 @@ More detail in [`tinygrad/extra/zhouyi/README.md`](tinygrad/extra/zhouyi/README.
 - **For the 27B models and Gemma 4:** the driver's zero-copy weight buffers (the WBUF / SLOT ioctls). Without them the weights
   are copied every token (~2-3 s a token on the 27B).
 - **NPU clocks at their defaults** (`npuclk` 1.2 GHz, `npu_memclk` 750 MHz) to reproduce the numbers above.
-- **Optional, for the speeds above:** write access to `/dev/cpu_dma_latency` (see
-  [bonsai2-27b/README.md](bonsai2-27b/README.md#the-cpu-latency-request)); without it the text models run slower and print a note.
-- **Disk:** Qwen3.8 about 27 GB of checkpoint + 27 GB of packed layers; Bonsai 2 about 6.4 GB of downloads + 8.2 GB packed;
-  Gemma 4 E2B 5.0 GB + 2.5 GB packed (E4B: 5.0 GB packed); Ideogram 4 about 45 GB, plus ~16 GB of repacked panels (set
-  `P48_DIR` / `W13I_DIR` to a disk with room).
-
-## Getting started
-
-```sh
-git clone --recursive https://github.com/Reonarudo/tinygrad-npu-examples.git
-cd tinygrad-npu-examples
-pip install -r requirements.txt
-```
-
-If you cloned without `--recursive`, run `git submodule update --init` to fetch `tinygrad/`.
-
-The scripts import tinygrad from the `tinygrad/` submodule. To use another checkout, set `TG=/path/to/tinygrad`.
-
-### Paths
-
-The scripts default to model and cache paths under `/mnt/ssd/...` (and `~/ideogram4` for Ideogram 4). These are examples: set
-the environment variables each README lists (`BONSAI_DIR`, `BONSAI_GGUF`, `QWEN_DIR`, `QWEN_NPU`, `ORNITH_GGUF`, `GEMMA_GGUF`,
-`GEMMA_NPU`, `IDEOGRAM4_DIR`, ...) to your own paths, on a disk with room.
+- **Disk:** Qwen3-30B-A3B 17.3 GB of checkpoint + 26 GB packed (and ~27 GB of free RAM for its pinned weights); Qwen3.8 about 27 GB of checkpoint + 27 GB of packed layers; Bonsai 2 about 6.4 GB of downloads + 8.7 GB packed; Gemma 4 E2B 5.0 GB + 2.4 GB packed; Ideogram 4 about 45 GB, plus ~16 GB of repacked panels
+  (set `P48_DIR` / `W13I_DIR` to a disk with room).
 
 ### First run
 

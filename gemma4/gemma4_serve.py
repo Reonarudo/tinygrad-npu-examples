@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Gemma 4 (E2B / E4B) behind an OpenAI- and Ollama-compatible HTTP endpoint: qwen3.8-27b/qwen38_serve.py's HTTP side and request
 queue, with Gemma's model, its tokenizer and chat template (gemma4_tokenize: from the GGUF itself) and gemma4_generate's decoding
--- speculative with the MTP drafter when its GGUF is beside the model (as gemma4_generate: 6 drafts a pass, tau 0.5), the text
+-- speculative with the MTP drafter when its GGUF is beside the model (as gemma4_generate: 7 drafts a pass, tau 0.65), the text
 streamed as each verify pass accepts it. Greedy; thinking off.
 
   python3 gemma4_serve.py [--host 0.0.0.0] [--port 8000] [--cache /mnt/ssd/gemma4-e2b-npu] [--tmax 1024] [--spec 6] [--tau 0.5]
@@ -23,7 +23,7 @@ class Engine(QS.Engine):
   def __init__(self, a):
     self.cpus, self.lat = GG.pin_cpus(), GG.hold_cpu_latency()
     meta = json.load(open(os.path.join(a.cache, "gemma4.json"))); gguf = meta["gguf"]; mtp = a.mtp or GG.GM_default_mtp(gguf)
-    self.spec = a.spec if a.spec is not None else int(os.environ["GEMMA_SPEC"]) if "GEMMA_SPEC" in os.environ else 6 if os.path.exists(mtp) else 0
+    self.spec = a.spec if a.spec is not None else int(os.environ["GEMMA_SPEC"]) if "GEMMA_SPEC" in os.environ else 7 if os.path.exists(mtp) else 0
     self.e4b = "E4B" in os.path.basename(gguf)
     if self.spec and self.e4b: os.environ.setdefault("GEMMA_LAYER_BLOCK", "4"); os.environ.setdefault("GEMMA_SPEC_GEOS", "3,5,7")   # as gemma4_generate
     t0 = time.perf_counter(); R = GR.Model(gguf, cache_layers=os.environ.get("GEMMA_PLE", "dev") == "host")
@@ -31,6 +31,8 @@ class Engine(QS.Engine):
     self.m = GG.Model(R, a.cache, a.tmax); self.dr = None
     if self.spec:
       import gemma4_mtp as GM
+      if os.environ.get("GEMMA_QDRAFT", "1") == "1": import gemma4_draft as GD; GD.default_mtp = GM.default_mtp; GD.Drafter = GD.QDrafter; GM = GD   # (as gemma4_generate)
+      os.environ.setdefault("QWEN_HEAD_TOPV", "1")
       self.geos = sorted({int(x) for x in os.environ.get("GEMMA_SPEC_GEOS", ",".join(str(x) for x in range(2, self.spec + 2))).split(",")} | {self.spec + 1})
       self.dr = GM.Drafter(self.m, mtp, os.path.join(a.cache, "mtp")); self.m.warmup(sorted({self.pm} | set(self.geos)))
       self.dr.chain(2, np.zeros(self.m.c.H, np.float32), 1, 2)                                     # (the drafter's graph captured)
@@ -67,8 +69,8 @@ def main():
   ap.add_argument("--cache", default=GG.DEFAULT_CACHE); ap.add_argument("--model-name", default=os.environ.get("GEMMA_SERVE_NAME"))
   ap.add_argument("--tmax", type=int, default=1024, help="the context: prompt + generated tokens (the global layers' cache length)")
   ap.add_argument("--prefill-m", type=int, default=int(os.environ.get("GEMMA_PREFILL_M", "8")), help="prompt tokens a pass")
-  ap.add_argument("--spec", type=int, default=None, help="drafts a pass (0: plain greedy; default GEMMA_SPEC, else 6 when the drafter is found)")
-  ap.add_argument("--tau", type=float, default=float(os.environ.get("GEMMA_DRAFT_TAU", "0.5"))); ap.add_argument("--mtp", default=None)
+  ap.add_argument("--spec", type=int, default=None, help="drafts a pass (0: plain greedy; default GEMMA_SPEC, else 7 when the drafter is found)")
+  ap.add_argument("--tau", type=float, default=float(os.environ.get("GEMMA_DRAFT_TAU", "0.65"))); ap.add_argument("--mtp", default=None)
   a = ap.parse_args(); eng = Engine(a); size = "E4B" if eng.e4b else "E2B"; name = a.model_name or f"gemma4-{size.lower()}"
   details = {"format": "npu", "family": "gemma4", "families": ["gemma4"], "parameter_size": size, "quantization_level": "Q8_0"}
   srv = ThreadingHTTPServer((a.host, a.port), QS.make_handler(eng, name, chat_messages, details))

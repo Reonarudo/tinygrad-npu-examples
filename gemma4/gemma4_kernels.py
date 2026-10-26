@@ -443,9 +443,10 @@ def gattn_part_size(NH, NKV, HD, M):
 
 def gattn_kvd_desc(KR, HD): return QK.V._desc_slots((KR * 4,), (HD * 4,))
 
-def gattn_kvd_src(NKV, HD, eps, M, KR, vsame=False, ring=0):
+def gattn_kvd_src(NKV, HD, eps, M, KR, vsame=False, ring=0, vnorm=True):
   """gattn_kv by DMA: unit = (row t, kv head h, k or v): the row's projection arrives by DMA (the whole kv row, KR floats), is normed
-  (and for k rotated, x knw) in LSRAM and leaves by DMA into the cache row (pos + t, or (pos + t) % ring). args: as gattn_kv + desc."""
+  (and for k rotated, x knw) in LSRAM and leaves by DMA into the cache row (pos + t, or (pos + t) % ring). args: as gattn_kv + desc.
+  `vnorm` False (Qwen3: v is not normed): v leaves as it arrived."""
   assert HD % 16 == 0
   row = (lambda t: f"(({t}) % {ring})") if ring else (lambda t: f"({t})")
   OUT = KR * 4; assert OUT + HD * 4 <= 32768 - 64
@@ -457,8 +458,8 @@ __kernel void gattn_kvd(__global float* restrict Kc, __global float* restrict Vc
     int t = u / {NKV * 2}, h = (u / 2) % {NKV}, isv = u % 2; int pos = pos0 + t;
     DMA_FILL(0, DESC(desc, 0), 0, (int)(kv_rows + t * {KR})); DMA_WAIT(0);
     __global float* src = LSF(0) + (isv ? {0 if vsame else NKV * HD} : 0) + h * {HD}; __global float* dst = LSF({OUT});
-    if (isv) norm_rope(dst, src, (__global float*)0, (__global float*)0); else norm_rope(dst, src, knw, cs + pos * {HD});
-    DMA_DRAIN(1, DESC(desc, 1), {OUT}, (int)((isv ? Vc : Kc) + ({row("pos")} * {NKV} + h) * {HD})); DMA_WAIT(1);
+    {"if (isv) norm_rope(dst, src, (__global float*)0, (__global float*)0); else " if vnorm else "if (isv) dst = src; else "}norm_rope(dst, src, knw, cs + pos * {HD});
+    DMA_DRAIN(1, DESC(desc, 1), {OUT if vnorm else "(int)((__global char*)dst - (__global char*)LSF(0))"}, (int)((isv ? Vc : Kc) + ({row("pos")} * {NKV} + h) * {HD})); DMA_WAIT(1);
   }}
   DMA_WAIT_ALL();
 }}"""

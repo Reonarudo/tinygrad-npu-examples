@@ -181,6 +181,21 @@ E2B, the ids identical to llama.cpp's in every row:
 12 rows lose to 8: a 12-row pass needs a third row tile of the GEMM and costs 264 ms against 132 ms. E4B: 22 tokens in 0.69 s,
 1074 tokens in 39.0 s.
 
+**Speculative decoding** (the default when the drafter's GGUF is beside the model; board o6n, 2026-10-25, the Fibonacci / code prompts,
+100 new tokens, 6 drafts a pass, tau 0.5): **22.2 / 21.9 tok/s** (was 21.4 / 20.9 with the matrix-unit drafter), 3.41 tokens a pass,
+ids identical to plain greedy. A pass is a 7-row verify (133 ms: 109 ms of GEMMs at the port's rate for 2.4 GB of weights, 19 ms of
+small kernels) plus ~4.5 drafts at 4.5 ms: the **drafter runs on qdot integer GEMVs** (`gemma4_draft.py`, `GEMMA_QDRAFT=0` for the
+matrix-unit one) over a decode-only Q8_0 stream of its 83 MB, its 41 kernels fused into one launch with device barriers; 3.0 ms of a
+draft is its 71 MB head at the DDR port, the rest the host's round trip. The head's top-1 runs in one vector pass a row
+(`QWEN_HEAD_TOPV`, 2.0 -> 1.25 ms). **The defaults are now 7 drafts a pass and tau 0.65** (an 8-row pass costs what a 7-row one does;
+`check/sched_an.py` replays the recorded chains under policies): against 6 / 0.5 in the same session, Fibonacci 21.4 -> 22.0 tok/s,
+code 21.0 -> 22.1, "why is the sky blue" 12.7 -> 13.6; pooled 17.3 -> 18.3. Scheduling the draft count by the target's own confidence
+in the token drafted from does NOT help: its top-1 probability does not predict how many drafts get accepted (p >= 0.99: 2.2 of 7;
+0.5-0.7: 2.8; 0.7-0.9: 1.5), and 74 of 120 passes start above 0.99.
+
+Set-up: the weights load in 1.9 s (zero-copy from the cache) and the kernel graphs are captured in 5.3 s, before the prompt.
+A decode step grows by ~0.01 ms per position of context (124 ms at position ~30, 132 ms at ~1074, on an earlier build).
+
 ### Where the time goes
 
 A ~124 ms plain E2B token: the GEMMs ~111 ms (gate | up 48, down 26, head 18, q | k | v 8, o 7, the
@@ -291,6 +306,7 @@ residual adds) ~8 ms; the launches inside the jobs ~4 ms; the host and the 9 job
 | `gemma4_kernels.py` | the hand-written kernels Gemma 4 adds to the Qwen family's: attention, the post-norm residual, the per-layer-embedding gate and inputs |
 | `gemma4_ref.py` | the numpy reference forward pass, straight from the GGUF (and the draft head's) |
 | `check/mtp_accept.py` | the draft head's acceptance against its target, in numpy |
+| `gemma4_draft.py` | the drafter on qdot GEMVs (qwen3-30b-a3b's `qgemvk`, kind q8) with DMA-staged package producers, fused into one launch; `check/qdraft_cmp.py` (vs the matrix-unit drafter), `check/qdraft_unit.py` (its kernels vs numpy), `check/kbench.py` (a pass / a draft kernel by kernel) |
 | `gemma4_tokenize.py` | the tokenizer and the chat template, from the GGUF |
 | `gemma4_serve.py` | the OpenAI- and Ollama-compatible server |
 | `demo/` | `serve-demo.gif`'s recording: `make_demo.sh` and its VHS tape |

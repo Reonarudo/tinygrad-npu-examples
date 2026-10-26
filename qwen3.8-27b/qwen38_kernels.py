@@ -951,7 +951,45 @@ __kernel void head_topd(__global float* restrict out, __global float* restrict c
   #undef ISSUE
 }}"""
 
-# ---- QWEN_SMALL2: head_top3 / head_top3r by DMA, bit-identical ---------------------------------------------------------------
+def head_topv_src(nc, nrb, m):
+  """head_topd with one vector pass a row and chunk (rpmax / rpadd instead of hmax8 / hsum8 and three scalar passes): the running
+  maximum folded in per 8-column vector (the sums rescaled when it rises, the column its first lane), the same partials up to the
+  sums' rounding order; the argmax identical (strict >, columns in order). Same args / desc as head_topd. QWEN_HEAD_TOPV=1."""
+  assert 1 <= m <= 8; ng = -(-nc // 48); SB = 3 * nrb
+  cg, PF, RO = (HT_CG, 64, "r * 4") if m <= 4 else (HT_CG2, 128, "(r / 4) * 64 + (r % 4) * 4")
+  CH = ((cg - 1) * SB + 3) * PF * 4; assert 2 * CH <= 32768 - 64
+  return V.FULL_H + TILE + EXP + f"""
+__kernel void head_topv(__global float* restrict out, __global float* restrict ct, __global int* restrict desc, const int core_id) {{
+  int g0 = core_id * {ng} / {NT}, g1 = (core_id + 1) * {ng} / {NT}; int nch = (g1 - g0 + {cg - 1}) / {cg};
+  float mx[{m}], ssum[{m}]; int am[{m}]; for (int r = 0; r < {m}; r++) {{ mx[r] = -3.0e38f; ssum[r] = 0.0f; am[r] = 0; }}
+  #define ISSUE(k, buf) {{ int ga = g0 + (k) * {cg}; int gn = g1 - ga < {cg} ? g1 - ga : {cg}; DMA_FILL(buf, DESC(desc, gn - 1), (buf) * {CH}, (int)(ct + ga * {SB * 192})); }}
+  if (nch > 0) ISSUE(0, 0);
+  for (int k = 0; k < nch; k++) {{
+    int p = k & 1; if (k + 1 < nch) {{ if (p == 0) ISSUE(k + 1, 1) else ISSUE(k + 1, 0) }}
+    if (p == 0) DMA_WAIT(0); else DMA_WAIT(1);
+    __global float* B = LSF(p * {CH}); int ga = g0 + k * {cg}; int gn = g1 - ga < {cg} ? g1 - ga : {cg};
+    for (int r = 0; r < {m}; r++) {{
+      float cm = mx[r], ss = ssum[r]; int ca = am[r]; float8 s8 = BC(0.0f);
+      for (int gg = 0; gg < gn; gg++) for (int sq = 0; sq < 6; sq++) {{
+        int c = (ga + gg) * 48 + sq * 8; __global float* q = B + (gg * {SB} + sq / 2) * {PF} + (sq % 2) * 32 + {RO};
+        float8 v = F8(*(__global float4*)q, *(__global float4*)(q + 16));
+        if (c + 8 > {nc}) {{ for (int j = 0; j < 8; j++) if (c + j >= {nc}) v[j] = -3.0e38f; }}
+        float vm = __builtin_aipu_rpmax_tfp32_pw(v, v, ALL)[0];
+        if (vm > cm) {{
+          float f = exp2_d4(BC((cm - vm) * 1.4426950408889634f))[0]; ss *= f; s8 *= BC(f); cm = vm;
+          for (int j = 0; j < 8; j++) if (v[j] == vm) {{ ca = c + j; break; }}
+        }}
+        s8 += exp2_d4((v - BC(cm)) * BC(1.4426950408889634f));
+      }}
+      mx[r] = cm; am[r] = ca; ssum[r] = ss + __builtin_aipu_rpadd_tfp32_pw(s8, s8, ALL)[0];
+    }}
+  }}
+  for (int r = 0; r < {m}; r++) {{ __global float* o = out + (core_id * {m} + r) * 4; o[0] = mx[r]; o[1] = (float)am[r]; o[2] = ssum[r]; o[3] = 0.0f; }}
+  DMA_WAIT_ALL();
+  #undef ISSUE
+}}"""
+
+# ---- QWEN_SMALL2: head_top3 / head_top3r by DMA, bit-identical ----------------------------------------------------------------
 # head_top3 read its C tiles by cached loads (Ornith's draft head ~485 us a part, head_top3r ~395). These keep its task split (8-
 # column units, task t: units t n8 / NT .. (t + 1) n8 / NT), its per-row loops in unit order and its expressions (hmax8, the
 # insertion, exp2_d4, hsum8): the same partials, bit for bit. The task's whole C groups stream through LSRAM: per chunk of <= T3_CG
@@ -3669,6 +3707,9 @@ class Kernels:
     if self.small_dma() and self.real <= 8:          # rows mode: the C tiles by DMA (head_topd; m > 4: row quads 0 and 1)
       dk = f"head_topd_desc{self.nrb}" if self.real <= 4 else f"head_topd_desc{self.nrb}q2"
       if dk not in self.bufs: self.bufs[dk] = Tensor(head_topd_desc(nc, self.nrb) if self.real <= 4 else head_topd_desc(nc, self.nrb, 2), device=DEV).realize()
+      if os.environ.get("QWEN_HEAD_TOPV", "0") == "1":   # one vector pass a row (gemma4: 2.0 -> ~0.5 ms on a 7-row verify pass)
+        k = self.key(f"head_topv|{nc}|{self.real}", head_topv_src(nc, self.nrb, self.real))
+        return self.run(k, tag, NT * self.real * 4, dtypes.float32, ct, self.bufs[dk])
       k = self.key(f"head_topd|{nc}|{self.real}", head_topd_src(nc, self.nrb, self.real))
       return self.run(k, tag, NT * self.real * 4, dtypes.float32, ct, self.bufs[dk])
     k = self.key(f"head_top|{nc}|{self.real}", head_top_src(nc, self.nrb, self.real))

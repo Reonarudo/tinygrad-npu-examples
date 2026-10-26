@@ -31,4 +31,6 @@ done
 # the packed weight caches (E4M3 panels in the GEMM layout): ~8.4 GB each, a few minutes each
 [ -f fpcache/done ]      || { python3 "$HERE/ideogram4_fp_pack.py" --weights unconditional_transformer --out fpcache --layers 0-33 && touch fpcache/done; }
 [ -f fpcache_cond/done ] || { python3 "$HERE/ideogram4_fp_pack.py" --weights transformer --out fpcache_cond --layers 0-33 && touch fpcache_cond/done; }
+# the text encoder's cache for the NPU (E4M3 panels + the text projection): 7.2 GB, a few minutes (needs TG)
+[ -f te_p48/done ]        || { python3 "$HERE/ideogram4_te_pack.py" --te text_encoder --cond transformer --out te_p48 && touch te_p48/done; }
 echo "== done $(date +%T): $D"

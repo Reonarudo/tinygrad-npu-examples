@@ -697,13 +697,15 @@ def gather_o_dma_descs(nrb: int) -> np.ndarray:
 
 
 # ---- S5b: softmax over any key count, streamed ----
-def _PASS1_SCAN(gb, ng, nrb, RB, treal, stamps, causal=False):
-    """softmax_stream's pass 1 over the logits themselves (the row maxima, lane-wise)."""
+def _PASS1_SCAN(gb, ng, nrb, RB, treal, stamps, causal=False, ngc=None):
+    """softmax_stream's pass 1 over the logits themselves (the row maxima, lane-wise). `ngc`: the group chunks a unit scans
+    (default all; `causal_trim`: those up to the row block's last row)."""
+    NGC = ng // gb if ngc is None else ngc
     return f"""/* pass 1: the row maxima (lane-wise, reduced below) */
     DMA_FILL(0, DESC(desc, 0), 0, (int)base);
-    for (int gc = 0; gc < {ng // gb}; gc++) {{
+    for (int gc = 0; gc < {NGC}; gc++) {{
       int s = gc & 1;
-      if (gc + 1 < {ng // gb}) DMA_FILL(s ^ 1, DESC(desc, 0), (s ^ 1) * {gb * 4608}, (int)(base + (gc + 1) * {gb * nrb * RB}));
+      if (gc + 1 < {NGC}) DMA_FILL(s ^ 1, DESC(desc, 0), (s ^ 1) * {gb * 4608}, (int)(base + (gc + 1) * {gb * nrb * RB}));
       {"{ int t_ = __builtin_aipu_mfctrl0(0xd1); acc_[0] += t_ - t0_; t0_ = t_; }" if stamps else ""}
       DMA_WAIT(s);
       {"{ int t_ = __builtin_aipu_mfctrl0(0xd1); acc_[1] += t_ - t0_; t0_ = t_; }" if stamps else ""}
@@ -721,15 +723,18 @@ def _PASS1_SCAN(gb, ng, nrb, RB, treal, stamps, causal=False):
     }}"""
 
 
-def softmax_stream_src(treal: int, nh: int, tp: int, nrb: int, ks: int, scale: float, hb: int = 0, nt: int = NT, gb: int = 2, stamps: bool = False, fast: bool = True, rowmax: bool = False, p2t: int = 5, causal: bool = False) -> str:
+def softmax_stream_src(treal: int, nh: int, tp: int, nrb: int, ks: int, scale: float, hb: int = 0, nt: int = NT, gb: int = 2, stamps: bool = False, fast: bool = True, rowmax: bool = False, p2t: int = 5, causal: bool = False, causal_trim: bool = False) -> str:
     """Unnormalized `P = fp16(exp(C * scale - rowmax))` for `nh` heads of logit tiles (N = tp; head h at `ct + h * LG`)
     in the A layout (head h at `out + h * PA`), and each row's `1 / sum` into `sums` (`[hb + h][rb][16]`: a 64-B line per
     unit), applied by `gather_o_sum`. Keys >= `treal` masked. A (row block, head) per unit, streamed twice by group:
     pass 1 row maxima, pass 2 exp, sums, A slices (fills flags 0/1, drains 2/3). `gb`: groups per DMA request.
     `rowmax`: logits from `gemm_gs(rowmax=True)`; pass 1 uses their maxima, scanning only groups with masked keys.
     `p2t`: pass-2 body (2: rolled two-tile, 3: `P2F`, 5: `P2P`, else 4-tile). `causal`: mask keys after the row.
+    `causal_trim`: a row block reads only the key groups up to its last row and writes only their P slices (the logits beyond
+    may be unwritten; the P beyond must be zero from the start: whoever reads it must know -- `gemm_gs(causal=2)` does not).
     args: out, ct, sums, desc (`softmax_stream_descs(nrb, gb, rowmax=ng if rowmax)`)."""
     assert not (causal and rowmax), "causal: the GEMM's maxima include the future keys"
+    assert not causal_trim or causal, "causal_trim needs causal"
     KMASK2 = ("""
 /* causal: lanes 0-3 are row `row`, 4-7 row `row + 1`; a key is kept if < treal and <= its row */
 static inline float8 kmask2(int g, int st, int jt, int row) {
@@ -743,7 +748,8 @@ static inline float8 kmask2(int g, int st, int jt, int row) {
     ngf, ngp = treal // 96, -(-treal // 96)         # the groups wholly below treal; those with any key below it
     sl2 = scale * LOG2E
     EXP = "exp2_le0" if fast else "exp2_f8"
-    PASS1 = _PASS1_SCAN(gb, ng, nrb, RB, treal, stamps, causal) if not rowmax else """/* pass 1: the GEMM's maxima of the full groups (one strided fill), then a scan of the groups with masked keys */
+    NGC = "ngc" if causal_trim else ng // gb          # the unit's group chunks
+    PASS1 = _PASS1_SCAN(gb, ng, nrb, RB, treal, stamps, causal, NGC if causal_trim else None) if not rowmax else """/* pass 1: the GEMM's maxima of the full groups (one strided fill), then a scan of the groups with masked keys */
     DMA_FILL(0, DESC(desc, 3), 0, (int)(base + 1152)); DMA_WAIT(0);
     {
       __global float* MX = LSF(0);
@@ -868,6 +874,7 @@ __kernel void softmax_stream(__global half* restrict out, __global float* restri
   for (int u = core_id; u < {nrb * nh}; u += {nt}) {{
     int rb = u / {nh}, h = u % {nh};
     __global float* base = ct + h * {LG} + rb * {RB};
+    {f"int ngc = (rb * 12 + 12 + {96 * gb - 1}) / {96 * gb}; ngc = ngc < {ng // gb} ? ngc : {ng // gb};" if causal_trim else ""}
     float8 m01[3], m23[3];
     for (int i = 0; i < 3; i++) {{ m01[i] = BC(-3.0e38f); m23[i] = BC(-3.0e38f); }}
     {PASS1}
@@ -881,9 +888,9 @@ __kernel void softmax_stream(__global half* restrict out, __global float* restri
     float8 s01[3], s23[3];
     for (int i = 0; i < 3; i++) {{ s01[i] = BC(0.0f); s23[i] = BC(0.0f); }}
     DMA_FILL(0, DESC(desc, 0), 0, (int)base);
-    for (int gc = 0; gc < {ng // gb}; gc++) {{
+    for (int gc = 0; gc < {NGC}; gc++) {{
       int s = gc & 1;
-      if (gc + 1 < {ng // gb}) DMA_FILL(s ^ 1, DESC(desc, 0), (s ^ 1) * {gb * 4608}, (int)(base + (gc + 1) * {gb * nrb * RB}));
+      if (gc + 1 < {NGC}) DMA_FILL(s ^ 1, DESC(desc, 0), (s ^ 1) * {gb * 4608}, (int)(base + (gc + 1) * {gb * nrb * RB}));
       {"{ int t_ = __builtin_aipu_mfctrl0(0xd1); acc_[2] += t_ - t0_; t0_ = t_; }" if stamps else ""}
       DMA_WAIT(s); DMA_WAIT(2 + s);
       {"{ int t_ = __builtin_aipu_mfctrl0(0xd1); acc_[3] += t_ - t0_; t0_ = t_; }" if stamps else ""}
@@ -970,6 +977,119 @@ __kernel void gather_o_sum(__global half* restrict out, __global float* restrict
 def gather_o_sum_descs(nrb: int, dhp: int = 288) -> np.ndarray:
     """0: the fill (dhp / 96 tile blocks), 1..24: a drain of n quads, 25: the unit's sums."""
     return _desc_slots(((dhp // 96) * 4608, 4608, nrb * 4608, 4608), *[(n * 96,) for n in range(1, 25)], (64,))
+
+
+# ---- the Qwen3-VL text encoder's qkv (GQA: 32 query heads, 8 KV heads, head dim 128 padded to 192) ----
+# ------------------------------------------------------------------ the Qwen3 encoder's qkv (GQA, head dim 128) ----
+def qkv_te_src(rows: int, nrb: int, tp: int, eps: float, nq: int = 32, nkv: int = 8, dh: int = 128, dhp: int = 192, ks: int = 24, nt: int = NT) -> str:
+    """The Qwen3-VL text encoder's qkv step (2026-09-28): from the fused q | k | v linear's C tiles (N = (nq + 2 nkv) dh, 6 strips a
+    group), per (row block, KV head j) -- its nq / nkv query heads h: x the weight scale, RMS-normed over dh (q_norm), RoPE (dim d
+    with d + dh / 2; the tables' halves are equal: `csn` holds the first halves), -> the A layout (K = dhp, dims dh .. dhp zero) at
+    `out + h QA`; K_j: the same with k_norm -> B panels ([N = tp keys, K = dhp]) at `out + nq QA + j KB`; V_j: x scale, each tile
+    transposed in fp32 (two levels of even / odd extracts) -> V^T panels ([N = dhp dims, K = tp]) at `out + nq QA + nkv KB + j VB`.
+    The GEMMs read K / V panels of head h // (nq / nkv) (gemm_gs b_head_div): no copies. Every byte written (pads as zeros).
+    args: out, ct, sc2 (`dup_quads` of the linear's scales), nq2 / nk2 (`dup_quads` of the norms), csn (`[tp / 4 row groups][cos
+    first dh / 8 quads x 16 | sin ...]`), desc (`qkv_te_descs`)."""
+    assert dh == 128 and dhp == 192 and ks == 24 and tp % 96 == 0 and nq % nkv == 0 and 12 * nrb <= tp
+    QA, KB, VB = 12 * nrb * dhp, tp * dhp, dhp * tp
+    GB, GBV = (dhp // 96) * 6 * ks * 64, (tp // 96) * 6 * ks * 64
+    DQ, HQ, PQ, REP = dh // 4, dh // 8, dhp // 4, nq // nkv
+    K0, V0 = nq * dh // 16, (nq + nkv) * dh // 16                      # the first strip of K / V
+    def fills(strip0, nheads, var):
+        body = []
+        for h in range(nheads):
+            off, calls = 0, []
+            for f, (g, st, cnt) in enumerate(head_strip_runs(h, dh, strip0=strip0)):
+                calls.append("DMA_FILL(%d, DESC(desc, %d), %d, (int)(ct + ((%d * %d + rb) * 6 + %d) * 192));" % (f, cnt, off, g, nrb, st)); off += cnt * 768
+            body.append("      %s (%s == %d) { %s }" % ("if" if h == 0 else "else if", var, h, " ".join(calls)))
+        return "\n".join(body)
+    def normrope(W, kind):
+        """T (the head's tiles) x SC, RMS over dh (x W), RoPE -> O: `kind` "q" the A layout, "k" the K staging."""
+        dst = (lambda kq: "O + (%s / 24) * 1152 + ((%s %% 24) * 3 + i) * 16" % (kq, kq)) if kind == "q" else (lambda kq: "O + ((%s / 24) * 3 + i) * 384 + (%s %% 24) * 16" % (kq, kq))
+        return f"""      for (int i = 0; i < 3; i++) {{
+        float8 a01 = BC(0.0f), a23 = BC(0.0f);
+        for (int kq = 0; kq < {DQ}; kq++) {{
+          __global float* tq = T + (((kq / 4) * 3 + i) * 4 + kq % 4) * 16; float8 s8 = *(__global float8*)(SC + kq * 8);
+          float8 v01 = *(__global float8*)(tq) * s8; float8 v23 = *(__global float8*)(tq + 8) * s8; a01 += v01 * v01; a23 += v23 * v23;
+        }}
+        float n0 = a01[0] + a01[1] + a01[2] + a01[3], n1 = a01[4] + a01[5] + a01[6] + a01[7], n2 = a23[0] + a23[1] + a23[2] + a23[3], n3 = a23[4] + a23[5] + a23[6] + a23[7];
+        int r0 = rb * 12 + 4 * i;
+        float8 i01 = ROWS2(r0 < {rows} ? 1.0f / __builtin_sqrtf(n0 * {1.0 / dh!r}f + {eps!r}f) : 0.0f, r0 + 1 < {rows} ? 1.0f / __builtin_sqrtf(n1 * {1.0 / dh!r}f + {eps!r}f) : 0.0f);
+        float8 i23 = ROWS2(r0 + 2 < {rows} ? 1.0f / __builtin_sqrtf(n2 * {1.0 / dh!r}f + {eps!r}f) : 0.0f, r0 + 3 < {rows} ? 1.0f / __builtin_sqrtf(n3 * {1.0 / dh!r}f + {eps!r}f) : 0.0f);
+        __global float* CS = CSN + i * {2 * HQ * 16}; __global float* SN = CS + {HQ * 16};
+        for (int kq = 0; kq < {HQ}; kq++) {{
+          int kb = kq + {HQ};
+          __global float* ta = T + (((kq / 4) * 3 + i) * 4 + kq % 4) * 16; __global float* tb = T + (((kb / 4) * 3 + i) * 4 + kb % 4) * 16;
+          float8 sa = *(__global float8*)(SC + kq * 8), sb = *(__global float8*)(SC + kb * 8), wa = *(__global float8*)({W} + kq * 8), wb = *(__global float8*)({W} + kb * 8);
+          float8 va01 = *(__global float8*)(ta) * sa; float8 va23 = *(__global float8*)(ta + 8) * sa; float8 vb01 = *(__global float8*)(tb) * sb; float8 vb23 = *(__global float8*)(tb + 8) * sb;
+          float8 qa01 = va01 * i01 * wa, qa23 = va23 * i23 * wa, qb01 = vb01 * i01 * wb, qb23 = vb23 * i23 * wb;
+          float8 c01 = *(__global float8*)(CS + kq * 16), c23 = *(__global float8*)(CS + kq * 16 + 8), s01 = *(__global float8*)(SN + kq * 16), s23 = *(__global float8*)(SN + kq * 16 + 8);
+          *(__global half16*)({dst("kq")}) = CVT16(qa01 * c01 - qb01 * s01, qa23 * c23 - qb23 * s23);
+          *(__global half16*)({dst("kb")}) = CVT16(qb01 * c01 + qa01 * s01, qb23 * c23 + qa23 * s23);
+        }}
+        for (int kq = {DQ}; kq < {PQ}; kq++) *(__global half16*)({dst("kq")}) = CVT16(BC(0.0f), BC(0.0f));
+      }}"""
+    return FULL_H + f"""
+__kernel void qkv_te(__global half* restrict out, __global float* restrict ct, __global float* restrict sc2, __global float* restrict nq2, __global float* restrict nk2, __global float* restrict csn, __global int* restrict desc, const int core_id) {{
+  __global float* T = LSF(0); __global half* O = LSH(8192); __global float* SC = LSF(13312); __global float* WQ = LSF(14336); __global float* WK = LSF(15360); __global float* CSN = LSF(16384);
+  for (int u = core_id; u < {nrb * nkv}; u += {nt}) {{
+    int rb = u / {nkv}, j = u % {nkv}, tq0 = rb * 3;
+    DMA_FILL(0, DESC(desc, 10), 16384, (int)(csn + rb * {3 * 2 * HQ * 16})); DMA_FILL(1, DESC(desc, 11), 14336, (int)nq2); DMA_FILL(2, DESC(desc, 11), 15360, (int)nk2); DMA_WAIT_ALL();
+    for (int hh = 0; hh < {REP}; hh++) {{
+      int h = j * {REP} + hh;
+{fills(0, nq, "h")}
+      DMA_FILL(3, DESC(desc, 11), 13312, (int)(sc2 + h * {DQ * 8})); DMA_WAIT_ALL();
+{normrope("WQ", "q")}
+      DMA_DRAIN(0, DESC(desc, 7), 8192, (int)(out + h * {QA} + rb * 1152));
+      DMA_DRAIN(1, DESC(desc, 7), 8192 + 2304, (int)(out + h * {QA} + ({nrb} + rb) * 1152));
+      DMA_WAIT_ALL();
+    }}
+    /* K_j: B panels -- per (i, slice) 24 tiles at the panel's 128-B kk pitch */
+{fills(K0, nkv, "j")}
+    DMA_FILL(3, DESC(desc, 11), 13312, (int)(sc2 + ({nq} + j) * {DQ * 8})); DMA_WAIT_ALL();
+{normrope("WK", "k")}
+    for (int b = 0; b < 6; b += 3) {{
+      for (int f = 0; f < 3; f++) {{
+        int sl = (b + f) / 3, i = (b + f) % 3, tq = tq0 + i;
+        DMA_DRAIN(f, DESC(desc, 8), 8192 + (sl * 3 + i) * 768, (int)(out + {nq * QA} + j * {KB} + (tq / 24) * {GB} + ((sl * 6 + (tq / 4) % 6) * {ks * 4} + tq % 4) * 16));
+      }}
+      DMA_WAIT_ALL();
+    }}
+    /* V_j^T: per i, the dhp / 4 dim quads' tiles transposed */
+{fills(V0, nkv, "j")}
+    DMA_FILL(3, DESC(desc, 11), 13312, (int)(sc2 + ({nq + nkv} + j) * {DQ * 8})); DMA_WAIT_ALL();
+    for (int i = 0; i < 3; i++) {{
+      for (int dq = 0; dq < {DQ}; dq++) {{
+        __global float* tq = T + (((dq / 4) * 3 + i) * 4 + dq % 4) * 16; float8 s8 = *(__global float8*)(SC + dq * 8);
+        float8 t01 = *(__global float8*)(tq) * s8; float8 t23 = *(__global float8*)(tq + 8) * s8;
+        float8 e = __builtin_shufflevector(t01, t23, 0, 2, 4, 6, 8, 10, 12, 14), f = __builtin_shufflevector(t01, t23, 1, 3, 5, 7, 9, 11, 13, 15);
+        *(__global half16*)(O + i * {PQ * 16} + dq * 16) = CVT16(__builtin_shufflevector(e, f, 0, 2, 4, 6, 8, 10, 12, 14), __builtin_shufflevector(e, f, 1, 3, 5, 7, 9, 11, 13, 15));
+      }}
+      for (int dq = {DQ}; dq < {PQ}; dq++) *(__global half16*)(O + i * {PQ * 16} + dq * 16) = CVT16(BC(0.0f), BC(0.0f));
+    }}
+    for (int b = 0; b < 6; b += 3) {{
+      for (int f = 0; f < 3; f++) {{
+        int i = (b + f) / 2, gv = (b + f) % 2, tq = tq0 + i;
+        DMA_DRAIN(f, DESC(desc, 9), 8192 + (i * {PQ} + gv * 24) * 32, (int)(out + {nq * QA + nkv * KB} + j * {VB} + gv * {GBV} + ((tq / 24) * {6 * ks} + tq % 24) * 64));
+      }}
+      DMA_WAIT_ALL();
+    }}
+  }}
+}}"""
+
+
+def qkv_te_descs(nrb: int, ks: int = 24, dh: int = 128) -> np.ndarray:
+    """0 unused, 1..6 a fill of n strips, 7 a Q A slice (2304 B), 8 the K drain (24 tiles of 32 B at 128), 9 the V^T drain (6 strips x
+    128 B at ks x 128), 10 a row block's 3 csn row groups, 11 a head's dh / 4 quads of scales / norm weights."""
+    return _desc_slots((64,), *[(n * 768,) for n in range(1, 7)], (2304,), (768, 32, 128, 32), (768, 128, ks * 128, 128), (3 * 2 * (dh // 8) * 64,), ((dh // 4) * 32,))
+
+
+def qkv_te_csn(cos: np.ndarray, sin: np.ndarray, nrb: int) -> np.ndarray:
+    """cos / sin `[rows, dh]` (the halves equal: asserted) -> `qkv_te`'s csn: per row group the first dh / 8 quads' tiles of cos, then sin."""
+    dh = cos.shape[1]; ct_, st_ = tile_rows(cos, nrb).reshape(-1, dh * 4), tile_rows(sin, nrb).reshape(-1, dh * 4)
+    h = dh * 2
+    assert np.array_equal(ct_[:, :h], ct_[:, h:]) and np.array_equal(st_[:, :h], st_[:, h:]), "qkv_te_csn: the tables' halves differ"
+    return np.ascontiguousarray(np.concatenate([ct_[:, :h], st_[:, :h]], 1)).ravel()
 
 
 # ---- the VAE decoder's convs ----
