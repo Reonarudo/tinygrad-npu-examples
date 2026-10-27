@@ -502,15 +502,15 @@ slot with the user as their cache index. A probe showed the NPU reads and writes
 remaps, every 2 MiB chunk of 64-512 MB mappings); the caches under slots equal the buffers' row for row, and the tokens are the same.
 What the window holds is then two slots of all users' caches of one layer, so `--tmax auto` (budget `QWEN_KV_GB`, 2.2 GB) reaches:
 
-| server | 2B | 9B (the 4B: the same cache shape) |
+| server | 2B | 4B / 9B |
 | --- | ---: | ---: |
 | `bonsai2_serve.py` (speculative, one user) | 65536 | 65536 |
-| `bonsai2_batch_serve.py --users 4` | 59392 | ~29k |
+| `bonsai2_batch_serve.py --users 4` | 59392 | 29696 |
 | `bonsai2_batch_serve.py --users 8` | 32768 | ~15k |
 
 Board o6n, 2026-10-27, with the caches in slots: the 2B's speculative server answers the 6283-token prompt correctly in 86 s; the
 batched server (4 users, 59392 context) in 68 s, and its concurrent figures are the table's above (46.5 tok/s at 4 users); the 9B at
-65536 answers the 3142-token prompt ("exactly 60 days") in 127 s. The host memory the caches take: attention layers x users x tmax x
+65536 answers the 3142-token prompt ("exactly 60 days") in 127 s; the 4B at 65536 in 78 s, and its batched server (4 users, 29696 context) runs 4 concurrent requests at 23 tok/s aggregate and the same prompt in 69 s. As fp32 buffers the 4B / 9B cannot even start at 64k (a 4.3 GB cache; the control run fails to allocate). The host memory the caches take: attention layers x users x tmax x
 4 KiB (2B) / 8 KiB (9B): 1.6 GB for one user of the 2B at 64k, 5.9 GB for four, 4.3 GB for the 9B. One price: the speculative server
 runs the chain verify, not the leaf tree (its commit moves K / V rows in every layer's cache at once, which a slot-at-a-time view
 cannot do): about 4 % fewer tokens a pass. The 27B keeps its 2048 default and its buffers (its one-pass prefill's part kernels are
