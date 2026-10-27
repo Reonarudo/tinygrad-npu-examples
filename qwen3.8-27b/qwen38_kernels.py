@@ -396,6 +396,133 @@ __kernel void had_a32(__global half* restrict out, __global float* restrict x{""
   }}
 }}"""
 
+def had_rows_desc(c, hb=HAD_B):
+  """slot 0: one whole row (c floats, contiguous); slot 1: one hb-block of a row (contiguous)."""
+  return V._desc_slots((c * 4,), (hb * 4,))
+
+def had_rows_sw_desc():
+  """"swiglu" by DMA: slot 0: a quad's 3 sub-tile pieces of one group (256 B each, DDR pitch 768 B, LSRAM contiguous)."""
+  return V._desc_slots((3 * 256, 256, 768, 256))
+
+def had_rows_src(mode, c, nrb, eps, real, stacked=False, post=1.0, g=1, hb=HAD_B):
+  """had_a32's values as fp32 ROWS (pitch c) instead of the A layout: the row values as rms_a32 / swiglu_a32 make them, the
+  unnormalised Walsh-Hadamard transform over each hb-wide block of K (had_a32_src's stages, in its order: the same bits), times
+  `post`. had_a32's unit is a block of K running every row quad in turn (the A layout interleaves the quads' pieces inside 64-byte
+  lines, which one TEC must own), so its rows serialise on c / hb tasks. Here ("rms" / "plain") a unit = (row, block): the row comes
+  into LSRAM by one DMA (its squares summed there), the block is transformed and leaves by one DMA into its own contiguous range of
+  the output row; "swiglu" (the gate | up C tiles, strided) keeps a unit = (row quad, block) with had_a32's quad loads (a float8 pair
+  covers 4 rows x 4 columns) and writes the quad's 4 row blocks. Every task works. The A layout is then rms_a32d's plain phase (one
+  DMA pass, bit-identical halves): Kernels.rms_a / swiglu_a chain the two (QWEN_HAD_ROWS).
+  args: out (float rows [R, c]), x (float rows, pitch c; "swiglu": the C tiles), w (float [c]; stacked: [L, c]) [, idx] [, desc
+  (had_rows_desc; not "swiglu")], core_id."""
+  B = hb; assert B in (512, 1024) and (B == HAD_B or g == 1) and mode in ("rms", "plain", "swiglu") and c % (g * B) == 0 and g in (1, 2, 4); nb = c // B
+  mix = [(f"(b / {g} * {g} + {j}) * {B}", f"sg{j}") for j in range(g)] if g > 1 else [(f"b * {B}", None)]
+  sgs = "".join(f" float sg{j} = ((((b % {g}) & {j}) ^ (((b % {g}) & {j}) >> 1)) & 1) ? -1.0f : 1.0f;" for j in range(g)) if g > 1 else ""
+  last = (f"""
+    for (int k = 0; k < {B // 2}; k += 8) {{                                     /* stage B / 2 */
+      float8 a = *(__global float8*)(Q + k), bb = *(__global float8*)(Q + k + {B // 2});
+      *(__global float8*)(Q + k) = a + bb; *(__global float8*)(Q + k + {B // 2}) = a - bb;
+    }}""" if (B.bit_length() - 1 - 3) % 2 else "")
+  def stages(row):
+    return f"""
+    {{ __global float* Q = {row};
+    for (int k = 0; k < {B}; k += 8) *(__global float8*)(Q + k) = h8(*(__global float8*)(Q + k));
+    for (int h = 8; h < {B // 2}; h *= 4) for (int j0 = 0; j0 < {B}; j0 += 4 * h) for (int k = j0; k < j0 + h; k += 8) {{   /* stages h, 2h */
+      float8 a = *(__global float8*)(Q + k), bb = *(__global float8*)(Q + k + h), cc = *(__global float8*)(Q + k + 2 * h), d = *(__global float8*)(Q + k + 3 * h);
+      float8 s0 = a + bb, s1 = a - bb, s2 = cc + d, s3 = cc - d;
+      *(__global float8*)(Q + k) = s0 + s2; *(__global float8*)(Q + k + h) = s1 + s3; *(__global float8*)(Q + k + 2 * h) = s0 - s2; *(__global float8*)(Q + k + 3 * h) = s1 - s3;
+    }}{last} }}"""
+  scale = "" if post == 1.0 else f" * BC({post!r}f)"
+  H8 = """
+static inline __attribute__((always_inline)) float8 h8(float8 v) {
+  float8 a = __builtin_shufflevector(v, v, 0, 0, 2, 2, 4, 4, 6, 6), b = __builtin_shufflevector(v, v, 1, 1, 3, 3, 5, 5, 7, 7);
+  v = a + b * ((float8){1.0f, -1.0f, 1.0f, -1.0f, 1.0f, -1.0f, 1.0f, -1.0f});
+  a = __builtin_shufflevector(v, v, 0, 1, 0, 1, 4, 5, 4, 5); b = __builtin_shufflevector(v, v, 2, 3, 2, 3, 6, 7, 6, 7);
+  v = a + b * ((float8){1.0f, 1.0f, -1.0f, -1.0f, 1.0f, 1.0f, -1.0f, -1.0f});
+  a = __builtin_shufflevector(v, v, 0, 1, 2, 3, 0, 1, 2, 3); b = __builtin_shufflevector(v, v, 4, 5, 6, 7, 4, 5, 6, 7);
+  return a + b * ((float8){1.0f, 1.0f, 1.0f, 1.0f, -1.0f, -1.0f, -1.0f, -1.0f});
+}
+"""
+  if mode == "swiglu" and g == 1 and c % 48 == 0:
+    # the gate | up tiles of the unit's quad by DMA, a group at a time: the quad's 3 sub-tile pieces (64 floats = [4 rows][16 cols], 256 B,
+    # DDR pitch 768 B) of the gate's group and of the up's (c / 48 groups later), double-buffered; the block's columns of the group
+    # then feed the same sw() / shuffle arithmetic as the plain path (the same bits). LSRAM: L [4][B] then 2 x 2 x 768 B of pieces.
+    LB = 4 * B * 4; GU = c // 48; ng = -(-c // 48)
+    gather = f"""
+    int g0 = (b * {B}) / 48, g1 = ((b + 1) * {B} - 1) / 48;
+    DMA_FILL(0, DESC(desc, 0), {LB}, (int)(x + (g0 * {nrb} * 3) * 192 + i * 64)); DMA_FILL(2, DESC(desc, 0), {LB + 768}, (int)(x + ((g0 + {GU}) * {nrb} * 3) * 192 + i * 64));
+    for (int gg = g0; gg <= g1; gg++) {{
+      int p = (gg - g0) & 1;
+      if (gg + 1 <= g1) {{
+        if (p == 0) {{ DMA_FILL(1, DESC(desc, 0), {LB + 1536}, (int)(x + ((gg + 1) * {nrb} * 3) * 192 + i * 64)); DMA_FILL(3, DESC(desc, 0), {LB + 2304}, (int)(x + ((gg + 1 + {GU}) * {nrb} * 3) * 192 + i * 64)); }}
+        else {{ DMA_FILL(0, DESC(desc, 0), {LB}, (int)(x + ((gg + 1) * {nrb} * 3) * 192 + i * 64)); DMA_FILL(2, DESC(desc, 0), {LB + 768}, (int)(x + ((gg + 1 + {GU}) * {nrb} * 3) * 192 + i * 64)); }}
+      }}
+      if (p == 0) {{ DMA_WAIT(0); DMA_WAIT(2); }} else {{ DMA_WAIT(1); DMA_WAIT(3); }}
+      __global float* G = LSF({LB} + p * 1536); __global float* P = G + 192;
+      int c0 = gg * 48 > b * {B} ? gg * 48 : b * {B}, c1 = (gg + 1) * 48 < (b + 1) * {B} ? (gg + 1) * 48 : (b + 1) * {B};
+      for (int col = c0; col < c1; col += 4) {{
+        int o = ((col % 48) / 16) * 64 + ((col % 16) / 4) * 16, k = col - b * {B};
+        float8 t01 = sw(*(__global float8*)(G + o), *(__global float8*)(P + o)), t23 = sw(*(__global float8*)(G + o + 8), *(__global float8*)(P + o + 8));
+        *(__global float4*)(L + k) = __builtin_shufflevector(t01, t01, 0, 1, 2, 3); *(__global float4*)(L + {B} + k) = __builtin_shufflevector(t01, t01, 4, 5, 6, 7);
+        *(__global float4*)(L + {2 * B} + k) = __builtin_shufflevector(t23, t23, 0, 1, 2, 3); *(__global float4*)(L + {3 * B} + k) = __builtin_shufflevector(t23, t23, 4, 5, 6, 7);
+      }}
+    }}"""
+    nq = -(-real // 4); assert LB + 3072 <= 32768 - 64
+    return V.FULL_H + TILE + EXP + H8 + f"""
+__kernel void had_rows(__global float* restrict out, __global float* restrict x, __global int* restrict desc, const int core_id) {{
+  __global float* L = LSF(0);
+  for (int u = core_id; u < {nq * nb}; u += {NT}) {{
+    int i = u / {nb}, b = u % {nb}; int nr = {real} - 4 * i; nr = nr > 4 ? 4 : nr;{gather}
+    for (int r = 0; r < nr; r++) {{{stages(f"L + r * {B}")}
+      for (int k = 0; k < {B}; k += 8) *(__global float8*)(out + (4 * i + r) * {c} + b * {B} + k) = *(__global float8*)(L + r * {B} + k){scale};
+    }}
+  }}
+}}"""
+  if mode == "swiglu":
+    def tile(col): return f"x + ((({col}) / 48 * {nrb}) * 3 + (({col}) % 48) / 16) * 192 + (i * 4 + (({col}) % 16) / 4) * 16"
+    if g == 1:
+      inner = f"""
+      int col = b * {B} + k; __global float* g = {tile("col")}; __global float* p = {tile("col + %d" % c)};
+      float8 t01 = sw(*(__global float8*)(g), *(__global float8*)(p)), t23 = sw(*(__global float8*)(g + 8), *(__global float8*)(p + 8));"""
+    else:
+      inner = "\n      float8 t01, t23;" + "".join(f"""
+      {{ int col = {o} + k; __global float* g = {tile("col")}; __global float* p = {tile("col + %d" % c)};
+        float8 u01 = sw(*(__global float8*)(g), *(__global float8*)(p)), u23 = sw(*(__global float8*)(g + 8), *(__global float8*)(p + 8));
+        {"t01 = u01 * BC(%s); t23 = u23 * BC(%s);" % (sj, sj) if j == 0 else "t01 += u01 * BC(%s); t23 += u23 * BC(%s);" % (sj, sj)} }}""" for j, (o, sj) in enumerate(mix))
+    load = f"""
+    for (int k = 0; k < {B}; k += 4) {{{inner}
+      *(__global float4*)(L + k) = __builtin_shufflevector(t01, t01, 0, 1, 2, 3); *(__global float4*)(L + {B} + k) = __builtin_shufflevector(t01, t01, 4, 5, 6, 7);
+      *(__global float4*)(L + {2 * B} + k) = __builtin_shufflevector(t23, t23, 0, 1, 2, 3); *(__global float4*)(L + {3 * B} + k) = __builtin_shufflevector(t23, t23, 4, 5, 6, 7);
+    }}"""
+    nq = -(-real // 4)
+    return V.FULL_H + TILE + EXP + H8 + f"""
+__kernel void had_rows(__global float* restrict out, __global float* restrict x, const int core_id) {{
+  __global float* L = LSF(0);
+  for (int u = core_id; u < {nq * nb}; u += {NT}) {{
+    int i = u / {nb}, b = u % {nb}; int nr = {real} - 4 * i; nr = nr > 4 ? 4 : nr;{sgs}{load}
+    for (int r = 0; r < nr; r++) {{{stages(f"L + r * {B}")}
+      for (int k = 0; k < {B}; k += 8) *(__global float8*)(out + (4 * i + r) * {c} + b * {B} + k) = *(__global float8*)(L + r * {B} + k){scale};
+    }}
+  }}
+}}"""
+  CB = c * 4
+  inv = (f"""float8 acc = BC(0.0f); for (int k = 0; k < {c}; k += 8) {{ float8 v = *(__global float8*)(X + k); acc += v * v; }}
+    float inv = 1.0f / __builtin_sqrtf(hsum8(acc) * {1.0 / c!r}f + {eps!r}f);""" if mode == "rms" else "float inv = 1.0f;")
+  post_loop = f"""
+    for (int k = 0; k < {B}; k += 8) *(__global float8*)(Lr + k) = *(__global float8*)(Lr + k){scale};""" if scale else ""
+  return V.FULL_H + TILE + H8 + f"""
+__kernel void had_rows(__global float* restrict out, __global float* restrict x, __global float* restrict w{", __global int* restrict idx" if stacked else ""}, __global int* restrict desc, const int core_id) {{
+{"  w += idx[0] * %d;" % c if stacked else ""}
+  __global float* X = LSF(0); __global float* Lr = LSF({CB});
+  for (int u = core_id; u < {real * nb}; u += {NT}) {{
+    int r = u / {nb}, b = u % {nb};{sgs}
+    DMA_FILL(0, DESC(desc, 0), 0, (int)(x + r * {c})); DMA_WAIT(0);
+    {inv}
+    for (int k = 0; k < {B}; k += 8) *(__global float8*)(Lr + k) = {" + ".join(f"*(__global float8*)(X + {o} + k) * BC(inv) * *(__global float8*)(w + {o} + k)" + ("" if g == 1 else f" * BC({sj})") for o, sj in mix)};{stages("Lr")}{post_loop}
+    DMA_DRAIN(1, DESC(desc, 1), {CB}, (int)(out + r * {c} + b * {B})); DMA_WAIT(1);
+  }}
+}}"""
+
 # had_a32d's butterfly stages 1, 2, 4 on two float8 (16 values) by even / odd lane extracts instead of h8's shuffles (which the
 # compiler lowers lane by lane: 96 bundles a float8 on the model). Each stage is E = even lanes, O = odd lanes of the pair, then
 # E + O, E - O: the same sums as h8 (v[k] + v[k ^ h] for bit h clear, v[k ^ h] subtracted for bit h set), the order permuted.
@@ -3604,6 +3731,12 @@ class Kernels:
         k = self.key(f"had_a32d|fast|rec|{mode}|{c}|{self.real}|{self.had_post}", HF.had_fast_src(mode, c, self.nrb, self.eps, self.real, stacked=True, post=self.had_post, opts=op))
         d = self.desc(f"had_a32d_desc|fast|rec|{mode}|{c}", lambda: HF.had_fast_desc(mode, c, self.nrb, self.real, opts=op))
         return self.run(k, tag, self.a_size(c), dtypes.uint16, x, *ws, self.bufs[rs[0]], d)
+      if self.compact and os.environ.get("QWEN_HAD_ROWS", "1" if self.had_b != HAD_B else "0") == "1":   # had_rows on every task, then the plain packer (default on for the 512 block, which had no DMA / fast producer)
+        k = self.key(f"had_rows|{mode}|{c}|{self.real}|{st}|{self.had_post}|{self.had_g}|{self.had_b}", had_rows_src(mode, c, self.nrb, self.eps, self.real, stacked=st and norm, post=self.had_post, g=self.had_g, hb=self.had_b))
+        rows = self.run(k, f"hadrows|{c}", self.rows * c, dtypes.float32, x, *ws, self.desc(f"had_rows_desc|{c}|{self.had_b}", lambda: had_rows_desc(c, self.had_b))).reshape(self.rows, c)
+        saved = self.had; self.had = None
+        try: return self.rms_a(rows, None, c, tag, norm=False)
+        finally: self.had = saved
       if self.had_dma(): return self.run(self.had_d(mode, c, st and norm), tag, self.a_size(c), dtypes.uint16, x, *ws, self.had_desc(mode, c))
       k = self.key(f"had_a32|{mode}|{c}|{self.real}|{self.compact}|{st}|{self.had_post}|{self.had_g}|{self.had_b}", had_a32_src(mode, c, self.nrb, self.eps, real=self.real, compact=self.compact, stacked=st and norm, post=self.had_post, g=self.had_g, hb=self.had_b))
       return self.run(k, tag, self.a_size(c), dtypes.uint16, x, *ws)
@@ -3667,6 +3800,13 @@ class Kernels:
         return self.run(self.key(f"{ACTS[act][1]}_a32d|{m_}|{self.real}", swiglu_a32d_src(m_, self.nrb, self.real, act)), tag, self.a_size(m_), dtypes.uint16, ct, self.bufs[dk])
       k = self.key(f"{ACTS[act][1]}_a32|{m_}|{self.real}|{self.compact}", swiglu_a32_src(m_, self.nrb, real=self.real, compact=self.compact, act=act))
       return self.run(k, tag, self.a_size(m_), dtypes.uint16, ct)
+    if self.had is not None and self.compact and os.environ.get("QWEN_HAD_ROWS", "1" if self.had_b != HAD_B else "0") == "1":   # had_rows (swiglu from the tiles), then the plain packer
+      k = self.key(f"had_rows|swiglu|{m_}|{self.real}|{self.had_post}|{self.had_g}|{self.had_b}", had_rows_src("swiglu", m_, self.nrb, self.eps, self.real, post=self.had_post, g=self.had_g, hb=self.had_b))
+      ex = (self.desc("had_rows_sw_desc", had_rows_sw_desc),) if self.had_g == 1 and m_ % 48 == 0 else ()   # the DMA gather (else the plain tile loads: the 27B's 17408)
+      rows = self.run(k, f"hadrows|{m_}", self.rows * m_, dtypes.float32, ct, *ex).reshape(self.rows, m_)
+      saved = self.had; self.had = None
+      try: return self.rms_a(rows, None, m_, tag, norm=False)
+      finally: self.had = saved
     if self.had is not None and self.had_dma(): return self.run(self.had_d("swiglu", m_, False), tag, self.a_size(m_), dtypes.uint16, ct, self.had_desc("swiglu", m_))
     if self.had is not None:                     # rotated inputs: the down projection's signs are in the up rows' scales
       k = self.key(f"had_a32|swiglu|{m_}|{self.real}|{self.compact}|{self.had_post}|{self.had_g}|{self.had_b}", had_a32_src("swiglu", m_, self.nrb, self.eps, real=self.real, compact=self.compact, post=self.had_post, g=self.had_g, hb=self.had_b))

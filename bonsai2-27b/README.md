@@ -357,8 +357,8 @@ safetensors file, then `--mtp-gguf` on that file). Board o6n, 2026-10-26, three 
 
 | size | resident | prefill tok/s | decode plain | decode speculative | drafts accepted a pass |
 | --- | --- | --- | --- | --- | --- |
-| 2B | 0.6 GB | 50-60 | 10.0-10.1 | **23.6-29.5** (~26 pooled) | 1.1-1.9 of 3 (leaf tree, 4 rows) |
-| 4B | 1.5 GB | 29-35 | 6.9 | **16.2-21.4** | 1.0-2.0 |
+| 2B | 0.6 GB | 50-60 | 10.0 (the verify-geometry plain path; 22.8 on the one-row batch loop) | **28-35** (23.6-29.5 before the producer rework) | 1.1-1.9 of 3 (leaf tree, 4 rows) |
+| 4B | 1.5 GB | 29-35 | 6.9 | **16.2-24.2** | 1.0-2.0 |
 | 9B | 2.7 GB | 15-17 | 4.5 | **9.2-10.7** | 1.5-1.9 |
 
 The prompt goes through the verify path (`QWEN_PREFILL=chunked`: the one-pass prefill's DeltaNet kernel wants 48 value heads). Plain
@@ -378,10 +378,10 @@ the one-row kernels joined by scatter / gather kernels. Board o6n, 2026-10-26, B
 
 | users | a step | aggregate tok/s | a user | prefill (lockstep) | per-user mixers (BATCH_KERNELS=0) |
 | ---: | ---: | ---: | ---: | ---: | ---: |
-| 1 | 53 ms | 18.8 | 18.8 | 8.4 tok/s | 52 ms, 19.2 |
+| 1 | 40-52 ms (53 before the reworks) | 19-25 | 19-25 | 8.4 tok/s | 52 ms, 19.2 |
 | 2 | | | | | 61 ms, 33.0 |
-| 4 | 80 ms | **50.1** | 12.5 | 32.9 | 108 ms, 37.1 |
-| 8 | 123 ms | **64.8** | 8.1 | 38.6 | 182 ms, 43.9 |
+| 4 | 48-62 ms (80 before the reworks) | **64-84** | 16-21 | 32.9 | 108 ms, 37.1 |
+| 8 | 71-85 ms (123 before the reworks) | **94-112** | 12-14 | 38.6 | 182 ms, 43.9 |
 | 12 | 216 ms | 55.7 | 4.6 | 37.2 | |
 
 Eight users is the sweet spot: 3.4x one stream's throughput. Past 8 the GEMM's third row tile (rows 9-12) and the 96 DeltaNet units
@@ -389,6 +389,45 @@ over 12 tasks cost more than the extra rows return. The remaining growth, ~9 ms 
 (each ~0.3 ms: the a | b projection and the 1 MB state through LSRAM, 8 head groups a user over 12 tasks) and the GEMMs' second row
 tile; the single-user step (53 ms, 18.8 tok/s) is also the 2B's best plain decode (the plain path through the 4-row verify
 geometry measured 100 ms).
+
+**Where a row costs, and the producer rework** (`gemm_parts_bench.py`: the 2B's kernels alone, a JIT replay of 10 launches, ms a launch;
+before -> after `had_rows`):
+
+| rows | gu GEMM (12288 x 2048) | dn GEMM | qkv\|z GEMM | o GEMM | had_a32 (an A producer) | swiglu_a | resid | unpack |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 | 0.39 | 0.25 | 0.28 | 0.14 | 0.14 -> **0.09** | 0.18 -> 0.19 | 0.06 | 0.06 |
+| 4 | 0.37 | 0.24 | 0.24 | 0.14 | 0.31 -> **0.13** | 0.20 -> 0.24 | 0.04 | 0.03 |
+| 8 | 0.44 | 0.28 | 0.32 | 0.12 | 0.57 -> **0.16** | 0.41 -> **0.33** | 0.07 | 0.04 |
+| 12 | 1.03 | 0.61 | 0.70 | 0.27 | 0.76 -> **0.22** | 0.48 -> **0.45** | 0.07 | 0.09 |
+
+The ternary GEMMs are flat from 1 to 8 rows (the codes are expanded once a K-slice and reused across the row tiles; gu moves its 6.3
+MB of codes at ~16 GB/s) and double at 12 rows, where the third row tile leaves the LSRAM-accumulator fast path (rt <= 2: the 32
+vector registers hold 8 accumulators a row tile beside the operands and the expand, so a third tile does not fit). What grew with the
+rows was the A producers: the Hadamard transform's unit was one 1024-block of K (2 for H 2048) running every row quad in turn, so the
+rows serialised on 2 of the 12 tasks. `had_rows` (qwen38_kernels.py, `QWEN_HAD_ROWS`, the default for the 512-block sizes) makes a
+unit a (row, block): the row by one DMA into LSRAM, the block transformed there in had_a32's exact order, drained by one DMA into the
+row's own range; the A layout is then the plain DMA packer's. "swiglu" keeps (row quad, block) units with the gate | up tiles gathered
+by DMA a group at a time. Bit-identical to had_a32 on the simulator in every mode (the gate `had_rows_sim.py`). Board, the 2B:
+batched decode 8 users 123 -> **101 ms a step (79 tok/s aggregate)**, one user 53 -> 44 ms (22.8 tok/s); speculative decode 24 / 29.5 /
+24.3 -> **28 / 35 / 30 tok/s**; the 4B's 21.4 -> 24.2 on code. The 27B's 1024-block producers (had_a32d / had_fast) stay faster than this
+path (7.3 vs 6.6 tok/s), so there it is opt-in.
+
+**The batched DeltaNet kernel's data movement** (`mixers_bench.py`: gdn_tokb alone at 1 / 4 / 8 rows): the first form read the conv's ring
+rows and taps, the row's q / k / v / z tile segments and the gated-norm's z by plain DDR loads and wrote the ring by plain stores -- some
+320 cache-line round trips a unit, the kernel's dominant cost (1.38 ms a layer at 8 rows). `gdn_tokb_src(stage=True)` moves them by DMA:
+the ring and taps segment (two requests, gdn_tokb_desc slot 3), the row's segments as whole row-tile strip pieces (256 B: 4 column quads
+x 4 rows, one request a group, slots 4-6) compacted in LSRAM, the ring writes as 512-B drains (slot 7). Bit-identical on the simulator
+(gdn_batch_sim.py); on the board 0.33 / 0.76 / 1.38 -> 0.24 / 0.54 / 1.02 ms at 1 / 4 / 8 rows. What remains a unit is its a | b
+weight chunks (16 requests a row: the same weights every row of a head group) and the state blocks' fill / drain pairs.
+
+**Layer blocks** (`BATCH_BLOCK`, default 4): as the runtime's verify pass, four layers run as one JIT graph and one job, each layer's
+weights in a window slot of its own (`Layers.block_slots` / `map_block`), so a token costs 6 jobs instead of 24. At 8 users 93-94 ->
+71-85 ms a step (one layer a job vs blocks, back to back); at 1 user the gain is within the noise. The board's step times vary by
+~15 % between runs of the same configuration (71 / 84 / 85 ms in three 8-user runs), so the figures above are ranges over 2-3 runs.
+
+**Why batching and speculative decoding are not combined here.** A row spent on a draft returns a token ~45 % of the time, a row
+spent on another user's token always; with the row costs above, plain batching beats any mix of users and drafts in a pass on this
+model. The combination pays on models whose rows are nearly free (the Q8_0 Gemma 4 E2B: a 7-row verify pass costs 1.07 plain steps).
 
 ## How it works
 

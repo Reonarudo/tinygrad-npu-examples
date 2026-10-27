@@ -22,6 +22,7 @@ from zy import OA, vec_f16 as V                                          # noqa:
 import qwen38_generate as QG, qwen38_ref as R, qwen38_kernels as QK      # noqa: E402
 import gdn_batch as GB, attn_batch as AB                                  # noqa: E402  (the batched one-token mixers: M rows a launch)
 BATCHK = os.environ.get("BATCH_KERNELS", "1") != "0"                       # 0: the mixers per user on the one-row kernels (scatter / gather)
+BLK = int(os.environ.get("BATCH_BLOCK", "4"))                              # layers a JIT graph / job (the runtime's layer blocks: their window slots), 1 = a layer a job
 from qwen38_generate import poke, dev, DEV                               # noqa: E402
 
 NT = 12
@@ -84,7 +85,7 @@ class Batch:
     a_h = K.rms_a(X, (M.Win_g, si), H, "a_h"); ct = L.lin_cts(a_h, slot, meta, ("qkv", "z")); xoff, zoff = ct["qkv"][1], ct["z"][1]
     src = QK.ct_goff(GB.gdn_tokb_src(R.NV, R.NK, R.DK, R.DV, self.C, R.CONV, H, K.nrb, R.EPS, N), K.nrb, (xoff, zoff), ("x", "z"))
     O = K.rows_buf("o_gather", max(R.NV * R.DV, R.NH * R.HD))
-    K.call(f"gdn_tokb|{N}|{xoff}|{zoff}", src, O, self.Sall, self.Call, gt, pt, ct["qkv"][0], ct["z"][0], X, self.Wab, self.Adt, self.Cwt, self.Nw, K.desc("gdn_tok3_desc", lambda: QK.gdn_tok3_desc(R.DK, R.DV, H, QK.gdn_hpt(R.NV))))
+    K.call(f"gdn_tokb|{N}|{xoff}|{zoff}", src, O, self.Sall, self.Call, gt, pt, ct["qkv"][0], ct["z"][0], X, self.Wab, self.Adt, self.Cwt, self.Nw, K.desc("gdn_tokb_desc", lambda: GB.gdn_tokb_desc(R.DK, R.DV, H, QK.gdn_hpt(R.NV), self.C, R.CONV)))
     a_o = K.rms_a(O, None, R.NV * R.DV, "a_o", norm=False)
     x1 = K.resid(X, L.lin_ct(a_o, slot, meta, "o"), H, "x1")
     return L.mlp(x1, slot, meta, (M.Wpost_g, si), f"xiov{1 - par}").realize()
@@ -138,6 +139,15 @@ class Batch:
     x1 = K.resid(X, L.lin_ct(a_o, slot, meta, "o"), H, "x1")
     return L.mlp(x1, slot, meta, (M.Wpost_a, a0), f"xiov{1 - par}").realize()
 
+  def blk(self, types, ptab, *args):
+    """BLK consecutive layers as one graph: the users' positions once (ptab), then the layers' index buffers and views concatenated
+    (gdn: sidx, gtab + M.GDN_LIN views; att: aix0, atab + M.ATT_LIN views), each layer on parity j % 2 (blocks start at even layers)."""
+    M = self.M; a = list(args); out = None
+    for j, t in enumerate(types):
+      if t == "full": n = 2 + len(M.ATT_LIN); out = self.att_b(j % 2, *a[:n]); a = a[n:]
+      else: n = 2 + len(M.GDN_LIN); out = self.gdn_b(j % 2, a[0], a[1], ptab, *a[2:n]); a = a[n:]
+    return out
+
   def step(self, toks, pos):
     """toks [N] at positions pos [N] -> the next token of each user."""
     M, L, N = self.M, self.L, self.N
@@ -147,6 +157,23 @@ class Batch:
     for u in range(N):
       poke(self.posb[u], np.array([pos[u]], np.int32))
       for i in range(M.NATT): poke(self.aix[u][i], np.array([u * M.NATT + i, pos[u]], np.int32))
+    if BATCHK and BLK > 1 and R.NL % BLK == 0 and BLK % 2 == 0:            # layer blocks: BLK layers a job, each in a window slot of its own
+      from qwen38_generate import one_job
+      L.block_slots(BLK)
+      for b in range(R.NL // BLK):
+        bp = b % 2; types = tuple(R.LAYER_TYPES[b * BLK + j] for j in range(BLK)); args = []
+        for j in range(BLK):
+          l = b * BLK + j; views, meta = L.map_block(l, bp, j)
+          if types[j] == "full": i = M.aidx[l]; self.meta_att = meta; args += [self.aix0[i], self.atab[i], *[views[k] for k in M.ATT_LIN]]
+          else: i = M.gidx[l]; self.meta_gdn = meta; args += [M.sidx[i], self.gtab[i], *[views[k] for k in M.GDN_LIN]]
+        key = ("blk", bp, types, tuple(L.kind(b * BLK + j) for j in range(BLK)))
+        if key not in self.jits: self.jits[key] = TinyJit(functools.partial(self.blk, types))
+        jit = self.jits[key]
+        if jit.cnt < 2:
+          with one_job(): jit(self.ptab, *args)
+        else: jit(self.ptab, *args)
+      ids, _ = M.head_top(self.X[R.NL % 2], L)
+      return [int(v) for v in ids[:N]]
     L.prefetch(0)
     for l in range(R.NL):
       if l + 1 < R.NL: L.prefetch(l + 1)
