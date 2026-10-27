@@ -464,7 +464,7 @@ Board o6n, 2026-10-27, a 22-token prompt and a 23-token answer: the 9B in 3.1 s 
 behind a slot scheduler): up to `--users` requests advance together, each in a slot with its own DeltaNet states, conv ring, K / V cache
 and position; a new request takes a free slot (its state zeroed), its prompt goes in a token a step, then it decodes plain greedy and
 streams. The step costs the geometry's whatever the number of busy slots (the 2B: ~50 ms at 4 slots, ~75 at 8), so one user sees one
-token a step and N users N. Context 512 (the batched attention kernel's scores live in LSRAM). Board o6n, the 2B, `curl`s in parallel,
+token a step and N users N. Context 512 (the batched attention kernel's scores live in LSRAM). Board o6n, the 2B, `batch_load.sh PORT N MAX_TOKENS` (N `curl`s in parallel, the aggregate tok/s printed),
 wall time including each request's prompt steps:
 
 | slots | requests | completion tokens | wall | aggregate (prefill included) | decode alone |
