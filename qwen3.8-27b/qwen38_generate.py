@@ -1014,7 +1014,12 @@ class Model:
   def prefill_chunked(self, ids):
     """The prompt through the verify path, up to max(geometries) tokens a pass (each pass one streaming of the weights; the
     DeltaNet states and caches carried like a decode), the last chunk padded and committed to its real length -> the logits of
-    the last prompt token. The rows-mode (compact) layouts only: the Q8_0 models' prefill."""
+    the last prompt token. The rows-mode (compact) layouts only: the Q8_0 models' prefill (and any model past ATT_PMAX slices)."""
+    for _ in self.prefill_chunks(ids): pass
+    return self.prefill_lg
+  def prefill_chunks(self, ids):
+    """prefill_chunked a pass at a time: yields the prompt positions done after each pass (a server interleaves other work between
+    them); the last prompt token's logits are left in `prefill_lg`. The caller runs the prelude of prefill() first (prefill_prelude)."""
     self.ids_prompt = list(ids); n = len(ids); m = max(self.geos); lg = None
     self.reset()                                                          # (the first chunk reads Sall as the state before position 0: zero it --
     #                                                                        spec_warmup's bank-path passes, a previous prompt or plain steps left one there)
@@ -1023,19 +1028,27 @@ class Model:
       chunk = list(ids[c0:c0 + m]); a = len(chunk); mm = min(g for g in self.geos if g >= max(2, a))
       lg = self.verify(chunk + [chunk[-1]] * (mm - a), c0, head="full" if c0 + m >= n else None); self.commit(a, c0, mm)
       if self.dump is not None or self.MTPL: self.pre_hidden = np.concatenate([getattr(self, "pre_hidden", np.zeros((0, R.H), np.float32))[:c0], self.v_hidden[:a]])
+      if c0 + m < n: yield c0 + a
     if self.dump is not None: self.dump.extend(self.pre_hidden)           # QWEN_DUMP_HIDDEN: every prompt position
-    self._prompt_pass = False
-    return lg[a - 1]
+    self._prompt_pass = False; self.prefill_lg = lg[a - 1]
+    yield n
   def reset(self):
     """Before an unrelated prompt in the same process (a server's next request): the DeltaNet states to zero (a chunked prefill
     starts from them; the default prefill overwrites them anyway). The rings and the K / V caches are only read at positions the
     new prompt has written."""
     self.Sall.assign(Tensor.zeros(self.Sall.shape[0], device=DEV, dtype=dtypes.float32)).realize()
-  def prefill(self, ids, nlayers=None):
+  def prefill_prelude(self):
+    """Before a prompt: a folded commit run, nothing pending for the next verify pass."""
     self._commit_flush()
     if getattr(self, "defer", False): poke(self.accb, np.zeros(1, np.int32)); self.pend = False   # no update pending for the next verify pass (gdn_defer_src)
     if getattr(self, "leaf", False) and self.M: poke(self.pathb, np.zeros(4 + self.M, np.int32))   # (the leaf tree's gdn_tokl: its pending path)
-    if R.Q8 or os.environ.get("QWEN_PREFILL") == "chunked": return self.prefill_chunked(ids)
+  def prefill_long(self):
+    """True when the context is past the exact attention path's slices (attn_plan): the one-pass prefill's part kernels do not
+    apply, the prompt goes through the verify path."""
+    return QK.attn_plan(R.NH, R.HD, self.TMAX)[1] is not None
+  def prefill(self, ids, nlayers=None):
+    self.prefill_prelude()
+    if R.Q8 or os.environ.get("QWEN_PREFILL") == "chunked" or self.prefill_long(): return self.prefill_chunked(ids)
     nlayers = R.NL if nlayers is None else nlayers
     n = len(ids); L = self.pre; assert n <= self.TMAX; self.ids_prompt = list(ids)
     x = np.zeros((L.R, R.H), np.float32); x[:n] = self.W.embed(ids); x = dev(x)

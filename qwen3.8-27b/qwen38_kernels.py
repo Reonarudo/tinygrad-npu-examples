@@ -3308,6 +3308,20 @@ def attn_gqa_nte(M, NH=None, NKV=None, HD=None, TMAX=None):
 def _attn_lsram(M, HD, CL, BT=ATT_BT): return 2 * M * HD * 4 + M * CL * 4 + 2 * BT * HD * 4 + HD * 4   # q, o, scores, K / V blocks, a new k
 def _attn_cl(TMAX, P): return -(-(-(-TMAX // P) + 1) // 8) * 8                 # a slice's positions (+1 for the rounding), to 8
 
+ATT_PMAX = 16                                                                # attn_plan: the most slices the exact (one-chunk) path takes
+
+def attn_plan(NH, HD, TMAX, BT=ATT_BT):
+  """(P, CLC) for attn_gqa's kernels: P position slices a query head, CLC the positions a slice is streamed in (None: the whole slice at
+  once -- attn_part's rounding, byte for byte, the path while the fewest slices that fit LSRAM are <= ATT_PMAX, up to ~4k positions
+  at HD 256). Longer contexts: P = the smallest multiple of the base >= NT (every task a unit at one row), each slice in chunks of
+  CLC positions with an online softmax (the chunk's scores in LSRAM beside one octet of records and its q octet: 168 at HD 256)."""
+  P = attn_parts(NH, HD, TMAX)
+  if P <= ATT_PMAX: return P, None
+  base = NT // math.gcd(NH, NT); P = base * -(-NT // base); PW = HD + 16
+  AV = 32768 - 64 - (2 * BT * HD * 4 + 2 * HD * 4); CLC = (AV - 8 * PW * 4 - 64 - 8 * HD * 4) // 32 // 8 * 8   # one octet of records, its state, its q octet, the chunk's scores
+  assert CLC >= 8 * BT and CLC % BT == 0, CLC
+  return P, CLC
+
 def attn_parts(NH, HD, TMAX):
   """Position slices a query head in attn_part: the fewest that make NH x P units fill the NT tasks evenly (a multiple of
   NT / gcd(NH, NT)) and leave a 7-row unit's buffers within LSRAM (Ornith's 16 heads: 3; the 27B's 24 at TMAX 512: 2)."""
@@ -3962,7 +3976,7 @@ class Kernels:
     OA.csrc_call(kk, o, q, Kall, Vall, knew, vnew, idx).realize(); return o.reshape(NH, HD)
   def attn_dec2(self, q_rows, kv_rows, qnw, knw, rope, Kall, Vall, idx, NH, NKV, HD, TMAX, ROT):
     """The fused decode attention (attn_dec2_src) -> the persistent o_rows [rows, NH*HD], the token in row 0."""
-    if attn_gqa_on() and 4 * 1024 + 10 * HD * 4 + TMAX * 32 <= 32768 - 64 and NH // NKV <= 8:   # attn_dec3 (attn_gqa.py): byte-identical o_rows / cache
+    if attn_gqa_on() and NH // NKV <= 8:                                # attn_dec3 (attn_gqa.py): byte-identical o_rows / cache; chunked past 512 positions
       import attn_gqa as AG
       U = int(os.environ.get("QWEN_ATTN_DEC_U", "1"))
       if f"attn_dec3_desc" not in self.bufs: self.bufs["attn_dec3_desc"] = Tensor(AG.attn_dec3_desc(NH, NKV, HD), device=DEV).realize()
@@ -4085,7 +4099,7 @@ class Kernels:
     """attn_part / attn_partt + attn_comb as the kv-head kernels (attn_gqa.py): the same records, the same o_rows, byte for byte
     (checked on the vendor simulator). `treeb` None: the chain rule; else the tree table."""
     import attn_gqa as AG
-    M = self.real; P = attn_parts(NH, HD, TMAX); tree = treeb is not None; nte = attn_gqa_nte(M, NH, NKV, HD, TMAX)
+    M = self.real; P, _ = attn_plan(NH, HD, TMAX); tree = treeb is not None; nte = attn_gqa_nte(M, NH, NKV, HD, TMAX)
     dk, ck = f"attn_gqa_desc{M}", f"attn_comb2_desc{M}"
     if dk not in self.bufs: self.bufs[dk] = Tensor(AG.attn_gqa_desc(NH, NKV, HD, TMAX, M), device=DEV).realize()
     if ck not in self.bufs: self.bufs[ck] = Tensor(AG.attn_comb2_desc(NH, HD, TMAX, M), device=DEV).realize()

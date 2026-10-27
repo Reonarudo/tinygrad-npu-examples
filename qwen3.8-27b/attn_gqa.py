@@ -19,6 +19,9 @@ rows, the new rows' k / v and the cache rows it writes go through the data cache
   - pass 2 keeps 2 records x 64 dims of o in registers over a K / V block (the fma order per element is attn_part's, t ascending);
   - the q rows (per head run, one 2-D request), the new rows' k / v and the records (one 2-D drain per head run) move by DMA;
     the M new rows go into the cache by DMA (units (row, kv head) on the tasks with the least attention work).
+Long contexts (attn_plan's CLC): a slice's positions in chunks of CLC with an online softmax -- the q octets resident in a region of
+their own, each octet's running max / sum as float8s, the records' o and the sum rescaled by exp(m_old - m_new) per chunk; the
+records then combine as before (the padding terms of the exact path are not added).
 `tree`: attn_part_tree_src / attn_part_rg_src(tree=True)'s rule (row r at position pos + depth[r], attending the cache and the new
 rows set in anc[r]); the 12th argument `tree` (spec_tree.table). Any M <= 12.
 """
@@ -117,7 +120,7 @@ def gqa_layout(NH, NKV, HD, TMAX, M, BT):
 
 
 def attn_gqa_desc(NH, NKV, HD, TMAX, M, BT=None):
-  K = _K(); BT = K.ATT_BT if BT is None else BT; P = K.attn_parts(NH, HD, TMAX); PW = HD + 16; QR = NH * 2 * HD
+  K = _K(); BT = K.ATT_BT if BT is None else BT; P, _ = K.attn_plan(NH, HD, TMAX); PW = HD + 16; QR = NH * 2 * HD
   lay = gqa_layout(NH, NKV, HD, TMAX, M, BT)
   sl = [(BT * HD * 4, HD * 4, NKV * HD * 4, HD * 4), (HD * 4,)]
   sl += [(n * HD * 4, HD * 4, QR * 4, HD * 4) for n in range(1, lay["QST"] + 1)]           # q rows of one head (pitch QR)
@@ -129,7 +132,7 @@ def attn_gqa_src(NH, NKV, HD, TMAX, ROT, eps, M, tree=False, BT=None, NTE=None, 
   """See the module docstring. args: part, q_rows, kv_rows, qnw_all, knw_all, rope, Kall, Vall, idx (layer, pos), desc
   (attn_gqa_desc)[, tree]. NTE: the tasks that take attention records (default 12; the rest only write cache rows)."""
   K = _K(); BT = K.ATT_BT if BT is None else BT; NT = K.NT; NTE = NT if NTE is None else NTE
-  g = NH // NKV; P = K.attn_parts(NH, HD, TMAX); CL = K._attn_cl(TMAX, P); NCH = CL // 8; G = g * M
+  g = NH // NKV; P, CLC = K.attn_plan(NH, HD, TMAX); CL = K._attn_cl(TMAX, P); NCH = CL // 8; G = g * M
   scale = 1.0 / HD ** 0.5; LOG2E = 1.4426950408889634; QR, KR = NH * 2 * HD, 2 * NKV * HD; PW = HD + 16
   assert 1 <= M <= 12 and HD % 64 == 0 and BT % 2 == 0 and CL % 8 == 0 and 1 <= NTE <= NT
   lay = gqa_layout(NH, NKV, HD, TMAX, M, BT); KB0, KN, KS, REC, AV, QST = (lay[k] for k in ("KB0", "KN", "KS", "REC", "AV", "QST"))
@@ -144,6 +147,46 @@ def attn_gqa_src(NH, NKV, HD, TMAX, ROT, eps, M, tree=False, BT=None, NTE=None, 
   sm_full = " ".join(f"{{ {ex(l)} }}" for l in L8)
   sm_part = " ".join(f"if (8 * k + {l} < n) {{ {ex(l)} }} else S{l} += ep;" for l in L8)
   sm_pad = " ".join(f"S{l} += ep;" for l in L8)
+  sm_old = f"""
+    /* each record's max and sum (attn_part's: lane classes over its CL / 8 chunks, the chunks past the slice as their constant) */
+    for (int o = 0; o < NO; o++) {{
+      __global float* so = SC + o * CLd * 8;
+      float8 mx = BC{NEG}; for (int t = 0; t < n; t++) mx = VMAX(mx, *(__global float8*)(so + t * 8));
+      float8 ep = exp2_d4((BC{NEG} - mx) * BC({LOG2E!r}f));
+      {sm_decl}
+      int k = 0;
+      for (; 8 * k + 8 <= n; k++) {{ {sm_full} }}
+      if (8 * k < n) {{ {sm_part} k++; }}
+      for (; k < {NCH}; k++) {{ {sm_pad} }}
+      float8 sm = ((((((S0 + S1) + S2) + S3) + S4) + S5) + S6) + S7;
+      for (int l = 0; l < 8; l++) {{
+        __global float* rec = QO + (o * 8 + l) * {PW};
+        for (int i = 0; i < {PW}; i += 8) *(__global float8*)(rec + i) = BC(0.0f);
+        rec[{HD}] = mx[l]; rec[{HD + 1}] = n > 0 ? sm[l] : 0.0f;
+      }}
+    }}"""
+  sm_online = f"""
+    /* the online softmax: each octet's running max and sum (float8s at MS: lanes = records); o and the sum rescaled by exp(m_old - m_new) */
+    for (int o = 0; o < NO; o++) {{
+      __global float* so = SC + o * CLd * 8; __global float* ms = MS + o * 16;
+      float8 mo = *(__global float8*)ms, lo = *(__global float8*)(ms + 8);
+      float8 mc = BC{NEG}; for (int t = 0; t < n; t++) mc = VMAX(mc, *(__global float8*)(so + t * 8));
+      float8 mn = VMAX(mo, mc), al = exp2_d4((mo - mn) * BC({LOG2E!r}f)), sm = lo * al;
+      for (int t = 0; t < n; t++) {{ float8 e = exp2_d4((*(__global float8*)(so + t * 8) - mn) * BC({LOG2E!r}f)); *(__global float8*)(so + t * 8) = e; sm += e; }}
+      *(__global float8*)ms = mn; *(__global float8*)(ms + 8) = sm;
+      for (int l = 0; l < 8; l++) {{ __global float* rec = QO + (o * 8 + l) * {PW}; float8 a = BC(al[l]); for (int i = 0; i < {HD}; i += 8) *(__global float8*)(rec + i) *= a; }}
+    }}"""
+  QS = 8 * HD if CLC else 8 * PW                                            # the q octets' stride: their own region when chunked (the records hold o across chunks), else the records'
+  cld_decl = f"int CLd = {CLC};" if CLC else f"int smax = (T + {P - 1}) / {P}, CLd = (smax + 7) & ~7;"
+  tvars = "" if CLC else " int t0 = s0, t1 = s1, tc = t1 < pos ? t1 : pos, n = t1 - t0;"
+  chunk_open = f"""
+    for (int o = 0; o < NO; o++) {{ for (int l = 0; l < 8; l++) {{ __global float* rec = QO + (o * 8 + l) * {PW}; for (int i = 0; i < {PW}; i += 8) *(__global float8*)(rec + i) = BC(0.0f); }}
+                                  *(__global float8*)(MS + o * 16) = BC{NEG}; *(__global float8*)(MS + o * 16 + 8) = BC(0.0f); }}
+    for (int ca = s0; ca < s1; ca += {CLC}) {{                            /* the slice's positions a chunk at a time */
+    int t0 = ca, t1 = ca + {CLC} < s1 ? ca + {CLC} : s1, tc = t1 < pos ? t1 : pos, n = t1 - t0;""" if CLC else ""
+  chunk_close = f"""
+    }}
+    for (int o = 0; o < NO; o++) for (int l = 0; l < 8; l++) {{ __global float* rec = QO + (o * 8 + l) * {PW}; rec[{HD}] = MS[o * 16 + l]; rec[{HD + 1}] = MS[o * 16 + 8 + l]; }}""" if CLC else ""
   p2 = " ".join(f"if (o * 8 + {2 * p} < R) {{ __global float* oa = QO + (o * 8 + {2 * p}) * {PW}; __global float* ob = o * 8 + {2 * p + 1} < R ? oa + {PW} : LSF({KN}); "
                 + f"if (nt == {BT}) {{ {_p2_pair_full(HD, 2 * p, 2 * p + 1, BT)} }} else {{ {_p2_pair(HD, 2 * p, 2 * p + 1)} }} }}" for p in range(4))
   return K.V.FULL_H + K.EXP + _norm_rope_c(HD, ROT, eps) + _HSUMT + f"""
@@ -165,8 +208,8 @@ __kernel void {kname}(__global float* restrict part, __global float* restrict q_
   }}
   {"int lid = core_id;" if NTE == NT else f"int lid = (core_id & 3) * 3 + (core_id >> 2);                  /* tasks spread over the 3 cores (each core's DMA engine serialises its TECs' requests) */"}
   if (lid >= {NTE}) return;
-  int smax = (T + {P - 1}) / {P}, CLd = (smax + 7) & ~7;                 /* a slice's positions (at most), the score octets' length */
-  int Rf = {G}; while (Rf > 1 && ((Rf + 7) >> 3) * ({8 * PW * 4} + CLd * 32) > {AV}) Rf--;
+  {cld_decl}                 /* a slice's positions (at most), the score octets' length */
+  int Rf = {G}; while (Rf > 1 && ((Rf + 7) >> 3) * ({8 * PW * 4 + (64 + QS * 4 if CLC else 0)} + CLd * 32) > {AV}) Rf--;
   if (Rf > 8) Rf &= ~7;                                                   /* whole octets when there are several */
   int w = lid * {NKV * P * G} / {NTE}, w1 = (lid + 1) * {NKV * P * G} / {NTE};
   __global float* QO = LSF({REC});
@@ -174,22 +217,22 @@ __kernel void {kname}(__global float* restrict part, __global float* restrict q_
     int pr = w / {G}, j0 = w % {G}, j1 = j0 + (w1 - w); if (j1 > {G}) j1 = {G}; if (j1 - j0 > Rf) j1 = j0 + Rf;
     w += j1 - j0;
     int kvh = pr / {P}, c = pr % {P}, R = j1 - j0, NO = (R + 7) >> 3;
-    int t0 = c * T / {P}, t1 = (c + 1) * T / {P}, tc = t1 < pos ? t1 : pos, n = t1 - t0;
-    __global float* SC = QO + NO * {8 * PW};                              /* octet o: SC + o * CLd * 8; position t: + (t - t0) * 8 */
+    int s0 = c * T / {P}, s1 = (c + 1) * T / {P};{tvars}
+    __global float* MS = QO + NO * {8 * PW}; __global float* QB = {'MS + NO * 16' if CLC else 'QO'}; __global float* SC = QB + NO * {QS if CLC else 0};   /* octet o: SC + o * CLd * 8; position t: + (t - t0) * 8 */
     DMA_WAIT(3);                                                          /* the previous unit's record drains (they read QO) */
     /* the q rows, normed and rotated, into the octets chunk-major (chunk i of lane l at + (8 i + l) 8); one request per run of a head's rows */
-    if (R & 7) for (int i = 0; i < {HD // 8}; i++) for (int l = R & 7; l < 8; l++) *(__global float8*)(QO + (NO - 1) * {8 * PW} + (8 * i + l) * 8) = BC(0.0f);
+    if (R & 7) for (int i = 0; i < {HD // 8}; i++) for (int l = R & 7; l < 8; l++) *(__global float8*)(QB + (NO - 1) * {QS} + (8 * i + l) * 8) = BC(0.0f);
     for (int jj = 0; jj < R; ) {{
       int j = j0 + jj, h = kvh * {g} + j / {M}, r = j % {M}, nr = {M} - r;
       if (nr > R - jj) nr = R - jj; if (nr > {QST}) nr = {QST};
       DMA_FILL(2, DESC(desc, {QD} - 1 + nr), {KB0}, (int)(q_rows + r * {QR} + h * {2 * HD})); DMA_WAIT(2);
       for (int ii = 0; ii < nr; ii++) {{
         norm_rope(LSF({KN}), LSF({KB0}) + ii * {HD}, qnw, rope + {RP("r + ii")} * {2 * ROT});
-        __global float* qd = QO + ((jj + ii) >> 3) * {8 * PW} + ((jj + ii) & 7) * 8;
+        __global float* qd = QB + ((jj + ii) >> 3) * {QS} + ((jj + ii) & 7) * 8;
         for (int i = 0; i < {HD // 8}; i++) *(__global float8*)(qd + i * 64) = *(__global float8*)(LSF({KN}) + i * 8);
       }}
       jj += nr;
-    }}
+    }}{chunk_open}
     for (int o = 0; o < NO; o++) for (int t = 0; t < n; t++) *(__global float8*)(SC + o * CLd * 8 + t * 8) = BC{NEG};
     /* pass 1: the cache rows [t0, tc) in blocks of {BT} (double-buffered), two positions x eight records a step */
     int nb = tc > t0 ? (tc - t0 + {BT - 1}) / {BT} : 0;
@@ -204,7 +247,7 @@ __kernel void {kname}(__global float* restrict part, __global float* restrict q_
         int t = t0 + b * {BT} + jt; if (t >= tc) break;
         __global float* kr0 = kb + jt * {HD}; __global float* kr1 = kr0 + {HD};
         for (int o = 0; o < NO; o++) {{
-          __global float* qb = QO + o * {8 * PW};
+          __global float* qb = QB + o * {QS};
           {_p1(HD, True)}
           __global float* so = SC + o * CLd * 8 + (t - t0) * 8;
           *(__global float8*)so = hsumT({xs}) * BC({scale!r}f);
@@ -218,30 +261,14 @@ __kernel void {kname}(__global float* restrict part, __global float* restrict q_
       norm_rope(LSF({KN}), LSF({KS}), knw, rope + {RPN("t")} * {2 * ROT});
       __global float* kr0 = LSF({KN});
       for (int o = 0; o < NO; o++) {{
-        __global float* qb = QO + o * {8 * PW};
+        __global float* qb = QB + o * {QS};
         {_p1(HD, False)}
         __global float* so = SC + o * CLd * 8 + (t - t0) * 8;
         *(__global float8*)so = hsumT({xs}) * BC({scale!r}f);
         for (int l = 0; l < 8 && o * 8 + l < R; l++) {{ int r = (j0 + o * 8 + l) % {M}; if (!{VIS("r", "t")}) so[l] = {NEG}; }}
       }}
     }}
-    /* each record's max and sum (attn_part's: lane classes over its CL / 8 chunks, the chunks past the slice as their constant) */
-    for (int o = 0; o < NO; o++) {{
-      __global float* so = SC + o * CLd * 8;
-      float8 mx = BC{NEG}; for (int t = 0; t < n; t++) mx = VMAX(mx, *(__global float8*)(so + t * 8));
-      float8 ep = exp2_d4((BC{NEG} - mx) * BC({LOG2E!r}f));
-      {sm_decl}
-      int k = 0;
-      for (; 8 * k + 8 <= n; k++) {{ {sm_full} }}
-      if (8 * k < n) {{ {sm_part} k++; }}
-      for (; k < {NCH}; k++) {{ {sm_pad} }}
-      float8 sm = ((((((S0 + S1) + S2) + S3) + S4) + S5) + S6) + S7;
-      for (int l = 0; l < 8; l++) {{
-        __global float* rec = QO + (o * 8 + l) * {PW};
-        for (int i = 0; i < {PW}; i += 8) *(__global float8*)(rec + i) = BC(0.0f);
-        rec[{HD}] = mx[l]; rec[{HD + 1}] = n > 0 ? sm[l] : 0.0f;
-      }}
-    }}
+{sm_online if CLC else sm_old}
     /* pass 2: o += p V, two records x 64 dims in registers over a block */
     if (nb > 0) DMA_FILL(0, DESC(desc, 0), {KB0}, (int)(Vc + (t0 * {NKV} + kvh) * {HD}));
     for (int b = 0; b < nb; b++) {{
@@ -264,7 +291,7 @@ __kernel void {kname}(__global float* restrict part, __global float* restrict q_
         float8 sa = BC(SC[(jj >> 3) * CLd * 8 + (jj & 7) + (t - t0) * 8]); __global float* oa = QO + jj * {PW};
         {_p2_one(HD)}
       }}
-    }}
+    }}{chunk_close}
     /* the records out: one 2-D drain per run of rows of one head */
     for (int jj = 0; jj < R; ) {{
       int j = j0 + jj, h = kvh * {g} + j / {M}, r = j % {M}, nr = {M} - r; if (nr > R - jj) nr = R - jj;
@@ -277,7 +304,7 @@ __kernel void {kname}(__global float* restrict part, __global float* restrict q_
 
 
 def attn_comb2_desc(NH, HD, TMAX, M):
-  K = _K(); P = K.attn_parts(NH, HD, TMAX); PW = HD + 16; QR, OR = NH * 2 * HD, NH * HD
+  K = _K(); P, _ = K.attn_plan(NH, HD, TMAX); PW = HD + 16; QR, OR = NH * 2 * HD, NH * HD
   return K.V._desc_slots(*([(n * P * PW * 4,) for n in range(1, M + 1)] + [(n * HD * 4, HD * 4, QR * 4, HD * 4) for n in range(1, M + 1)]
                            + [(n * HD * 4, HD * 4, OR * 4, HD * 4) for n in range(1, M + 1)]))
 
@@ -286,7 +313,7 @@ def attn_comb2_src(NH, HD, TMAX, M, name="attn_comb"):
   """attn_comb with every row by DMA: a unit = (head h, a run of rows): its rows' P slice records (contiguous), their gates (pitch
   QR) in by two requests, attn_comb's arithmetic per (row, head), the outputs drained by one 2-D request (pitch OR). The units
   (NH x ceil(M / RU) of them) fill the 12 tasks. args: o_rows, part, q_rows, desc (attn_comb2_desc)."""
-  K = _K(); NT = K.NT; P = K.attn_parts(NH, HD, TMAX); PW = HD + 16; LOG2E = 1.4426950408889634; QR, OR = NH * 2 * HD, NH * HD
+  K = _K(); NT = K.NT; P, _ = K.attn_plan(NH, HD, TMAX); PW = HD + 16; LOG2E = 1.4426950408889634; QR, OR = NH * 2 * HD, NH * HD
   RU = M
   while RU > 1 and NH * -(-M // RU) < NT: RU -= 1                           # rows a unit: the most that still give >= NT units
   while RU * (P * PW + 2 * HD) * 4 > 32768 - 64: RU -= 1
@@ -323,7 +350,7 @@ def bench_arm(kern, NH, NKV, HD, TMAX, ROT, eps, M, opts, I, desc, part):
   kern gqa / comb2 with opts (tree, BT<n>, NTE<n>)."""
   K = _K(); from tinygrad import Tensor; DEV = "ZHOUYI"
   o = {x.rstrip("0123456789"): (int(x[len(x.rstrip("0123456789")):]) if x[-1].isdigit() else True) for x in opts}
-  P = K.attn_parts(NH, HD, TMAX); PW = HD + 16
+  P, _ = K.attn_plan(NH, HD, TMAX); PW = HD + 16
   if kern == "gqa":
     BT = o.get("BT", K.ATT_BT); tree = bool(o.get("tree")); NTE = o.get("NTE")
     src = attn_gqa_src(NH, NKV, HD, TMAX, ROT, eps, M, tree=tree, BT=BT, NTE=NTE)
@@ -342,19 +369,27 @@ def attn_dec3_desc(NH, NKV, HD, BT=2):
                            + [(n * HD * 4,) for n in range(1, g + 1)]))
 
 
+DEC3_CL1 = 512                                                               # attn_dec3: the positions one chunk of scores holds when the whole context fits LSRAM
+DEC3_CLC = 256                                                               # ... and a chunk's positions when it does not (the q octets and o then both stay resident)
+
+
 def attn_dec3_src(NH, NKV, HD, TMAX, ROT, eps, U=1, BT=2):
   """attn_dec2 (the plain decode step's attention, one row) in kv-head units: a unit = (kv head, one of U runs of its g query heads);
   the unit streams the head's K / V rows [0, pos) once by DMA (blocks of BT rows, double-buffered), scores two positions x its
   heads a step (attn_gqa's transposed sum = dot256's order), and keeps attn_dec2's arithmetic per head: the max from -1e30, the
   exps summed over t = 0..pos in order (lanes = heads), o += p V in t order, 1 / sum, the gate. The new token's k / v rows go into
-  the cache by DMA on the tasks without a unit. Same arguments as attn_dec2 plus desc (attn_dec3_desc). Scores: TMAX x 8 floats."""
+  the cache by DMA on the tasks without a unit. Same arguments as attn_dec2 plus desc (attn_dec3_desc).
+  Scores: TMAX <= DEC3_CL1: one chunk of TMAX x 8 floats (the text as before). Longer contexts: the positions 0..pos in chunks of
+  DEC3_CLC with an online softmax -- each chunk's scores in LSRAM, the running max per head, the sum and the o accumulators
+  rescaled by exp(m_old - m_new) when the max grows (the q octets stay resident, o has a region of its own)."""
   K = _K(); NT = K.NT; g = NH // NKV; scale = 1.0 / HD ** 0.5; LOG2E = 1.4426950408889634
   assert 1 <= U <= g and NKV * U < NT and BT % 2 == 0 and g <= 8
   NHU = -(-g // U)                                                            # heads a unit (the last may hold fewer)
-  KB0 = 0; KN = KB0 + 2 * BT * HD * 4; KS = KN + HD * 4; QO = KS + HD * 4; SC = QO + 8 * HD * 4; END = SC + TMAX * 32
-  assert END <= 32768 - 64 and TMAX * 32 >= NHU * HD * 4 and 2 * BT * HD * 4 >= HD * 4, (END, NHU)
+  chunked = TMAX > DEC3_CL1; CLC = DEC3_CLC if chunked else TMAX
+  KB0 = 0; KN = KB0 + 2 * BT * HD * 4; KS = KN + HD * 4; QO = KS + HD * 4; OO = QO + 8 * HD * 4 if chunked else QO; SC = OO + 8 * HD * 4; END = SC + CLC * 32
+  assert END <= 32768 - 64 and CLC * 32 >= NHU * HD * 4 and 2 * BT * HD * 4 >= HD * 4 and CLC % BT == 0, (END, NHU)
   xs = ", ".join(f"x{l}" for l in L8); ys = ", ".join(f"y{l}" for l in L8)
-  p2 = " ".join(f"if ({2 * p} < R) {{ __global float* oa = QOp + {2 * p * HD}; __global float* ob = {2 * p + 1} < R ? oa + {HD} : LSF({KS}); "
+  p2 = " ".join(f"if ({2 * p} < R) {{ __global float* oa = OOp + {2 * p * HD}; __global float* ob = {2 * p + 1} < R ? oa + {HD} : LSF({KS}); "
                 + _p2_pair(HD, 2 * p, 2 * p + 1) + " }" for p in range(4))
   return K.V.FULL_H + K.EXP + _norm_rope_c(HD, ROT, eps) + _HSUMT + f"""
 __kernel void attn_dec2(__global float* restrict o_rows, __global float* restrict q_rows, __global float* restrict kv_rows,
@@ -372,7 +407,7 @@ __kernel void attn_dec2(__global float* restrict o_rows, __global float* restric
     return;
   }}
   int kvh = core_id / {U}, part = core_id % {U}, h0 = kvh * {g} + part * {NHU}, R = {g} - part * {NHU}; if (R > {NHU}) R = {NHU};
-  __global float* QOp = LSF({QO}); __global float* S = LSF({SC});
+  __global float* QOp = LSF({QO}); __global float* OOp = LSF({OO}); __global float* S = LSF({SC});
   DMA_FILL(2, DESC(desc, 1 + R), {SC}, (int)(q_rows + h0 * {2 * HD})); DMA_FILL(3, DESC(desc, 1), {KS}, (int)(kv_rows + kvh * {HD}));
   for (int i = 0; i < {HD // 8}; i++) for (int l = R; l < 8; l++) *(__global float8*)(QOp + (8 * i + l) * 8) = BC(0.0f);
   DMA_WAIT(2);
@@ -382,44 +417,53 @@ __kernel void attn_dec2(__global float* restrict o_rows, __global float* restric
   }}
   DMA_WAIT(3); norm_rope(LSF({KN}), LSF({KS}), knw, cs);
   __global float* qb = QOp;
-  int nb = (pos + {BT - 1}) / {BT};
-  if (nb > 0) DMA_FILL(0, DESC(desc, 0), {KB0}, (int)(Kc + kvh * {HD}));
-  for (int b = 0; b < nb; b++) {{
-    int p = b & 1;
-    if (b + 1 < nb) {{ if (p == 0) DMA_FILL(1, DESC(desc, 0), {KB0 + BT * HD * 4}, (int)(Kc + ((b + 1) * {BT} * {NKV} + kvh) * {HD}));
-                      else        DMA_FILL(0, DESC(desc, 0), {KB0}, (int)(Kc + ((b + 1) * {BT} * {NKV} + kvh) * {HD})); }}
-    if (p == 0) DMA_WAIT(0); else DMA_WAIT(1);
-    __global float* kb = LSF({KB0} + p * {BT * HD * 4});
-    for (int jt = 0; jt < {BT}; jt += 2) {{
-      int t = b * {BT} + jt; if (t >= pos) break;
-      __global float* kr0 = kb + jt * {HD}; __global float* kr1 = kr0 + {HD};
-      {_p1(HD, True)}
-      *(__global float8*)(S + t * 8) = hsumT({xs}) * BC({scale!r}f);
-      if (t + 1 < pos) *(__global float8*)(S + t * 8 + 8) = hsumT({ys}) * BC({scale!r}f);
+  float8 mx = BC(-1e30f), sum = BC(0.0f); int cz = 0;
+  for (int ca = 0; ca <= pos; ca += {CLC}) {{                        /* the positions [ca, cb) of 0..pos: the cache rows [ca, ce), then the new token when cb > pos */
+    int cb = ca + {CLC} < pos + 1 ? ca + {CLC} : pos + 1, ce = cb < pos ? cb : pos, n = cb - ca; cz = ca;
+    int nb = (ce - ca + {BT - 1}) / {BT};
+    if (nb > 0) DMA_FILL(0, DESC(desc, 0), {KB0}, (int)(Kc + (ca * {NKV} + kvh) * {HD}));
+    for (int b = 0; b < nb; b++) {{
+      int p = b & 1;
+      if (b + 1 < nb) {{ if (p == 0) DMA_FILL(1, DESC(desc, 0), {KB0 + BT * HD * 4}, (int)(Kc + ((ca + (b + 1) * {BT}) * {NKV} + kvh) * {HD}));
+                        else        DMA_FILL(0, DESC(desc, 0), {KB0}, (int)(Kc + ((ca + (b + 1) * {BT}) * {NKV} + kvh) * {HD})); }}
+      if (p == 0) DMA_WAIT(0); else DMA_WAIT(1);
+      __global float* kb = LSF({KB0} + p * {BT * HD * 4});
+      for (int jt = 0; jt < {BT}; jt += 2) {{
+        int t = ca + b * {BT} + jt; if (t >= ce) break;
+        __global float* kr0 = kb + jt * {HD}; __global float* kr1 = kr0 + {HD};
+        {_p1(HD, True)}
+        *(__global float8*)(S + (t - ca) * 8) = hsumT({xs}) * BC({scale!r}f);
+        if (t + 1 < ce) *(__global float8*)(S + (t - ca) * 8 + 8) = hsumT({ys}) * BC({scale!r}f);
+      }}
     }}
-  }}
-  {{ __global float* kr0 = LSF({KN}); {_p1(HD, False)} *(__global float8*)(S + pos * 8) = hsumT({xs}) * BC({scale!r}f); }}
-  float8 mx = BC(-1e30f); for (int t = 0; t <= pos; t++) mx = VMAX(mx, *(__global float8*)(S + t * 8));
-  float8 sum = BC(0.0f);
-  for (int t = 0; t <= pos; t++) {{ float8 e = exp2_d4((*(__global float8*)(S + t * 8) - mx) * BC({LOG2E!r}f)); *(__global float8*)(S + t * 8) = e; sum += e; }}
-  for (int i = 0; i < R * {HD}; i += 8) *(__global float8*)(QOp + i) = BC(0.0f);
-  if (nb > 0) DMA_FILL(0, DESC(desc, 0), {KB0}, (int)(Vc + kvh * {HD}));
-  for (int b = 0; b < nb; b++) {{
-    int p = b & 1;
-    if (b + 1 < nb) {{ if (p == 0) DMA_FILL(1, DESC(desc, 0), {KB0 + BT * HD * 4}, (int)(Vc + ((b + 1) * {BT} * {NKV} + kvh) * {HD}));
-                      else        DMA_FILL(0, DESC(desc, 0), {KB0}, (int)(Vc + ((b + 1) * {BT} * {NKV} + kvh) * {HD})); }}
-    if (p == 0) DMA_WAIT(0); else DMA_WAIT(1);
-    __global float* vb = LSF({KB0} + p * {BT * HD * 4});
-    int tb = b * {BT}, nt = pos - tb < {BT} ? pos - tb : {BT};
-    __global float* pe = S + tb * 8;
-    {p2}
+    if (cb > pos) {{ __global float* kr0 = LSF({KN}); {_p1(HD, False)} *(__global float8*)(S + (pos - ca) * 8) = hsumT({xs}) * BC({scale!r}f); }}
+    float8 mc = BC(-1e30f); for (int t = 0; t < n; t++) mc = VMAX(mc, *(__global float8*)(S + t * 8));
+    float8 mn = VMAX(mx, mc);
+    if (ca > 0) {{                                                    /* the max grew: the sum and o so far rescaled */
+      float8 al = exp2_d4((mx - mn) * BC({LOG2E!r}f)); sum *= al;
+      for (int jj = 0; jj < R; jj++) {{ float8 a = BC(al[jj]); for (int i = 0; i < {HD}; i += 8) *(__global float8*)(OOp + jj * {HD} + i) *= a; }}
+    }}
+    mx = mn;
+    for (int t = 0; t < n; t++) {{ float8 e = exp2_d4((*(__global float8*)(S + t * 8) - mx) * BC({LOG2E!r}f)); *(__global float8*)(S + t * 8) = e; sum += e; }}
+    if (ca == 0) for (int i = 0; i < R * {HD}; i += 8) *(__global float8*)(OOp + i) = BC(0.0f);
+    if (nb > 0) DMA_FILL(0, DESC(desc, 0), {KB0}, (int)(Vc + (ca * {NKV} + kvh) * {HD}));
+    for (int b = 0; b < nb; b++) {{
+      int p = b & 1;
+      if (b + 1 < nb) {{ if (p == 0) DMA_FILL(1, DESC(desc, 0), {KB0 + BT * HD * 4}, (int)(Vc + ((ca + (b + 1) * {BT}) * {NKV} + kvh) * {HD}));
+                        else        DMA_FILL(0, DESC(desc, 0), {KB0}, (int)(Vc + ((ca + (b + 1) * {BT}) * {NKV} + kvh) * {HD})); }}
+      if (p == 0) DMA_WAIT(0); else DMA_WAIT(1);
+      __global float* vb = LSF({KB0} + p * {BT * HD * 4});
+      int tb = ca + b * {BT}, nt = ce - tb < {BT} ? ce - tb : {BT};
+      __global float* pe = S + (tb - ca) * 8;
+      {p2}
+    }}
   }}
   DMA_FILL(2, DESC(desc, 1), {KS}, (int)(kv_rows + {NKV * HD} + kvh * {HD})); DMA_WAIT(2);
   for (int j0 = 0; j0 < R; j0 += {2 * BT}) {{
     int ng = R - j0 < {2 * BT} ? R - j0 : {2 * BT};
     DMA_FILL(3, DESC(desc, 1 + ng), {KB0}, (int)(q_rows + (h0 + j0) * {2 * HD} + {HD})); DMA_WAIT(3);
     for (int jj = j0; jj < j0 + ng; jj++) {{
-      float8 pb = BC(S[pos * 8 + jj]); __global float* oa = QOp + jj * {HD}; __global float* vr = LSF({KS}); __global float* gp = LSF({KB0}) + (jj - j0) * {HD};
+      float8 pb = BC(S[(pos - cz) * 8 + jj]); __global float* oa = OOp + jj * {HD}; __global float* vr = LSF({KS}); __global float* gp = LSF({KB0}) + (jj - j0) * {HD};
       float8 inv = BC(1.0f / sum[jj]);
       for (int j = 0; j < {HD}; j += 8) {{
         float8 o = *(__global float8*)(oa + j) + pb * *(__global float8*)(vr + j);
@@ -428,7 +472,7 @@ __kernel void attn_dec2(__global float* restrict o_rows, __global float* restric
       }}
     }}
   }}
-  DMA_DRAIN(2, DESC(desc, {1 + g} + R), {QO}, (int)(o_rows + h0 * {HD})); DMA_WAIT(2);
+  DMA_DRAIN(2, DESC(desc, {1 + g} + R), {OO}, (int)(o_rows + h0 * {HD})); DMA_WAIT(2);
 }}"""
 
 
@@ -438,8 +482,8 @@ def gqa_nte(NH, NKV, HD, TMAX, M, BT=None, T_est=None, port_gbs=21.6, core_gbs=7
   over the port (at most core_gbs a core: one DMA engine a core, the tasks spread over the cores), against the busiest task's
   octet-positions (a run of r records costs ceil(r / 8) octets a position, ~cyc_oct cycles: simulator bundle counts of v3);
   the n with the least max(), fewer tasks only when 2 % better. A model, not a measurement (QWEN_ATTN_NTE overrides)."""
-  K = _K(); BT = K.ATT_BT if BT is None else BT; g = NH // NKV; P = K.attn_parts(NH, HD, TMAX); G = g * M; PW = HD + 16
-  T = T_est or max(M + 1, TMAX // 4); AV = gqa_layout(NH, NKV, HD, TMAX, M, BT)["AV"]; CLd = (-(-T // P) + 7) & ~7
+  K = _K(); BT = K.ATT_BT if BT is None else BT; g = NH // NKV; P, CLC = K.attn_plan(NH, HD, TMAX); G = g * M; PW = HD + 16
+  T = T_est or max(M + 1, TMAX // 4); AV = gqa_layout(NH, NKV, HD, TMAX, M, BT)["AV"]; CLd = CLC or (-(-T // P) + 7) & ~7
   Rf = G
   while Rf > 1 and -(-Rf // 8) * (8 * PW * 4 + CLd * 32) > AV: Rf -= 1
   if Rf > 8: Rf &= ~7

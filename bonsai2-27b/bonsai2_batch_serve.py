@@ -6,7 +6,15 @@ zeroed), its prompt goes through the same steps a token at a time (the slot's ro
 plain greedy until <eos>, a stop string or max_tokens; its tokens stream as they come. Idle slots run dummy rows (the step's cost is
 the geometry's, ~66 ms for 4 users on the 2B, ~85 ms for 8), so one user sees 1 / step and N users N / step.
 
-  QWEN_MODEL=bonsai2-2b python3 bonsai2_batch_serve.py [--users 4] [--host 0.0.0.0] [--port 8000] [--tmax 512]
+The prompt: a short one (< BATCH_PREFILL_MIN, 48 tokens) goes through the batch steps a token at a time in its slot (the row's
+outputs discarded until it is in: no other user slows down); a long one through the model's chunked prefill (the verify path,
+max(geometries) = 4 tokens a pass on the model's own states and cache), one request at a time, a pass between two batch steps while
+others decode (back to back when no slot is busy); when it is in, the DeltaNet states, rings and the prompt's K / V rows are copied
+into the slot and the first token goes out. The context
+(`--tmax`, 65536 by default) sets the K / V caches: (1 + users) x attention layers x tmax x 2 KiB (2B: 1.5 GB a user at 64k;
+the 4B / 9B 4.3 GB a user -- fewer users or a shorter context there).
+
+  QWEN_MODEL=bonsai2-2b python3 bonsai2_batch_serve.py [--users 4] [--host 0.0.0.0] [--port 8000] [--tmax 65536]
   (the single-request speculative server is bonsai2_serve.py: faster for one user, one request at a time)
 """
 import argparse, os, queue, sys, threading, time
@@ -19,6 +27,7 @@ from qwen38_tokenize import Tok                                          # noqa:
 from tinygrad import Tensor                                              # noqa: E402
 
 EOS = S.EOS
+PREFILL_MIN = int(os.environ.get("BATCH_PREFILL_MIN", "48"))                   # prompts this long or longer go through the chunked prefill
 
 
 class BatchEngine:
@@ -32,19 +41,35 @@ class BatchEngine:
     print(f"   model set up in {time.perf_counter() - t0:.0f} s; {a.users} slots; host CPUs {self.cpus}; CPU latency {self.lat}", flush=True)
   def submit(self, ids, max_new, stop):
     q = queue.Queue(); self.jobs.put((list(ids), max_new, stop, q)); return q
-  def _free(self, u, job):
-    """Slot u takes a job: its DeltaNet states and rings zeroed, its position 0."""
+  def _short(self, u, job):
+    """Slot u takes a short prompt: its DeltaNet states and rings zeroed, the prompt's ids go in a token a step from position 0."""
     ids, max_new, stop, q = job
-    if len(ids) + 1 > self.tmax: q.put(("error", f"the prompt ({len(ids)} tokens) does not fit the context ({self.tmax})")); return
     self.B.Sall[u * self.ssz:(u + 1) * self.ssz].assign(Tensor.zeros(self.ssz, device=BB.DEV)).realize()
     self.B.Call[u * self.csz:(u + 1) * self.csz].assign(Tensor.zeros(self.csz, device=BB.DEV)).realize()
     self.slots[u] = dict(ids=ids, k=0, out=[], max_new=max(1, min(max_new, self.tmax - len(ids) - 1)), stop=stop, q=q, pos=0, sent="", t0=time.perf_counter(), tf=None)
+  def _start(self, job):
+    """A job's prompt starts through the model's chunked prefill (one at a time): -> the in-flight record, or None (rejected)."""
+    ids, max_new, stop, q = job
+    M = self.M; M.prefill_prelude(); M.spec_meta = dict(prompt="(server)", n_prompt=len(ids), thinking=False, prompt_ids=[int(v) for v in ids])
+    return dict(job=job, gen=M.prefill_chunks(ids), t0=time.perf_counter())
+  def _place(self, u, pre):
+    """The prefilled prompt into slot u: the model's DeltaNet states, rings and the prompt's K / V rows copied (the model's own
+    stacks were the prefill's), the first token emitted; the slot decodes from position n."""
+    ids, max_new, stop, q = pre["job"]; M, B, n = self.M, self.B, len(pre["job"][0]); NA = M.NATT; rs = R.NKV * R.HD
+    M.flush()                                                             # (the deferred commit: the last pass's state updates into Sall)
+    B.Sall[u * self.ssz:(u + 1) * self.ssz].assign(M.Sall).realize(); B.Call[u * self.csz:(u + 1) * self.csz].assign(M.Call).realize()
+    for i in range(NA):
+      src, dst = i * M.TMAX * rs, (u * NA + i) * self.tmax * rs
+      B.Kall[dst:dst + n * rs].assign(M.Kall[src:src + n * rs]).realize(); B.Vall[dst:dst + n * rs].assign(M.Vall[src:src + n * rs]).realize()
+    first = int(np.argmax(M.prefill_lg))
+    s = self.slots[u] = dict(ids=ids, k=n, out=[], max_new=max(1, min(max_new, self.tmax - n - 1)), stop=stop, q=q, pos=n, sent="", t0=pre["t0"], tf=None)
+    if self._emit(s, first): self.slots[u] = None
   def _emit(self, s, t):
     """Token t into slot s's output: the text's new suffix streamed; done on <eos>, a stop string or max_tokens -> True when finished."""
     s["out"].append(int(t)); fin = None
     if s["tf"] is None: s["tf"] = time.perf_counter()
     text = self.tok.decode([v for v in s["out"] if v not in EOS])
-    if not text.endswith("�"):
+    if not text.endswith("\ufffd"):
       for st in s["stop"]:
         if st and (i := text.find(st)) >= 0: text = text[:i]; fin = "stop"; break
       if len(text) > len(s["sent"]): s["q"].put(("delta", text[len(s["sent"]):])); s["sent"] = text
@@ -53,12 +78,24 @@ class BatchEngine:
     if fin is not None:
       t1 = time.perf_counter(); s["q"].put(("done", len([v for v in s["out"] if v not in EOS]), fin, s["tf"] - s["t0"], t1 - s["tf"])); return True
     return False
+  def _take(self):
+    """The next waiting job: rejected (too long), or placed in a free slot (short), or started on the chunked prefill (-> its record)."""
+    job = self.jobs.get_nowait(); ids = job[0]
+    if len(ids) + 1 > self.tmax: job[3].put(("error", f"the prompt ({len(ids)} tokens) does not fit the context ({self.tmax})")); return None
+    if len(ids) < PREFILL_MIN: self._short(self.slots.index(None), job); return None
+    return self._start(job)
   def serve_jobs(self):
-    """The main thread's loop: a step whenever a slot is busy; waiting requests fill the free slots between steps."""
-    N = self.N
+    """The main thread's loop: a prefill pass (the one long prompt in flight) and a batch step (when a slot is busy) in turn; a prompt
+    that is in takes a free slot; waiting requests start while a slot is free (and the prefill is, for a long one)."""
+    pre = None
     while True:
-      if all(s is None for s in self.slots): job = self.jobs.get(); self._free(self.slots.index(None), job)
-      while any(s is None for s in self.slots) and not self.jobs.empty(): self._free(self.slots.index(None), self.jobs.get_nowait())
+      if pre is None and all(s is None for s in self.slots) and self.jobs.empty(): self.jobs.put(self.jobs.get())   # (block until a request comes)
+      while None in self.slots and not self.jobs.empty() and (pre is None or len(self.jobs.queue[0][0]) < PREFILL_MIN): pre = self._take() or pre
+      if pre is not None and None in self.slots:
+        try:
+          if next(pre["gen"]) >= len(pre["job"][0]): self._place(self.slots.index(None), pre); pre = None   # (the last pass yields the prompt's length)
+        except Exception as e: pre["job"][3].put(("error", f"{type(e).__name__}: {e}")); print(f"   prefill failed: {e!r}", flush=True); pre = None
+      if all(s is None for s in self.slots): continue
       toks, pos = [], []
       for s in self.slots:
         if s is None: toks.append(0); pos.append(0)
@@ -81,11 +118,13 @@ class BatchEngine:
 def main():
   ap = argparse.ArgumentParser(); ap.add_argument("--host", default="127.0.0.1"); ap.add_argument("--port", type=int, default=8000)
   ap.add_argument("--users", type=int, default=int(os.environ.get("BATCH_USERS", "4")), help="slots: requests decoded together (the step's geometry; 8 at most pays)")
-  ap.add_argument("--model-name", default=os.environ.get("QWEN_SERVE_NAME", os.environ["QWEN_MODEL"])); ap.add_argument("--tmax", type=int, default=512, help="the context (prompt + generated tokens): the batched attention kernel's scores live in LSRAM, 512 at most")
+  ap.add_argument("--model-name", default=os.environ.get("QWEN_SERVE_NAME", os.environ["QWEN_MODEL"])); ap.add_argument("--tmax", default=os.environ.get("QWEN_TMAX", "auto"), help="the context (prompt + generated tokens): the K / V caches' length; `auto` (default): the largest up to 65536 whose (1 + users) caches fit QWEN_KV_GB (2.0) of NPU-visible memory (the 2B: 16384 at 4 users, 8192 at 8)")
   ap.add_argument("--pin-gb", type=float, default=float(os.environ.get("QWEN_PIN_GB", "12")))
   ap.add_argument("--dir", default=os.environ["QWEN_DIR"]); ap.add_argument("--cache", default=os.environ["QWEN_NPU"]); a = ap.parse_args()
-  assert a.tmax <= 512, "--tmax: the batched attention kernel holds a row's scores in LSRAM (512 positions)"
-  eng = BatchEngine(a); srv = S.ThreadingHTTPServer((a.host, a.port), S.make_handler(eng, a.model_name))
+  auto = a.tmax == "auto" or os.environ.get("QWEN_TMAX_AUTO") == "1"
+  a.tmax, kv_gb = S.auto_tmax(a.users, float(os.environ.get("QWEN_KV_GB", "2.0")), R.NL // 4, R.NKV, R.HD) if a.tmax == "auto" else (int(a.tmax), (1 + a.users) * (R.NL // 4) * 2 * R.NKV * R.HD * 4 * int(a.tmax) / 1e9)
+  print(f"   context {a.tmax} tokens: K / V caches {kv_gb:.2f} GB of NPU-visible memory ({1 + a.users} x {R.NL // 4} attention layers; the NPU's window holds ~2.75 GB in all)", flush=True)
+  eng = S.engine_fit(BatchEngine, a, auto); srv = S.ThreadingHTTPServer((a.host, a.port), S.make_handler(eng, a.model_name))
   print(f"== serving {a.model_name} on http://{a.host}:{a.port}/v1 (OpenAI- / Ollama-compatible; greedy; {a.users} requests a step; context {a.tmax} tokens)", flush=True)
   threading.Thread(target=srv.serve_forever, daemon=True).start()
   try: eng.serve_jobs()

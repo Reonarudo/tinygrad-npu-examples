@@ -191,13 +191,39 @@ def make_handler(eng, name, chat_messages=chat_messages, details=OLLAMA_DETAILS)
                        "usage": {"prompt_tokens": len(ids), "completion_tokens": n, "total_tokens": len(ids) + n}})
   return H
 
-def main(default_name="qwen3.8-27b"):
+
+def auto_tmax(users, budget_gb, natt, nkv, hd, want=65536):
+  """The context: `want`, or the largest multiple of 1024 whose K / V caches ((1 + users) copies, natt layers, 2 x nkv x hd floats a
+  position) fit budget_gb -- the NPU addresses a 4 GiB window of which ~2.75 GB can hold buffers (the rest of the process's
+  buffers take ~0.3-0.5 GB)."""
+  per_pos = (1 + users) * natt * 2 * nkv * hd * 4; t = min(want, int(budget_gb * 1e9) // per_pos // 1024 * 1024)
+  return max(1024, t), per_pos * t / 1e9
+
+
+def engine_fit(cls, a, auto):
+  """cls(a); when the NPU-visible memory runs out under `auto` (the model's own buffers vary by size: the drafter, the head parts,
+  the window slots), the process restarts itself with the context shortened by a quarter (QWEN_TMAX; down to 4096) -- a fresh
+  process, since a half-built model leaves buffers behind."""
+  import sys
+  try: return cls(a)
+  except MemoryError as e:
+    if not auto or a.tmax <= 4096: raise
+    t = max(4096, a.tmax * 3 // 4 // 1024 * 1024); print(f"   NPU memory ran out ({str(e)[:60]}): restarting with a context of {t} tokens", flush=True)
+    argv = [v for i, v in enumerate(sys.argv) if v != "--tmax" and not (i and sys.argv[i - 1] == "--tmax")]
+    os.environ["QWEN_TMAX"] = str(t); os.environ["QWEN_TMAX_AUTO"] = "1"; os.execv(sys.executable, [sys.executable] + argv)
+
+
+def main(default_name="qwen3.8-27b", default_tmax=2048):
   ap = argparse.ArgumentParser(); ap.add_argument("--host", default="127.0.0.1"); ap.add_argument("--port", type=int, default=8000)
   ap.add_argument("--model-name", default=os.environ.get("QWEN_SERVE_NAME", default_name))
-  ap.add_argument("--tmax", type=int, default=2048, help="the context: prompt + generated tokens (the K / V caches' length)")
+  ap.add_argument("--tmax", default=os.environ.get("QWEN_TMAX", str(default_tmax)), help="the context: prompt + generated tokens (the K / V caches' length); `auto`: the largest up to 65536 whose caches fit QWEN_KV_GB (2.0) of NPU-visible memory")
   ap.add_argument("--pin-gb", type=float, default=float(os.environ.get("QWEN_PIN_GB", "24")))
   ap.add_argument("--dir", default=os.environ.get("QWEN_DIR", "/mnt/ssd/qwen3.8-27b-fp8")); ap.add_argument("--cache", default=os.environ.get("QWEN_NPU", "/mnt/ssd/qwen3.8-27b-npu-s1"))
-  a = ap.parse_args(); eng = Engine(a)
+  a = ap.parse_args()
+  import qwen38_ref as R_
+  auto = a.tmax == "auto" or os.environ.get("QWEN_TMAX_AUTO") == "1"
+  a.tmax, gb = auto_tmax(0, float(os.environ.get("QWEN_KV_GB", "2.0")), R_.NL // 4, R_.NKV, R_.HD) if a.tmax == "auto" else (int(a.tmax), (R_.NL // 4) * 2 * R_.NKV * R_.HD * 4 * int(a.tmax) / 1e9)
+  print(f"   context {a.tmax} tokens: K / V caches {gb:.2f} GB of NPU-visible memory", flush=True); eng = engine_fit(Engine, a, auto)
   srv = ThreadingHTTPServer((a.host, a.port), make_handler(eng, a.model_name))
   print(f"== serving {a.model_name} on http://{a.host}:{a.port}/v1 (OpenAI-compatible; greedy; context {a.tmax} tokens)", flush=True)
   threading.Thread(target=srv.serve_forever, daemon=True).start()

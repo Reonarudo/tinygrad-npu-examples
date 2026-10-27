@@ -462,21 +462,53 @@ Board o6n, 2026-10-27, a 22-token prompt and a 23-token answer: the 9B in 3.1 s 
 
 `bonsai2_batch_serve.py` is the same endpoint with concurrent requests **batched into one decode step** (the loop of `bonsai2_batch.py`
 behind a slot scheduler): up to `--users` requests advance together, each in a slot with its own DeltaNet states, conv ring, K / V cache
-and position; a new request takes a free slot (its state zeroed), its prompt goes in a token a step, then it decodes plain greedy and
-streams. The step costs the geometry's whatever the number of busy slots (the 2B: ~50 ms at 4 slots, ~75 at 8), so one user sees one
-token a step and N users N. Context 512 (the batched attention kernel's scores live in LSRAM). Board o6n, the 2B, `batch_load.sh PORT N MAX_TOKENS` (N `curl`s in parallel, the aggregate tok/s printed),
-wall time including each request's prompt steps:
+and position; a new request takes a free slot (its state zeroed) and decodes plain greedy, streaming. A short prompt (under 48 tokens)
+goes in a token a step in its slot; a longer one goes through the model's chunked prefill (4 tokens a pass, one prompt at a time, a
+pass between two steps while the others decode) and its states and cache rows are copied into the slot when it is in. The step costs
+the geometry's whatever the number of busy slots (the 2B: ~50 ms at 4 slots, ~75 at 8), so one user sees one token a step and N users
+N. Board o6n, the 2B, `batch_load.sh PORT N MAX_TOKENS` (N `curl`s in parallel, the aggregate tok/s printed), wall time including each
+request's prompt:
 
 | slots | requests | completion tokens | wall | aggregate (prefill included) | decode alone |
 | ---: | ---: | ---: | ---: | ---: | ---: |
 | 4 | 1 | 22 | 2.2 s | 10 tok/s | 20 tok/s a step |
 | 4 | 4 | 166 | 3.6 s | **46.5 tok/s** | 60-84 tok/s |
 | 4 | 6 (two wait) | 181 | 5.2 s | 34.8 tok/s | |
+| 4 | 8 (four wait) | 288 | 6.7 s | 43.3 tok/s | |
 | 8 | 8 | 346 | 6.3-6.8 s | **51-55 tok/s** | 94-112 tok/s |
 | 8 | 1 | 22 | 3.1 s | 7.1 tok/s | 12 tok/s a step |
 
 So: `bonsai2_serve.py` for one user at a time (speculative, ~30 tok/s on the 2B), `bonsai2_batch_serve.py --users 4` when several agents
 or users share the board (each at 15-20 tok/s while 4 run, ~60 in all). The two are separate processes; the NPU time-slices them.
+
+### Long contexts
+
+The attention kernels used to hold a row's scores in LSRAM (32 KiB a task): 512 positions for the batched one-token kernel, about 4k
+for the sliced verify-pass kernel (its slices multiply until the combiner's records overflow). Both now stream the positions in
+**chunks with an online softmax** -- the chunk's scores in LSRAM, a running max and sum per head, the partial output rescaled by
+exp(m_old - m_new) when the max grows -- so the kernels take any context (`attn_plan`: the exact path up to 16 slices, then 12 slices
+in chunks of 168; the one-row kernel chunks of 256 past 512). Simulator gate: the chunked kernels against float64 (rel. error 1-2e-5),
+the batched kernel bit for bit against the one-row kernel. The 2B answers this correctly at a 64k context, a 6283-token prompt
+("how many days are logged above?" over 120 repeated paragraphs: 120), prefilled in 69 s (batched server, 90 tok/s) to 87 s (the
+speculative server, 72 tok/s): the prefill is 4 tokens a pass, so long prompts take minutes.
+
+**What bounds the context now is the NPU's address window, not the kernels.** Every device pointer is a 32-bit offset in a 4 GiB
+window, and about 2.75 GB of it can hold buffers (the window slots the weights stream through share it). The K / V caches are fp32:
+24 KiB a position on the 2B (6 attention layers x 4 KiB), 64 KiB on the 4B / 9B. `--tmax auto` (the servers' default) takes the
+largest context up to 65536 whose caches fit 2 GB (`QWEN_KV_GB`), and restarts with a quarter less if the model's other buffers leave
+less room:
+
+| server | 2B | 9B (the 4B: the same cache shape) |
+| --- | ---: | ---: |
+| `bonsai2_serve.py` (one cache) | 65536 | 21504 (29696 asked for, restarted once) |
+| `bonsai2_batch_serve.py --users 4` (5 caches) | 15360 | ~5k |
+| `bonsai2_batch_serve.py --users 8` (9 caches) | 8192 | ~3k |
+
+The 9B at 21504: a 3142-token prompt (60 paragraphs) answered correctly ("exactly 60 days") in 127 s wall, 25 tok/s of prefill.
+
+Lifting that needs the caches in host memory, mapped into the window a layer at a time the way the weights are: a probe shows the
+NPU writes through a window slot into host memory (a kernel's stores visible on the host side), so that is the next step rather than
+a dead end. The 27B keeps its 2048 default (its one-pass prefill's part kernels are the exact path's).
 
 ## How it works
 
