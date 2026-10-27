@@ -65,10 +65,10 @@ class Batch:
     rep = lambda t, n: dev(np.tile(OA.host_invalidate(t).numpy().reshape(n, -1), (N, 1)).reshape(-1))        # a stack replicated per user
     self.Wab, self.Adt, self.Cwt, self.Nw = rep(M.Wab, NG), rep(M.Adt, NG), rep(M.Cwt, NG), rep(M.Nw, NG); self.QN, self.KN = rep(M.QN, NA), rep(M.KN, NA)
     self.Sall = Tensor.zeros(N * NG * R.NV * R.DK * R.DV, device=DEV).contiguous().realize(); self.Call = Tensor.zeros(N * NG * R.CONV * self.CP, device=DEV).contiguous().realize()
-    self.kvs = M.kvs                                                       # KV slots (QWEN_KV_SLOTS=1, QWEN_KV_USERS >= N): the users' caches are the model's, in host memory behind two window slots
+    self.kvs = M.kvs                                                       # the caches in ASIDs 1-3 (QWEN_KV_ASID=1, QWEN_KV_USERS >= N): the users' caches are the model's
     if self.kvs: assert self.kvs.users >= N and self.kvs.tmax == tmax, (self.kvs.users, self.kvs.tmax, N, tmax); self.Kall = self.Vall = None
     else: ksz = (N * NA * tmax + QK.ATT_BT) * R.NKV * R.HD; self.Kall, self.Vall = (Tensor.zeros(ksz, device=DEV).contiguous().realize() for _ in range(2))
-    self.ci = (lambda u, i: u) if self.kvs else (lambda u, i: u * NA + i)   # a user's cache index at attention layer i
+    self.ci = (lambda u, i: self.kvs.cidx(i, u)) if self.kvs else (lambda u, i: u * NA + i)   # a user's cache index at attention layer i
     self.sidx = [[dev(np.array([u * NG + i], np.int32)) for i in range(NG)] for u in range(N)]; self.aix = [[dev(np.array([i, 0, self.ci(u, i)], np.int32)) for i in range(NA)] for u in range(N)]
     self.posb = [dev(np.array([0], np.int32)) for u in range(N)]; self.aix0 = [dev(np.array([i, 0], np.int32)) for i in range(NA)]
     self.K1 = [QK.Kernels(2, 24, R.EPS, real=1) for _ in range(N)]          # the users' one-row kernel sets (their own row-0 buffers)
@@ -93,16 +93,16 @@ class Batch:
     x1 = K.resid(X, L.lin_ct(a_o, slot, meta, "o"), H, "x1")
     return L.mlp(x1, slot, meta, (M.Wpost_g, si), f"xiov{1 - par}").realize()
 
-  def kv(self, cp): return self.kvs.kv(cp) if self.kvs else (self.Kall, self.Vall)
-  def att_b(self, par, cp, aix0, atab, *views):
-    """An attention layer on the N rows with the batched kernel: atab (int32 [N][2]: the users' [cache index, position]); cp: the cache
-    parity (KV slots: the slot the layer's caches are mapped in; the JIT is keyed by it)."""
-    M, L, K, N, H = self.M, self.L, self.L.K, self.N, R.H; X = self.X[par]; slot = dict(zip(M.ATT_LIN, views)); meta = self.meta_att; Kall, Vall = self.kv(cp)
+  def kv(self, kvb): return self.kvs.views[kvb - 1] if self.kvs else (self.Kall, self.Vall)
+  def att_b(self, par, kvb, aix0, atab, *views):
+    """An attention layer on the N rows with the batched kernel: atab (int32 [N][3]: the users' [layer, position, cache index]); kvb: the
+    cache's DMA base code (the layer's ASID, whose views the kernel gets; 0: the buffers). The JIT is keyed by it."""
+    M, L, K, N, H = self.M, self.L, self.L.K, self.N, R.H; X = self.X[par]; slot = dict(zip(M.ATT_LIN, views)); meta = self.meta_att; Kall, Vall = self.kv(kvb)
     a0 = K.hold("b_aix0", aix0); at = K.hold("b_atab", atab)
     a_h = K.rms_a(X, (M.Win_a, a0), H, "a_h"); ct = L.lin_cts(a_h, slot, meta, ("q", "kv")); QR, KR = R.NH * 2 * R.HD, 2 * R.NKV * R.HD
     q_rows = K.unpack(ct["q"][0], QR, "q_rows", goff=ct["q"][1]); kv_rows = K.unpack(ct["kv"][0], KR, "kv_rows", goff=ct["kv"][1])
     O = K.rows_buf("o_gather", max(R.NV * R.DV, R.NH * R.HD))
-    K.call(f"attn_decb|{N}|{self.TMAX}|nidx", AB.attn_decb_src(R.NH, R.NKV, R.HD, self.TMAX, R.ROT, R.EPS, N, nidx=True), O, q_rows, kv_rows, self.QN, self.KN, M.ROPE, Kall, Vall, at, K.desc("attn_dec3_desc", lambda: __import__("attn_gqa").attn_dec3_desc(R.NH, R.NKV, R.HD)))
+    K.call(f"attn_decb|{N}|{self.TMAX}|nidx|{kvb}", AB.attn_decb_src(R.NH, R.NKV, R.HD, self.TMAX, R.ROT, R.EPS, N, nidx=True, kvb=kvb), O, q_rows, kv_rows, self.QN, self.KN, M.ROPE, Kall, Vall, at, K.desc("attn_dec3_desc", lambda: __import__("attn_gqa").attn_dec3_desc(R.NH, R.NKV, R.HD)))
     a_o = K.rms_a(O, None, R.NH * R.HD, "a_o", norm=False)
     x1 = K.resid(X, L.lin_ct(a_o, slot, meta, "o"), H, "x1")
     return L.mlp(x1, slot, meta, (M.Wpost_a, a0), f"xiov{1 - par}").realize()
@@ -128,7 +128,7 @@ class Batch:
     x1 = K.resid(X, L.lin_ct(a_o, slot, meta, "o"), H, "x1")
     return L.mlp(x1, slot, meta, (M.Wpost_g, si), f"xiov{1 - par}").realize()
 
-  def att(self, par, cp, aix0, uaix, *views):
+  def att(self, par, kvb, aix0, uaix, *views):
     """An attention layer on the N rows: aix0 (int32 [2]: [the layer's attention index, 0]), uaix [N] ([user x NATT + index, the user's
     position]: the user's cache and norm stacks), the linears' views (M.ATT_LIN's order)."""
     M, L, K, N, H = self.M, self.L, self.L.K, self.N, R.H; X = self.X[par]; slot = dict(zip(M.ATT_LIN, views)); meta = self.meta_att
@@ -138,18 +138,18 @@ class Batch:
     q_rows = K.unpack(ct["q"][0], QR, "q_rows", goff=ct["q"][1]); kv_rows = K.unpack(ct["kv"][0], KR, "kv_rows", goff=ct["kv"][1])
     q1 = [k.rows_buf("q_rows", QR) for k in self.K1]; kv1 = [k.rows_buf("kv_rows", KR) for k in self.K1]
     K.call(f"rows_scatter|{QR}|{N}", rows_scatter_src(QR, N), q1[0], *q1[1:], q_rows); K.call(f"rows_scatter|{KR}|{N}", rows_scatter_src(KR, N), kv1[0], *kv1[1:], kv_rows)
-    outs = [self.K1[u].attn_dec2(q1[u], kv1[u], self.QN, self.KN, M.ROPE, *self.kv(cp), ua[u], R.NH, R.NKV, R.HD, self.TMAX, R.ROT, nidx=True) for u in range(N)]
+    outs = [self.K1[u].attn_dec2(q1[u], kv1[u], self.QN, self.KN, M.ROPE, *self.kv(kvb), ua[u], R.NH, R.NKV, R.HD, self.TMAX, R.ROT, nidx=True, kvb=kvb) for u in range(N)]
     K.call(f"rows_gather|{R.NH * R.HD}|{N}", rows_gather_src(R.NH * R.HD, N), self.O, *[self.K1[u].bufs["o_rows"] for u in range(N)])
     a_o = K.rms_a(self.O, None, R.NH * R.HD, "a_o", norm=False)
     x1 = K.resid(X, L.lin_ct(a_o, slot, meta, "o"), H, "x1")
     return L.mlp(x1, slot, meta, (M.Wpost_a, a0), f"xiov{1 - par}").realize()
 
-  def blk(self, types, bp, ptab, *args):
+  def blk(self, types, kvb, ptab, *args):
     """BLK consecutive layers as one graph: the users' positions once (ptab), then the layers' index buffers and views concatenated
     (gdn: sidx, gtab + M.GDN_LIN views; att: aix0, atab + M.ATT_LIN views), each layer on parity j % 2 (blocks start at even layers)."""
     M = self.M; a = list(args); out = None
     for j, t in enumerate(types):
-      if t == "full": n = 2 + len(M.ATT_LIN); out = self.att_b(j % 2, bp, *a[:n]); a = a[n:]
+      if t == "full": n = 2 + len(M.ATT_LIN); out = self.att_b(j % 2, kvb, *a[:n]); a = a[n:]
       else: n = 2 + len(M.GDN_LIN); out = self.gdn_b(j % 2, a[0], a[1], ptab, *a[2:n]); a = a[n:]
     return out
 
@@ -168,13 +168,13 @@ class Batch:
       if prof: from tinygrad import Device; Device[DEV].synchronize(); tp.append(time.perf_counter())
       L.block_slots(BLK)
       for b in range(R.NL // BLK):
-        bp = b % 2; types = tuple(R.LAYER_TYPES[b * BLK + j] for j in range(BLK)); args = []
+        bp = b % 2; types = tuple(R.LAYER_TYPES[b * BLK + j] for j in range(BLK)); args = []; kvb = 0
         for j in range(BLK):
-          l = b * BLK + j; views, meta = L.map_block(l, bp, j); M._kvmap(l, bp)
-          if types[j] == "full": i = M.aidx[l]; self.meta_att = meta; args += [self.aix0[i], self.atab[i], *[views[k] for k in M.ATT_LIN]]
+          l = b * BLK + j; views, meta = L.map_block(l, bp, j)
+          if types[j] == "full": i = M.aidx[l]; self.meta_att = meta; kvb = M._kvb(i); args += [self.aix0[i], self.atab[i], *[views[k] for k in M.ATT_LIN]]
           else: i = M.gidx[l]; self.meta_gdn = meta; args += [M.sidx[i], self.gtab[i], *[views[k] for k in M.GDN_LIN]]
-        key = ("blk", bp, types, tuple(L.kind(b * BLK + j) for j in range(BLK)))
-        if key not in self.jits: self.jits[key] = TinyJit(functools.partial(self.blk, types, bp))
+        key = ("blk", bp, types, tuple(L.kind(b * BLK + j) for j in range(BLK)), kvb)
+        if key not in self.jits: self.jits[key] = TinyJit(functools.partial(self.blk, types, kvb))
         jit = self.jits[key]
         if jit.cnt < 2:
           with one_job(): jit(self.ptab, *args)
@@ -189,17 +189,17 @@ class Batch:
         Device[DEV].synchronize(); tp.append(time.perf_counter()); d = np.diff(tp) * 1e3
         print(f"      prof: host (embed + pokes) {d[0]:.1f} ms | blocks {' '.join(f'{v:.1f}' for v in d[1:-1])} ms | head {d[-1]:.1f} ms | total {(tp[-1] - tp[0]) * 1e3:.1f}", flush=True)
       return [int(v) for v in ids[:N]]
-    L.prefetch(0); M._kvmap(0)
+    L.prefetch(0)
     for l in range(R.NL):
-      if l + 1 < R.NL: L.prefetch(l + 1); M._kvmap(l + 1)
+      if l + 1 < R.NL: L.prefetch(l + 1)
       slot, meta, sm = L.load(l); par = l % 2; kind = L.kind(l)
       if R.LAYER_TYPES[l] == "full":
-        i = M.aidx[l]; self.meta_att = meta; cp = self.kvs.cp(i) if self.kvs else 0
+        i = M.aidx[l]; self.meta_att = meta; kvb = M._kvb(i)
         if BATCHK:
-          if (key := ("attb", par, kind, cp)) not in self.jits: self.jits[key] = TinyJit(functools.partial(self.att_b, par, cp))
+          if (key := ("attb", par, kind, kvb)) not in self.jits: self.jits[key] = TinyJit(functools.partial(self.att_b, par, kvb))
           self.jits[key](self.aix0[i], self.atab[i], *[slot[k] for k in M.ATT_LIN])
         else:
-          if (key := ("att", par, kind, cp)) not in self.jits: self.jits[key] = TinyJit(functools.partial(self.att, par, cp))
+          if (key := ("att", par, kind, kvb)) not in self.jits: self.jits[key] = TinyJit(functools.partial(self.att, par, kvb))
           self.jits[key](self.aix0[i], [self.aix[u][i] for u in range(N)], *[slot[k] for k in M.ATT_LIN])
       else:
         i = M.gidx[l]; self.meta_gdn = meta
@@ -216,7 +216,7 @@ class Batch:
 def main():
   ap = argparse.ArgumentParser(); ap.add_argument("--users", type=int, default=4); ap.add_argument("--max-new", type=int, default=32); ap.add_argument("--tmax", type=int, default=512)
   ap.add_argument("--check", default=None, help="a bonsai2_generate --out npz: user 0's ids must equal its out_ids"); ap.add_argument("--pin-gb", type=float, default=12); a = ap.parse_args()
-  os.environ.setdefault("QWEN_KV_USERS", str(a.users))                     # KV slots: the model's caches hold every user
+  os.environ.setdefault("QWEN_KV_USERS", str(a.users))                     # the caches in ASIDs: the model's hold every user
   from qwen38_tokenize import Tok, chat_text
   cache, dir_ = os.environ["QWEN_NPU"], os.environ["QWEN_DIR"]; tok = Tok(os.environ.get("QWEN_TOK", cache))
   prompts = ["The capital of France is", "Write a Python function that returns the n-th Fibonacci number.", "Explain in two sentences why the sky is blue.", "List three uses of copper.",

@@ -134,39 +134,51 @@ def attend(L, x, q, gate, K_, V_, mask, slot, meta, sm):
   x = L.K.resid(x, L.lin_ct(a_o, slot, meta, "o"), R.H, "x1")
   return L.mlp(x, slot, meta, sm["post_attention_layernorm_weight"])
 
-class KVSlots:
-  """The K / V caches in host memory, mapped into the NPU's address window a layer at a time (QWEN_KV_SLOTS=1): the window is
-  4 GiB (every device pointer a u32 offset) and ~2.75 GB of it holds buffers and slots, so fp32 caches of several users or of long
-  contexts do not fit as buffers. Attention layer i's cache is a weight buffer (the KMD's: host memory the NPU reads AND writes
-  through a slot) holding [K | V], each (users x tmax + ATT_BT) rows of NKV HD floats, user u at rows u tmax (the kernels' idx[0]
-  is the user); two window slots alternate by attention index (slot i % 2 is re-pointed at layer i while layer i - 1 runs: its
-  previous reader, i - 2, has run), the MTP drafter's cache has a slot of its own, mapped once. Views: Tensor.from_blob at the
-  slots' addresses, fixed per parity (the JIT sees the same buffers)."""
-  def __init__(self, raw, natt, users, tmax, rowf, mtp=False):
-    self.raw, self.natt, self.users, self.tmax, self.rowf = raw, natt, users, tmax, rowf
-    self.KB = (users * tmax + ATT_BT) * rowf * 4; self.S = -(-(2 * self.KB) // (2 << 20)) * (2 << 20)       # K, then V; whole 2 MiB chunks
-    t0 = time.perf_counter(); self.wbufs = []
-    try:
-      for i in range(natt): self.wbufs.append(raw.wbuf_alloc(self.S))
-      self.slots = [raw.slot_alloc(self.S) for _ in range(2)]
-      self.mslot = raw.slot_alloc(-(-(2 * (tmax + ATT_BT) * rowf * 4) // (2 << 20)) * (2 << 20)) if mtp else None
-      self.mwbuf = raw.wbuf_alloc(-(-(2 * (tmax + ATT_BT) * rowf * 4) // (2 << 20)) * (2 << 20)) if mtp else None
-    except OSError as e: raise MemoryError(f"KV slots: {natt} caches of {self.S / 1e9:.2f} GB (host) + 2 window slots: {e}") from e
-    view = lambda pa, kb: (Tensor.from_blob(pa, (kb // 4,), dtype=dtypes.float32, device=DEV), Tensor.from_blob(pa + kb, (kb // 4,), dtype=dtypes.float32, device=DEV))
-    self.views = [view(sid_pa[1], self.KB) for sid_pa in self.slots]; self.mapped = [None, None]
-    if mtp: raw.slot_map(self.mslot[0], self.mwbuf[0], 0, self.mslot_size()); self.mviews = view(self.mslot[1], (tmax + ATT_BT) * rowf * 4)
-    print(f"   KV slots: {natt} caches of {self.S / 1e9:.2f} GB in host memory ({natt * self.S / 1e9:.1f} GB; {users} user(s) x {tmax} positions), "
-          f"two window slots{' + the drafter' + chr(39) + 's' if mtp else ''} ({(2 + bool(mtp)) * self.S / 1e9:.1f} GB of the window) in {time.perf_counter() - t0:.1f} s", flush=True)
-  def mslot_size(self): return -(-(2 * (self.tmax + ATT_BT) * self.rowf * 4) // (2 << 20)) * (2 << 20)
-  def cp(self, i): return i % 2
-  def map(self, i, cp=None):
-    """Attention layer i's cache into slot cp (default i % 2), without waiting for a job in flight (its last reader has run)."""
-    cp = self.cp(i) if cp is None else cp
-    if self.mapped[cp] != i: slot_map_nodrain(self.raw, self.slots[cp][0], self.wbufs[i][0], 0, self.S); self.mapped[cp] = i
-  def kv(self, cp): return self.views[cp]
-  def host(self, i):
-    """Layer i's cache as a host array [2][users tmax + ATT_BT][rowf] (K, V) over the weight buffer's mapping (the NPU's writes land here)."""
-    return np.frombuffer(self.wbufs[i][1], np.float32, count=2 * self.KB // 4).reshape(2, -1, self.rowf)
+class KVAsid:
+  """The K / V caches outside the NPU's ASID0 window (QWEN_KV_ASID=1): the part has four 3 GiB address spaces, and a DMA whose base
+  code is kGlobal1..3 reads and writes the matching one (its 32-bit address the offset there; every attention kernel moves the cache
+  by DMA alone). The attention layers go round ASIDs 1, 2, 3 (layer i in 1 + i % 3); one buffer per ASID holds its layers' [K | V]:
+  region (layer slot jl = i // 3, user u) = jl users + u, tmax rows of NKV HD floats each (+ ATT_BT rows of margin), the Ks first and
+  the Vs after them; the MTP drafter's cache is one more region at the end of ASID 1's. The kernels take the ASID's K / V views
+  (Tensor.from_blob at the buffer's address: the low 32 bits are what the kernel sees) and the base code; idx[2] is the region.
+  The chain head must carry the ASID bases (ZHOUYI_ASID_BASES=0x100000000,0x200000000,0x300000000: the KMD's layout)."""
+  @staticmethod
+  def available(raw):
+    """How many of ASIDs 1..3 the KMD will allocate in right now (a 1 MiB request each, freed). The stock allocator searches downward
+    from its last 64-bit insertion, device-wide, so once anything sits in ASID 1 the higher ASIDs come back ENOMEM until the driver
+    is reloaded -- usually 1 (ASID 1 alone, 3 GiB); the driver fix (an IOVA domain per ASID) makes it 3."""
+    n = 0
+    for a in (3, 2, 1):
+      try: b = raw.req_buf(1 << 20, asid=a); raw.free_buf(b); n += 1
+      except OSError: pass
+    return n if n == 3 else (1 if n else 0)
+  def __init__(self, raw, natt, users, tmax, rowf, mtp=False, nasid=None):
+    assert os.environ.get("ZHOUYI_ASID_BASES"), "QWEN_KV_ASID: ZHOUYI_ASID_BASES must name the ASID 1..3 bases before the device is opened"
+    self.raw, self.natt, self.users, self.tmax, self.rowf, self.mtp = raw, natt, users, tmax, rowf, mtp
+    self.na = KVAsid.available(raw) if nasid is None else nasid; assert self.na, "QWEN_KV_ASID: no ASID beyond 0 allocates"
+    self.nl = [len([i for i in range(natt) if i % self.na == a]) for a in range(3)]        # layers in ASID 1 + a
+    self.regions = [self.nl[a] * users + (1 if mtp and a == 0 else 0) for a in range(3)]   # tmax-row regions a buffer holds
+    self.KB = [(r * tmax + ATT_BT) * rowf * 4 for r in self.regions]; t0 = time.perf_counter(); self.bufs, self.views = [None] * 3, [None] * 3
+    # ASID 3 first, then 2, then 1: the KMD's IOVA allocator searches downward from its cached 64-bit node (device-wide), so a
+    # request in a higher ASID made after a lower one's lands in the lower range and is refused ("IOVA ... outside ASID n range")
+    for a in (2, 1, 0):
+      if not self.regions[a]: continue
+      if self.KB[a] * 2 > 3 * 2**30 - (16 << 20): raise MemoryError(f"KV ASID {1 + a}: {2 * self.KB[a] / 1e9:.2f} GB of caches do not fit its 3 GiB window")
+      try: b = raw.req_buf(2 * self.KB[a], asid=1 + a)
+      except OSError as e: raise MemoryError(f"KV ASID {1 + a}: {2 * self.KB[a] / 1e9:.2f} GB: {e}") from e
+      self.bufs[a] = b
+      self.views[a] = (Tensor.from_blob(b.pa, (self.KB[a] // 4,), dtype=dtypes.float32, device=DEV), Tensor.from_blob(b.pa + self.KB[a], (self.KB[a] // 4,), dtype=dtypes.float32, device=DEV))
+    print(f"   KV in ASID{'s 1-3' if self.na == 3 else ' 1'}: {natt} layers x {users} user(s) x {tmax} positions{' + the drafter' if mtp else ''}: "
+          f"{' / '.join(f'{2 * kb / 1e9:.2f}' for kb in self.KB[:self.na])} GB (3 GiB each), none of the ASID0 window, in {time.perf_counter() - t0:.1f} s", flush=True)
+  def base(self, i): return 1 + (i % self.na if i < self.natt else 0)       # the DMA base code of attention layer i (the MTP's: 1)
+  def kv(self, i): return self.views[(i % self.na) if i < self.natt else 0]  # (K view, V view) of layer i's ASID (the MTP's: ASID 1)
+  def cidx(self, i, u):
+    """idx[2] of attention layer i for user u: its region in the ASID's buffer (the MTP, i == natt: the last region of ASID 1)."""
+    return self.nl[0] * self.users if i >= self.natt else (i // self.na) * self.users + u
+  def host(self, i, u=0):
+    """Layer i's cache rows of user u as host arrays (K, V) [tmax + ATT_BT][rowf] (the device's writes made visible first)."""
+    import ctypes; a = i % self.na; b = self.bufs[a]; self.raw.cache_invalidate(b); r = self.cidx(i, u) * self.tmax * self.rowf * 4; n = (self.tmax + ATT_BT) * self.rowf * 4
+    return tuple(np.frombuffer(ctypes.string_at(b.va + off + r, n), np.float32).reshape(-1, self.rowf) for off in (0, self.KB[a]))
 
 
 class Model:
@@ -228,11 +240,11 @@ class Model:
     self.mtp_src = self.mtpg[1] if self.mtpg else self.dec                                    # whose _meta(MTPL) is the MTP layer's
     # (+ ATT_BT rows: attn_part's last DMA block of the last layer may run past its final row)
     K = self.dec.K; self.kv_user = 0                                                       # KV slots: the user whose cache this model's passes use
-    if os.environ.get("QWEN_KV_SLOTS", "0") == "1":
+    if os.environ.get("QWEN_KV_ASID", "0") == "1":
       from tinygrad import Device
-      assert not self.tree, "QWEN_KV_SLOTS: the chain verify only (the leaf tree's commit moves K / V rows across every layer's cache, one slot at a time here)"
-      self.kvs = KVSlots(Device[DEV].raw, self.NATT, int(os.environ.get("QWEN_KV_USERS", "1")), tmax, R.NKV * R.HD, mtp=bool(self.MTPL))
-      self.Kall, self.Vall = self.kvs.views[0]                                             # (ring_commit's arguments: unread with the chain's -1 move)
+      assert not self.tree, "QWEN_KV_ASID: the chain verify only (the leaf tree's commit moves K / V rows in every layer's cache through ASID0 pointers)"
+      self.kvs = KVAsid(Device[DEV].raw, self.NATT, int(os.environ.get("QWEN_KV_USERS", "1")), tmax, R.NKV * R.HD, mtp=bool(self.MTPL))
+      self.Kall, self.Vall = self.kvs.kv(0)                                                # (ring_commit's arguments: unread with the chain's -1 move)
     else:
       self.kvs = None; ksz = (natt * tmax + ATT_BT) * R.NKV * R.HD
       self.Kall = K.buf("K_all", ksz, dtypes.float32); self.Vall = K.buf("V_all", ksz, dtypes.float32)
@@ -282,18 +294,17 @@ class Model:
     if self.M: self._spec_init(self.M)
 
   def _aixL(self, i):
-    """idx[0] of attention layer i's kernels: its index into the cache stacks, or with KV slots the user (0 for the MTP's own slot)."""
-    return (0 if i == self.NATT else self.kv_user) if self.kvs else i
+    """The cache index of attention layer i's kernels: its index into the cache stacks, or with the caches in ASIDs its region (kv_user's)."""
+    return self.kvs.cidx(i, self.kv_user) if self.kvs else i
   def _aixw(self, i, pos):
-    """The index words of attention layer i at `pos`: [the layer (the stacked norms' row), pos, the cache index (KV slots: the user)]."""
+    """The index words of attention layer i at `pos`: [the layer (the stacked norms' row), pos, the cache index (in ASIDs: the region)]."""
     return np.array([i, pos, self._aixL(i)], np.int32)
   def _kv(self, i):
-    """(K, V) of attention layer i: the stacks, or with KV slots the parity's slot views (the MTP: its slot's)."""
-    if not self.kvs: return self.Kall, self.Vall
-    return self.kvs.mviews if i == self.NATT else self.kvs.kv(self.kvs.cp(i))
-  def _kvmap(self, l, cp=None):
-    """Before layer l runs (KV slots): its cache mapped into its slot (an attention layer; no-op otherwise)."""
-    if self.kvs and R.LAYER_TYPES[l] == "full": self.kvs.map(self.aidx[l], cp)
+    """(K, V) of attention layer i: the stacks, or with the caches in ASIDs the layer's ASID views."""
+    return self.kvs.kv(i) if self.kvs else (self.Kall, self.Vall)
+  def _kvb(self, i):
+    """The DMA base code of attention layer i's cache (0: ASID0, the stacks)."""
+    return self.kvs.base(i) if self.kvs else 0
 
   # ---- speculative decoding: the verify pass (M consecutive tokens through the 64 layers, one streaming of the weights)
   def _spec_init(self, M):
@@ -625,7 +636,7 @@ class Model:
     a_h = L.K.rms_a(u, (self.Win_a, ah), R.H, "a_h"); ct = L.lin_cts(a_h, slot, self.meta_mtp, ("q", "kv"))
     q_rows = L.K.unpack(ct["q"][0], R.NH * 2 * R.HD, "q_rows", goff=ct["q"][1])
     kv_rows = L.K.unpack(ct["kv"][0], 2 * R.NKV * R.HD, "kv_rows", goff=ct["kv"][1])
-    oc = L.K.attn_decm(q_rows, kv_rows, self.QN, self.KN, self.ROPE, *self._kv(self.NATT), ah, R.NH, R.NKV, R.HD, self.TMAX, R.ROT, nidx=bool(self.kvs))
+    oc = L.K.attn_decm(q_rows, kv_rows, self.QN, self.KN, self.ROPE, *self._kv(self.NATT), ah, R.NH, R.NKV, R.HD, self.TMAX, R.ROT, nidx=bool(self.kvs), kvb=self._kvb(self.NATT))
     x = L.K.resid(u, L.lin_ct(L.K.rms_a(oc, None, R.NH * R.HD, "a_o", norm=False), slot, self.meta_mtp, "o"), R.H, "x1")
     return L.mlp(x, slot, self.meta_mtp, (self.Wpost_a, ah), "mtp_out").realize()
   def mtp_pass(self, rows, pos):
@@ -717,22 +728,22 @@ class Model:
       if R.HAD: a_o = L.K.rms_a(a_o, None, R.NV * R.DV, "a_o", norm=False)   # o_proj's A from the fp32 rows (had_a32: whole 1024-blocks across heads)
     x = L.K.resid(x, L.lin_ct(a_o, slot, self.meta_gdn, "o"), R.H, "x1")
     return L.mlp(x, slot, self.meta_gdn, (self.Wpost_g, idh), f"xiov{1 - par}").realize()
-  def vblk_step(self, m, types, bp, *args):
+  def vblk_step(self, m, types, kvb, *args):
     """A block of layers (types: their LAYER_TYPES; the block starts at an even layer) as one JIT: per layer its index buffer (sidx /
     aix) then its linears' views, in order; layer j reads xbvs[m][j % 2] and writes the other, as the per-layer steps do."""
     i = 0; out = None
     for j, lt in enumerate(types):
       nl = len(self.ATT_LIN if lt == "full" else self.GDN_LIN)
-      out = self.vatt_step(m, j % 2, bp, *args[i:i + 1 + nl]) if lt == "full" else self.vgdn_step(m, j % 2, *args[i:i + 1 + nl]); i += 1 + nl
+      out = self.vatt_step(m, j % 2, kvb, *args[i:i + 1 + nl]) if lt == "full" else self.vgdn_step(m, j % 2, *args[i:i + 1 + nl]); i += 1 + nl
     return out
-  def vatt_step(self, m, par, cp, aix, *rest):
-    """cp: the cache parity (KV slots: which slot's views; else any). The JIT is keyed by it."""
-    L = self.vers[m]; Kall, Vall = self._kv(cp) if self.kvs else (self.Kall, self.Vall); slot = dict(zip(self.ATT_LIN, rest[:len(self.ATT_LIN)])); x = self.xbvs[m][par]; ah = L.K.hold("aix_held", aix)
+  def vatt_step(self, m, par, kvb, aix, *rest):
+    """kvb: the cache's DMA base code (the caches in ASIDs: the layer's ASID, whose views the kernel gets; 0: the stacks). The JIT is keyed by it."""
+    L = self.vers[m]; Kall, Vall = self.kvs.views[kvb - 1] if self.kvs else (self.Kall, self.Vall); slot = dict(zip(self.ATT_LIN, rest[:len(self.ATT_LIN)])); x = self.xbvs[m][par]; ah = L.K.hold("aix_held", aix)
     a_h = L.K.rms_a(x, (self.Win_a, ah), R.H, "a_h"); ct = L.lin_cts(a_h, slot, self.meta_att, ("q", "kv"))   # one GEMM when fused
     q_rows = L.K.unpack(ct["q"][0], R.NH * 2 * R.HD, "q_rows", goff=ct["q"][1])
     kv_rows = L.K.unpack(ct["kv"][0], 2 * R.NKV * R.HD, "kv_rows", goff=ct["kv"][1])
     if self.tree: oc = L.K.attn_tree(q_rows, kv_rows, self.QN, self.KN, self.ROPE, Kall, Vall, ah, self.treeb, R.NH, R.NKV, R.HD, self.TMAX, R.ROT)
-    else: oc = L.K.attn_decm(q_rows, kv_rows, self.QN, self.KN, self.ROPE, Kall, Vall, ah, R.NH, R.NKV, R.HD, self.TMAX, R.ROT, nidx=bool(self.kvs))
+    else: oc = L.K.attn_decm(q_rows, kv_rows, self.QN, self.KN, self.ROPE, Kall, Vall, ah, R.NH, R.NKV, R.HD, self.TMAX, R.ROT, nidx=bool(self.kvs), kvb=kvb)
     x = L.K.resid(x, L.lin_ct(L.K.rms_a(oc, None, R.NH * R.HD, "a_o", norm=False), slot, self.meta_att, "o"), R.H, "x1")
     return L.mlp(x, slot, self.meta_att, (self.Wpost_a, ah), f"xiov{1 - par}").realize()
   def _head_part(self, L, i, x, norm_w1, view, top3=False, hp=None, red=None, pick=None, x3=False):
@@ -857,15 +868,14 @@ class Model:
     if self.blk > 1: self._verify_blocks(M, L)
     else:
       zc = self.pre.zc; late = STREAM_LATE and bool(zc) and bool(zc.get("stream"))   # streamed layers: refill / prefetch after the next submit
-      L.prefetch(0); self._kvmap(0)
+      L.prefetch(0)
       if late: zc["late_refill"] = True
       for l in range(R.NL):
         if l + 1 < R.NL and not late: L.prefetch(l + 1)
-        if l + 1 < R.NL: self._kvmap(l + 1)
         slot, meta, sm = L.load(l); par = l % 2
         if R.LAYER_TYPES[l] == "full":
-          self.meta_att = meta; cp = self.kvs.cp(self.aidx[l]) if self.kvs else 0
-          if (kp := (M, par, L.kind(l), cp)) not in self.jit_vatt: self.jit_vatt[kp] = TinyJit(functools.partial(self.vatt_step, M, par, cp))
+          self.meta_att = meta; kvb = self._kvb(self.aidx[l])
+          if (kp := (M, par, L.kind(l), kvb)) not in self.jit_vatt: self.jit_vatt[kp] = TinyJit(functools.partial(self.vatt_step, M, par, kvb))
           self.jit_vatt[kp](self.aix[self.aidx[l]], *[slot[k] for k in self.ATT_LIN])
         else:
           self.meta_gdn = meta
@@ -881,12 +891,12 @@ class Model:
     b - 1 runs (the backend's async tail), then the block as one JIT call."""
     k = self.blk
     for b in range(R.NL // k):
-      bp = b % 2; types = tuple(R.LAYER_TYPES[b * k + j] for j in range(k)); args = []
+      bp = b % 2; types = tuple(R.LAYER_TYPES[b * k + j] for j in range(k)); args = []; kvb = 0
       for j in range(k):
-        l = b * k + j; views, meta = L.map_block(l, bp, j); self._kvmap(l, bp)
-        if types[j] == "full": self.meta_att = meta; args += [self.aix[self.aidx[l]], *[views[n] for n in self.ATT_LIN]]
+        l = b * k + j; views, meta = L.map_block(l, bp, j)
+        if types[j] == "full": self.meta_att = meta; kvb = self._kvb(self.aidx[l]); args += [self.aix[self.aidx[l]], *[views[n] for n in self.ATT_LIN]]
         else: self.meta_gdn = meta; args += [self.sidx[self.gidx[l]], *[views[n] for n in self.GDN_LIN]]
-      if (key := (M, bp, types)) not in self.jit_vblk: self.jit_vblk[key] = TinyJit(functools.partial(self.vblk_step, M, types, bp))
+      if (key := (M, bp, types, kvb)) not in self.jit_vblk: self.jit_vblk[key] = TinyJit(functools.partial(self.vblk_step, M, types, kvb))
       jit = self.jit_vblk[key]
       if jit.cnt < 2:                                                     # the capture: the whole block as one graph, one chain
         with one_job(): jit(*args)
@@ -1150,7 +1160,7 @@ class Model:
     y, _ = L.gdn_body(None, slot, self.meta_gdn, sm, (self.Sall, self.Call, idx, self.posb, self.Wab, self.Cwt, self.Nw, self.Adt, self.Win_g, self.Wpost_g), xin=self.xb[par], out=f"xio{1 - par}")
     return y.realize()
 
-  def att_step(self, par, cp, aix, cos, sin, *rest):
+  def att_step(self, par, kvb, aix, cos, sin, *rest):
     """Decode (layer parity `par`: reads xb[par], writes xb[1-par]): q / k / v of the one real row, the hand-written attention
     against the cache stack (the new k / v rows written at pos by the kernel), the gate, o_proj and the MLP."""
     L = self.dec; nl = len(self.ATT_LIN); slot = dict(zip(self.ATT_LIN, rest[:nl])); sm = dict(zip(self.ATT_SMALL, rest[nl:])); x = self.xb[par]
@@ -1158,7 +1168,7 @@ class Model:
     a_h = L.K.rms_a(x, (self.Win_a, ah), R.H, "a_h"); ct = L.lin_cts(a_h, slot, self.meta_att, ("q", "kv"))   # one GEMM when fused
     q_rows = L.K.unpack(ct["q"][0], R.NH * 2 * R.HD, "q_rows", goff=ct["q"][1])
     kv_rows = L.K.unpack(ct["kv"][0], 2 * R.NKV * R.HD, "kv_rows", goff=ct["kv"][1])
-    oc = L.K.attn_dec2(q_rows, kv_rows, self.QN, self.KN, self.ROPE, *self._kv(cp if self.kvs else 0), ah, R.NH, R.NKV, R.HD, self.TMAX, R.ROT, nidx=bool(self.kvs))
+    oc = L.K.attn_dec2(q_rows, kv_rows, self.QN, self.KN, self.ROPE, *(self.kvs.views[kvb - 1] if self.kvs else (self.Kall, self.Vall)), ah, R.NH, R.NKV, R.HD, self.TMAX, R.ROT, nidx=bool(self.kvs), kvb=kvb)
     x = L.K.resid(x, L.lin_ct(L.K.rms_a(oc, None, R.NH * R.HD, "a_o", norm=False), slot, self.meta_att, "o"), R.H, "x1")
     return L.mlp(x, slot, self.meta_att, (self.Wpost_a, ah), f"xio{1 - par}").realize()
 
@@ -1177,13 +1187,13 @@ class Model:
     if pos not in self.cos_dec: self.cos_dec[pos], self.sin_dec[pos] = rope_tables(pos, L.R)
     for i, t in enumerate(self.aix): poke(t, self._aixw(i, pos))
     self.posb.assign(Tensor([pos], device=DEV, dtype=dtypes.int32)).realize()
-    L.prefetch(0); self._kvmap(0)
+    L.prefetch(0)
     for l in range(R.NL):
-      if l + 1 < R.NL: L.prefetch(l + 1); self._kvmap(l + 1)
+      if l + 1 < R.NL: L.prefetch(l + 1)
       slot, meta, sm = L.load(l); par = l % 2
       if R.LAYER_TYPES[l] == "full":
-        self.meta_att = meta; cp = self.kvs.cp(self.aidx[l]) if self.kvs else 0
-        if (kp := (par, L.kind(l), cp)) not in self.jit_att: self.jit_att[kp] = TinyJit(functools.partial(self.att_step, par, cp))
+        self.meta_att = meta; kvb = self._kvb(self.aidx[l])
+        if (kp := (par, L.kind(l), kvb)) not in self.jit_att: self.jit_att[kp] = TinyJit(functools.partial(self.att_step, par, kvb))
         self.jit_att[kp](self.aix[self.aidx[l]], self.cos_dec[pos], self.sin_dec[pos], *[slot[k] for k in self.ATT_LIN], *[sm[k] for k in self.ATT_SMALL])
       else:
         self.meta_gdn = meta

@@ -8,9 +8,9 @@ from qwen38_kernels import NT
 import attn_gqa as AG
 
 
-def attn_decb_src(NH, NKV, HD, TMAX, ROT, eps, M, U=1, BT=2, nidx=False):
+def attn_decb_src(NH, NKV, HD, TMAX, ROT, eps, M, U=1, BT=2, nidx=False, kvb=0):
   """`nidx`: idx [M][3] -- a row's layer (its norm weights), position and cache index (KV slots)."""
-  src = AG.attn_dec3_src(NH, NKV, HD, TMAX, ROT, eps, U=U, BT=BT, nidx=nidx); W = 3 if nidx else 2; g = NH // NKV; QR, KR, OR = NH * 2 * HD, 2 * NKV * HD, NH * HD; NU = NKV * U
+  src = AG.attn_dec3_src(NH, NKV, HD, TMAX, ROT, eps, U=U, BT=BT, nidx=nidx, kvb=kvb); W = 3 if nidx else 2; g = NH // NKV; QR, KR, OR = NH * 2 * HD, 2 * NKV * HD, NH * HD; NU = NKV * U
   def rep(a, b, n=1):
     nonlocal src; assert src.count(a) == n, (a[:70], src.count(a)); src = src.replace(a, b)
   rep("__kernel void attn_dec2(", "__kernel void attn_decb(")

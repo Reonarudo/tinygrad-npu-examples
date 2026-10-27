@@ -492,29 +492,34 @@ the batched kernel bit for bit against the one-row kernel. The 2B answers this c
 ("how many days are logged above?" over 120 repeated paragraphs: 120), prefilled in 69 s (batched server, 90 tok/s) to 87 s (the
 speculative server, 72 tok/s): the prefill is 4 tokens a pass, so long prompts take minutes.
 
-**The NPU's address window, and the caches behind window slots.** Every device pointer is a 32-bit offset in a 4 GiB window, and
-about 2.75 GB of it can hold buffers and the slots the weights stream through. As fp32 buffers the K / V caches (24 KiB a position on
-the 2B, 64 KiB on the 4B / 9B) would have bounded the context at 64k for one user of the 2B, ~21k for the 9B, 15k for 4 batched users.
-So the caches now live in **host memory and are mapped into the window a layer at a time**, as the weights are (`QWEN_KV_SLOTS=1`, the
-default for the smaller sizes): each attention layer's [K | V] is a weight buffer of the KMD's, two window slots alternate by layer
-(slot i % 2 is re-pointed at layer i while layer i - 1 runs), the drafter's cache has a slot of its own, and the kernels address the
-slot with the user as their cache index. A probe showed the NPU reads and writes through a slot bit for bit (read after write, across
-remaps, every 2 MiB chunk of 64-512 MB mappings); the caches under slots equal the buffers' row for row, and the tokens are the same.
-What the window holds is then two slots of all users' caches of one layer, so `--tmax auto` (budget `QWEN_KV_GB`, 2.2 GB) reaches:
+**The NPU's address window, and the caches in the other ASIDs.** Every device pointer a kernel holds is a 32-bit offset in a 4 GiB
+window (ASID 0), and about 2.75 GB of it can hold buffers and the slots the weights stream through. As fp32 buffers there, the K / V
+caches (24 KiB a position on the 2B, 64 KiB on the 4B / 9B) would have bounded the context at 64k for one user of the 2B, ~21k for the
+9B, 15k for 4 batched users. But the part has **four** such address spaces, 3 GiB usable each, and the TEC's DMA instruction carries a
+base code (`kGlobal1..3`) that selects one: a transfer with that code reads or writes the matching ASID at the 32-bit address. Every
+attention kernel moves the cache by DMA alone, so the caches now live in **ASID 1** (`QWEN_KV_ASID=1`, the default for the smaller
+sizes): buffers requested in that ASID (the KMD's `REQ_BUF` takes the ASID; the chain head carries the four bases,
+`ZHOUYI_ASID_BASES`), the kernels' cache transfers with the base code, the layer's region as the kernels' cache index, and nothing of
+the ASID 0 window spent. Probes on the board: a kernel's DMA with base 1 reads the ASID 1 buffer bit for bit and its writes reach the
+host, the same address through base 0 reads something else; the caches in ASID 1 equal the buffers' row for row and the tokens are the
+same (2B at 512, 4096 and 65536). `--tmax auto` is then the largest context whose caches fit the ASID (`QWEN_TMAX_MAX`, 65536):
 
-| server | 2B | 4B / 9B |
+| server, caches in ASID 1 | 2B | 4B / 9B |
 | --- | ---: | ---: |
-| `bonsai2_serve.py` (speculative, one user) | 65536 | 65536 |
-| `bonsai2_batch_serve.py --users 4` | 59392 | 29696 |
-| `bonsai2_batch_serve.py --users 8` | 32768 | ~15k |
+| `bonsai2_serve.py` (speculative, one user) | 65536 | 43008 |
+| `bonsai2_batch_serve.py --users 4` | 31744 | 11264 |
 
-Board o6n, 2026-10-27, with the caches in slots: the 2B's speculative server answers the 6283-token prompt correctly in 86 s; the
-batched server (4 users, 59392 context) in 68 s, and its concurrent figures are the table's above (46.5 tok/s at 4 users); the 9B at
-65536 answers the 3142-token prompt ("exactly 60 days") in 127 s; the 4B at 65536 in 78 s, and its batched server (4 users, 29696 context) runs 4 concurrent requests at 23 tok/s aggregate and the same prompt in 69 s. As fp32 buffers the 4B / 9B cannot even start at 64k (a 4.3 GB cache; the control run fails to allocate). The host memory the caches take: attention layers x users x tmax x
-4 KiB (2B) / 8 KiB (9B): 1.6 GB for one user of the 2B at 64k, 5.9 GB for four, 4.3 GB for the 9B. One price: the speculative server
-runs the chain verify, not the leaf tree (its commit moves K / V rows in every layer's cache at once, which a slot-at-a-time view
-cannot do): about 4 % fewer tokens a pass. The 27B keeps its 2048 default and its buffers (its one-pass prefill's part kernels are
-the exact path's).
+Board o6n, 2026-10-27: the 2B's speculative server answers the 6283-token prompt correctly in 86 s, its batched server (4 users) in
+68 s with the usual 45-46 tok/s at 4 concurrent requests; the 9B (43008) and the 4B answer the 3142-token prompt ("60 days") in 127 s
+and 78 s; the 9B's batched server at 11264 runs 4 concurrent requests at 13.5 tok/s. One price: the speculative server runs the chain
+verify, not the leaf tree (its commit moves K / V rows in every layer's cache through ASID 0 pointers): about 4 % fewer tokens a pass.
+
+ASIDs 2 and 3 would triple that (9 GiB of caches: the 2B's 4 users at 64k, the 9B's at 32k, 9B single users near 128k), and the
+code already spreads the layers over whatever ASIDs allocate. They do not allocate today because of the KMD's IOVA allocator: it
+searches downward from its last 64-bit insertion, device-wide, so once anything sits in ASID 1 a request for ASID 2 or 3 is placed
+in ASID 1's range and refused. A ten-line driver fix (start the search at the top for ASID > 0; the never-map zones bound each slot
+from below) is written and built, not yet loaded. The 27B keeps its 2048 default and its buffers (its one-pass prefill's part kernels
+are the exact path's).
 
 ## How it works
 

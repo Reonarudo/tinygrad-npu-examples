@@ -128,12 +128,15 @@ def attn_gqa_desc(NH, NKV, HD, TMAX, M, BT=None):
   return K.V._desc_slots(*sl)
 
 
-def attn_gqa_src(NH, NKV, HD, TMAX, ROT, eps, M, tree=False, BT=None, NTE=None, name=None, nidx=False):
+def attn_gqa_src(NH, NKV, HD, TMAX, ROT, eps, M, tree=False, BT=None, NTE=None, name=None, nidx=False, kvb=0):
   """See the module docstring. args: part, q_rows, kv_rows, qnw_all, knw_all, rope, Kall, Vall, idx (layer, pos), desc
   (attn_gqa_desc)[, tree]. NTE: the tasks that take attention records (default 12; the rest only write cache rows). `nidx`: idx has a
   third word: the cache index (KV slots: the user's cache in the slot), idx[0] staying the layer (the norm weights' row, as every
-  other stacked kernel reads it)."""
+  other stacked kernel reads it). `kvb`: the DMA base code of the cache (kGlobal1..3: Kall / Vall live in that ASID, their pointers the
+  offsets there; 0: the text as before)."""
   K = _K(); BT = K.ATT_BT if BT is None else BT; NT = K.NT; NTE = NT if NTE is None else NTE
+  KF = (lambda f, d, off, a: f"DMA_FILL({f}, {d}, {off}, {a})") if not kvb else (lambda f, d, off, a: f"DMA_FILLB({f}, {d}, {off}, {a}, {kvb})")
+  KD = (lambda f, d, off, a: f"DMA_DRAIN({f}, {d}, {off}, {a})") if not kvb else (lambda f, d, off, a: f"DMA_DRAINB({f}, {d}, {off}, {a}, {kvb})")
   g = NH // NKV; P, CLC = K.attn_plan(NH, HD, TMAX); CL = K._attn_cl(TMAX, P); NCH = CL // 8; G = g * M
   scale = 1.0 / HD ** 0.5; LOG2E = 1.4426950408889634; QR, KR = NH * 2 * HD, 2 * NKV * HD; PW = HD + 16
   assert 1 <= M <= 12 and HD % 64 == 0 and BT % 2 == 0 and CL % 8 == 0 and 1 <= NTE <= NT
@@ -204,8 +207,8 @@ __kernel void {kname}(__global float* restrict part, __global float* restrict q_
     DMA_FILL(2, DESC(desc, 1), {KS}, (int)(kv_rows + r * {KR} + kh * {HD}));
     DMA_FILL(3, DESC(desc, 1), {KB0}, (int)(kv_rows + r * {KR} + {NKV * HD} + kh * {HD}));
     DMA_WAIT(2); norm_rope(LSF({KN}), LSF({KS}), knw, rope + {RP("r")} * {2 * ROT});
-    DMA_DRAIN(2, DESC(desc, 1), {KN}, (int)(Kc + ((pos + r) * {NKV} + kh) * {HD}));
-    DMA_WAIT(3); DMA_DRAIN(3, DESC(desc, 1), {KB0}, (int)(Vc + ((pos + r) * {NKV} + kh) * {HD}));
+    {KD(2, "DESC(desc, 1)", KN, f"(int)(Kc + ((pos + r) * {NKV} + kh) * {HD})")};
+    DMA_WAIT(3); {KD(3, "DESC(desc, 1)", KB0, f"(int)(Vc + ((pos + r) * {NKV} + kh) * {HD})")};
     DMA_WAIT(2); DMA_WAIT(3);
   }}
   {"int lid = core_id;" if NTE == NT else f"int lid = (core_id & 3) * 3 + (core_id >> 2);                  /* tasks spread over the 3 cores (each core's DMA engine serialises its TECs' requests) */"}
@@ -238,11 +241,11 @@ __kernel void {kname}(__global float* restrict part, __global float* restrict q_
     for (int o = 0; o < NO; o++) for (int t = 0; t < n; t++) *(__global float8*)(SC + o * CLd * 8 + t * 8) = BC{NEG};
     /* pass 1: the cache rows [t0, tc) in blocks of {BT} (double-buffered), two positions x eight records a step */
     int nb = tc > t0 ? (tc - t0 + {BT - 1}) / {BT} : 0;
-    if (nb > 0) DMA_FILL(0, DESC(desc, 0), {KB0}, (int)(Kc + (t0 * {NKV} + kvh) * {HD}));
+    if (nb > 0) {KF(0, "DESC(desc, 0)", KB0, f"(int)(Kc + (t0 * {NKV} + kvh) * {HD})")};
     for (int b = 0; b < nb; b++) {{
       int p = b & 1;
-      if (b + 1 < nb) {{ if (p == 0) DMA_FILL(1, DESC(desc, 0), {KB0 + BT * HD * 4}, (int)(Kc + ((t0 + (b + 1) * {BT}) * {NKV} + kvh) * {HD}));
-                        else        DMA_FILL(0, DESC(desc, 0), {KB0}, (int)(Kc + ((t0 + (b + 1) * {BT}) * {NKV} + kvh) * {HD})); }}
+      if (b + 1 < nb) {{ if (p == 0) {KF(1, "DESC(desc, 0)", KB0 + BT * HD * 4, f"(int)(Kc + ((t0 + (b + 1) * {BT}) * {NKV} + kvh) * {HD})")};
+                        else        {KF(0, "DESC(desc, 0)", KB0, f"(int)(Kc + ((t0 + (b + 1) * {BT}) * {NKV} + kvh) * {HD})")}; }}
       if (p == 0) DMA_WAIT(0); else DMA_WAIT(1);
       __global float* kb = LSF({KB0} + p * {BT * HD * 4});
       for (int jt = 0; jt < {BT}; jt += 2) {{
@@ -272,11 +275,11 @@ __kernel void {kname}(__global float* restrict part, __global float* restrict q_
     }}
 {sm_online if CLC else sm_old}
     /* pass 2: o += p V, two records x 64 dims in registers over a block */
-    if (nb > 0) DMA_FILL(0, DESC(desc, 0), {KB0}, (int)(Vc + (t0 * {NKV} + kvh) * {HD}));
+    if (nb > 0) {KF(0, "DESC(desc, 0)", KB0, f"(int)(Vc + (t0 * {NKV} + kvh) * {HD})")};
     for (int b = 0; b < nb; b++) {{
       int p = b & 1;
-      if (b + 1 < nb) {{ if (p == 0) DMA_FILL(1, DESC(desc, 0), {KB0 + BT * HD * 4}, (int)(Vc + ((t0 + (b + 1) * {BT}) * {NKV} + kvh) * {HD}));
-                        else        DMA_FILL(0, DESC(desc, 0), {KB0}, (int)(Vc + ((t0 + (b + 1) * {BT}) * {NKV} + kvh) * {HD})); }}
+      if (b + 1 < nb) {{ if (p == 0) {KF(1, "DESC(desc, 0)", KB0 + BT * HD * 4, f"(int)(Vc + ((t0 + (b + 1) * {BT}) * {NKV} + kvh) * {HD})")};
+                        else        {KF(0, "DESC(desc, 0)", KB0, f"(int)(Vc + ((t0 + (b + 1) * {BT}) * {NKV} + kvh) * {HD})")}; }}
       if (p == 0) DMA_WAIT(0); else DMA_WAIT(1);
       __global float* vb = LSF({KB0} + p * {BT * HD * 4});
       int tb = t0 + b * {BT}, nt = tc - tb < {BT} ? tc - tb : {BT};
@@ -375,7 +378,7 @@ DEC3_CL1 = 512                                                               # a
 DEC3_CLC = 256                                                               # ... and a chunk's positions when it does not (the q octets and o then both stay resident)
 
 
-def attn_dec3_src(NH, NKV, HD, TMAX, ROT, eps, U=1, BT=2, nidx=False):
+def attn_dec3_src(NH, NKV, HD, TMAX, ROT, eps, U=1, BT=2, nidx=False, kvb=0):
   """attn_dec2 (the plain decode step's attention, one row) in kv-head units: a unit = (kv head, one of U runs of its g query heads);
   the unit streams the head's K / V rows [0, pos) once by DMA (blocks of BT rows, double-buffered), scores two positions x its
   heads a step (attn_gqa's transposed sum = dot256's order), and keeps attn_dec2's arithmetic per head: the max from -1e30, the
@@ -383,8 +386,10 @@ def attn_dec3_src(NH, NKV, HD, TMAX, ROT, eps, U=1, BT=2, nidx=False):
   the cache by DMA on the tasks without a unit. Same arguments as attn_dec2 plus desc (attn_dec3_desc).
   Scores: TMAX <= DEC3_CL1: one chunk of TMAX x 8 floats (the text as before). Longer contexts: the positions 0..pos in chunks of
   DEC3_CLC with an online softmax -- each chunk's scores in LSRAM, the running max per head, the sum and the o accumulators
-  rescaled by exp(m_old - m_new) when the max grows (the q octets stay resident, o has a region of its own). `nidx`: as attn_gqa_src's."""
+  rescaled by exp(m_old - m_new) when the max grows (the q octets stay resident, o has a region of its own). `nidx`, `kvb`: as attn_gqa_src's."""
   K = _K(); NT = K.NT; g = NH // NKV; scale = 1.0 / HD ** 0.5; LOG2E = 1.4426950408889634
+  KF = (lambda f, d, off, a: f"DMA_FILL({f}, {d}, {off}, {a})") if not kvb else (lambda f, d, off, a: f"DMA_FILLB({f}, {d}, {off}, {a}, {kvb})")
+  KD = (lambda f, d, off, a: f"DMA_DRAIN({f}, {d}, {off}, {a})") if not kvb else (lambda f, d, off, a: f"DMA_DRAINB({f}, {d}, {off}, {a}, {kvb})")
   assert 1 <= U <= g and NKV * U < NT and BT % 2 == 0 and g <= 8
   NHU = -(-g // U)                                                            # heads a unit (the last may hold fewer)
   chunked = TMAX > DEC3_CL1; CLC = DEC3_CLC if chunked else TMAX
@@ -403,8 +408,8 @@ __kernel void attn_dec2(__global float* restrict o_rows, __global float* restric
   if (core_id >= {NKV * U}) {{                                       /* the new token's k (normed, rotated) and v into the cache by DMA */
     for (int kh = core_id - {NKV * U}; kh < {NKV}; kh += {NT - NKV * U}) {{
       DMA_FILL(2, DESC(desc, 1), {KS}, (int)(kv_rows + kh * {HD})); DMA_FILL(3, DESC(desc, 1), {KB0}, (int)(kv_rows + {NKV * HD} + kh * {HD}));
-      DMA_WAIT(2); norm_rope(LSF({KN}), LSF({KS}), knw, cs); DMA_DRAIN(2, DESC(desc, 1), {KN}, (int)(Kc + (pos * {NKV} + kh) * {HD}));
-      DMA_WAIT(3); DMA_DRAIN(3, DESC(desc, 1), {KB0}, (int)(Vc + (pos * {NKV} + kh) * {HD})); DMA_WAIT(2); DMA_WAIT(3);
+      DMA_WAIT(2); norm_rope(LSF({KN}), LSF({KS}), knw, cs); {KD(2, "DESC(desc, 1)", KN, f"(int)(Kc + (pos * {NKV} + kh) * {HD})")};
+      DMA_WAIT(3); {KD(3, "DESC(desc, 1)", KB0, f"(int)(Vc + (pos * {NKV} + kh) * {HD})")}; DMA_WAIT(2); DMA_WAIT(3);
     }}
     return;
   }}
@@ -423,11 +428,11 @@ __kernel void attn_dec2(__global float* restrict o_rows, __global float* restric
   for (int ca = 0; ca <= pos; ca += {CLC}) {{                        /* the positions [ca, cb) of 0..pos: the cache rows [ca, ce), then the new token when cb > pos */
     int cb = ca + {CLC} < pos + 1 ? ca + {CLC} : pos + 1, ce = cb < pos ? cb : pos, n = cb - ca; cz = ca;
     int nb = (ce - ca + {BT - 1}) / {BT};
-    if (nb > 0) DMA_FILL(0, DESC(desc, 0), {KB0}, (int)(Kc + (ca * {NKV} + kvh) * {HD}));
+    if (nb > 0) {KF(0, "DESC(desc, 0)", KB0, f"(int)(Kc + (ca * {NKV} + kvh) * {HD})")};
     for (int b = 0; b < nb; b++) {{
       int p = b & 1;
-      if (b + 1 < nb) {{ if (p == 0) DMA_FILL(1, DESC(desc, 0), {KB0 + BT * HD * 4}, (int)(Kc + ((ca + (b + 1) * {BT}) * {NKV} + kvh) * {HD}));
-                        else        DMA_FILL(0, DESC(desc, 0), {KB0}, (int)(Kc + ((ca + (b + 1) * {BT}) * {NKV} + kvh) * {HD})); }}
+      if (b + 1 < nb) {{ if (p == 0) {KF(1, "DESC(desc, 0)", KB0 + BT * HD * 4, f"(int)(Kc + ((ca + (b + 1) * {BT}) * {NKV} + kvh) * {HD})")};
+                        else        {KF(0, "DESC(desc, 0)", KB0, f"(int)(Kc + ((ca + (b + 1) * {BT}) * {NKV} + kvh) * {HD})")}; }}
       if (p == 0) DMA_WAIT(0); else DMA_WAIT(1);
       __global float* kb = LSF({KB0} + p * {BT * HD * 4});
       for (int jt = 0; jt < {BT}; jt += 2) {{
@@ -448,11 +453,11 @@ __kernel void attn_dec2(__global float* restrict o_rows, __global float* restric
     mx = mn;
     for (int t = 0; t < n; t++) {{ float8 e = exp2_d4((*(__global float8*)(S + t * 8) - mx) * BC({LOG2E!r}f)); *(__global float8*)(S + t * 8) = e; sum += e; }}
     if (ca == 0) for (int i = 0; i < R * {HD}; i += 8) *(__global float8*)(OOp + i) = BC(0.0f);
-    if (nb > 0) DMA_FILL(0, DESC(desc, 0), {KB0}, (int)(Vc + (ca * {NKV} + kvh) * {HD}));
+    if (nb > 0) {KF(0, "DESC(desc, 0)", KB0, f"(int)(Vc + (ca * {NKV} + kvh) * {HD})")};
     for (int b = 0; b < nb; b++) {{
       int p = b & 1;
-      if (b + 1 < nb) {{ if (p == 0) DMA_FILL(1, DESC(desc, 0), {KB0 + BT * HD * 4}, (int)(Vc + ((ca + (b + 1) * {BT}) * {NKV} + kvh) * {HD}));
-                        else        DMA_FILL(0, DESC(desc, 0), {KB0}, (int)(Vc + ((ca + (b + 1) * {BT}) * {NKV} + kvh) * {HD})); }}
+      if (b + 1 < nb) {{ if (p == 0) {KF(1, "DESC(desc, 0)", KB0 + BT * HD * 4, f"(int)(Vc + ((ca + (b + 1) * {BT}) * {NKV} + kvh) * {HD})")};
+                        else        {KF(0, "DESC(desc, 0)", KB0, f"(int)(Vc + ((ca + (b + 1) * {BT}) * {NKV} + kvh) * {HD})")}; }}
       if (p == 0) DMA_WAIT(0); else DMA_WAIT(1);
       __global float* vb = LSF({KB0} + p * {BT * HD * 4});
       int tb = ca + b * {BT}, nt = ce - tb < {BT} ? ce - tb : {BT};

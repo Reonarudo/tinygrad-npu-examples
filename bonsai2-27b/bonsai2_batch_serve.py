@@ -14,9 +14,9 @@ into the slot and the first token goes out. The context
 (`--tmax`, 65536 by default) sets the K / V caches: (1 + users) x attention layers x tmax x 2 KiB (2B: 1.5 GB a user at 64k;
 the 4B / 9B 4.3 GB a user -- fewer users or a shorter context there).
 
-With KV slots (QWEN_KV_SLOTS=1, bonsai2_generate's default for the smaller sizes) the caches live in host memory and are mapped
-into two window slots a layer at a time, so `auto` reaches 65536 for 4 users of the 2B (the window holds the two slots: 4 x users x
-tmax x 2 KiB on the 2B), and the prefill writes straight into the user's cache.
+With the caches in the NPU's ASIDs 1-3 (QWEN_KV_ASID=1, bonsai2_generate's default for the smaller sizes: three more 3 GiB address
+spaces the attention kernels reach by DMA) the ASID0 window is not the bound: `auto` is the largest context whose fullest ASID holds its
+layers' caches for every user (QWEN_TMAX_MAX caps it, 65536), and the prefill writes straight into the user's cache.
 
   QWEN_MODEL=bonsai2-2b python3 bonsai2_batch_serve.py [--users 4] [--host 0.0.0.0] [--port 8000] [--tmax auto]
   (the single-request speculative server is bonsai2_serve.py: faster for one user, one request at a time)
@@ -54,7 +54,7 @@ class BatchEngine:
     self.slots[u] = dict(ids=ids, k=0, out=[], max_new=max(1, min(max_new, self.tmax - len(ids) - 1)), stop=stop, q=q, pos=0, sent="", t0=time.perf_counter(), tf=None)
   def _start(self, job):
     """A job's prompt starts through the model's chunked prefill (one at a time) for the free slot it reserves (PRE): -> the
-    in-flight record. KV slots: the model prefills straight into that user's cache (kv_user)."""
+    in-flight record. The caches in ASIDs: the model prefills straight into that user's cache (kv_user)."""
     ids, max_new, stop, q = job; u = self.slots.index(None); self.slots[u] = PRE
     M = self.M; M.kv_user = u; M.prefill_prelude(); M.spec_meta = dict(prompt="(server)", n_prompt=len(ids), thinking=False, prompt_ids=[int(v) for v in ids])
     return dict(job=job, gen=M.prefill_chunks(ids), t0=time.perf_counter(), u=u)
@@ -130,9 +130,9 @@ def main():
   ap.add_argument("--pin-gb", type=float, default=float(os.environ.get("QWEN_PIN_GB", "12")))
   ap.add_argument("--dir", default=os.environ["QWEN_DIR"]); ap.add_argument("--cache", default=os.environ["QWEN_NPU"]); a = ap.parse_args()
   auto = a.tmax == "auto" or os.environ.get("QWEN_TMAX_AUTO") == "1"
-  os.environ.setdefault("QWEN_KV_USERS", str(a.users)); slots = os.environ.get("QWEN_KV_SLOTS", "0") == "1"
-  a.tmax, kv_gb = S.auto_tmax(a.users, float(os.environ.get("QWEN_KV_GB", "2.2" if slots else "2.0")), R.NL // 4, R.NKV, R.HD, slots=slots) if a.tmax == "auto" else (int(a.tmax), S.kv_window_bytes(a.users, R.NL // 4, R.NKV, R.HD, int(a.tmax), slots) / 1e9)
-  print(f"   context {a.tmax} tokens: K / V caches {kv_gb:.2f} GB of the NPU's window ({'two slots, the caches in host memory' if slots else f'{1 + a.users} x {R.NL // 4} attention layers as buffers'}; the window holds ~2.75 GB in all)", flush=True)
+  os.environ.setdefault("QWEN_KV_USERS", str(a.users)); asid = os.environ.get("QWEN_KV_ASID", "0") == "1"
+  a.tmax, kv_gb = S.auto_tmax(a.users, float(os.environ.get("QWEN_KV_GB", "2.0")), R.NL // 4, R.NKV, R.HD, want=int(os.environ.get("QWEN_TMAX_MAX", "65536")), mtp=False) if a.tmax == "auto" else (int(a.tmax), (S.asid_tmax(a.users, R.NL // 4, R.NKV, R.HD, False, int(a.tmax))[1] if asid else S.kv_window_bytes(a.users, R.NL // 4, R.NKV, R.HD, int(a.tmax), False) / 1e9))
+  print(f"   context {a.tmax} tokens: K / V caches {kv_gb:.2f} GB {'in the fullest of ASIDs 1-3 (3 GiB each; none of the ASID0 window)' if asid else f'of the NPU window ({1 + a.users} x {R.NL // 4} attention layers as buffers; ~2.75 GB in all)'}", flush=True)
   eng = S.engine_fit(BatchEngine, a, auto); srv = S.ThreadingHTTPServer((a.host, a.port), S.make_handler(eng, a.model_name))
   print(f"== serving {a.model_name} on http://{a.host}:{a.port}/v1 (OpenAI- / Ollama-compatible; greedy; {a.users} requests a step; context {a.tmax} tokens)", flush=True)
   threading.Thread(target=srv.serve_forever, daemon=True).start()

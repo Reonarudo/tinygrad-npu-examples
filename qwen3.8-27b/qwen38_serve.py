@@ -199,9 +199,26 @@ def kv_window_bytes(users, natt, nkv, hd, tmax, slots, mtp=True):
   return (2 * max(1, users) + (1 if mtp else 0)) * row * tmax if slots else (1 + users) * natt * row * tmax
 
 
+def asid_count():
+  """How many of ASIDs 1..3 allocate right now (qwen38_generate.KVAsid.available on the device)."""
+  from tinygrad import Device; import qwen38_generate as G_
+  return G_.KVAsid.available(Device["ZHOUYI"].raw)
+
+
+def asid_tmax(users, natt, nkv, hd, mtp=True, want=65536, nasid=None):
+  """The caches in ASIDs 1-3 (QWEN_KV_ASID): the largest multiple of 1024 up to `want` whose fullest ASID (ceil(natt / nasid) layers x
+  max(1, users) regions, + the drafter's in ASID 1) holds its [K | V] in 3 GiB -> (tmax, that ASID's GB). nasid: the ASIDs that
+  allocate (asid_count; the stock KMD: 1)."""
+  na = asid_count() if nasid is None else nasid
+  row = nkv * hd * 4; regs = max(-(-natt // na) * max(1, users) + (1 if mtp else 0), 1); cap = 3 * 2**30 - (16 << 20)
+  t = min(want, cap // (2 * regs * row) // 1024 * 1024); return max(1024, t), 2 * regs * row * t / 1e9
+
+
 def auto_tmax(users, budget_gb, natt, nkv, hd, want=65536, slots=False, mtp=True):
   """The context: `want`, or the largest multiple of 1024 whose K / V caches (kv_window_bytes) fit budget_gb -- the NPU addresses a
-  4 GiB window of which ~2.75 GB can hold buffers and slots (the rest of the process's buffers take ~0.3-0.6 GB)."""
+  4 GiB window of which ~2.75 GB can hold buffers and slots (the rest of the process's buffers take ~0.3-0.6 GB). With the caches
+  in ASIDs 1-3 (QWEN_KV_ASID=1) the window is not the bound: asid_tmax's."""
+  if os.environ.get("QWEN_KV_ASID", "0") == "1": return asid_tmax(users, natt, nkv, hd, mtp, want)
   per_pos = kv_window_bytes(users, natt, nkv, hd, 1, slots, mtp); t = min(want, int(budget_gb * 1e9) // per_pos // 1024 * 1024)
   return max(1024, t), per_pos * t / 1e9
 
@@ -228,9 +245,9 @@ def main(default_name="qwen3.8-27b", default_tmax=2048):
   a = ap.parse_args()
   import qwen38_ref as R_
   auto = a.tmax == "auto" or os.environ.get("QWEN_TMAX_AUTO") == "1"
-  slots = os.environ.get("QWEN_KV_SLOTS", "0") == "1"
-  a.tmax, gb = auto_tmax(0, float(os.environ.get("QWEN_KV_GB", "2.2" if slots else "2.0")), R_.NL // 4, R_.NKV, R_.HD, slots=slots) if a.tmax == "auto" else (int(a.tmax), kv_window_bytes(0, R_.NL // 4, R_.NKV, R_.HD, int(a.tmax), slots) / 1e9)
-  print(f"   context {a.tmax} tokens: K / V caches {gb:.2f} GB of the NPU's window{' (KV slots: the caches in host memory)' if slots else ''}", flush=True); eng = engine_fit(Engine, a, auto)
+  asid = os.environ.get("QWEN_KV_ASID", "0") == "1"
+  a.tmax, gb = auto_tmax(0, float(os.environ.get("QWEN_KV_GB", "2.0")), R_.NL // 4, R_.NKV, R_.HD, want=int(os.environ.get("QWEN_TMAX_MAX", "65536"))) if a.tmax == "auto" else (int(a.tmax), (asid_tmax(0, R_.NL // 4, R_.NKV, R_.HD, True, int(a.tmax))[1] if asid else kv_window_bytes(0, R_.NL // 4, R_.NKV, R_.HD, int(a.tmax), False) / 1e9))
+  print(f"   context {a.tmax} tokens: K / V caches {gb:.2f} GB {'in the fullest of ASIDs 1-3 (3 GiB each; none of the ASID0 window)' if asid else 'of the NPU window'}", flush=True); eng = engine_fit(Engine, a, auto)
   srv = ThreadingHTTPServer((a.host, a.port), make_handler(eng, a.model_name))
   print(f"== serving {a.model_name} on http://{a.host}:{a.port}/v1 (OpenAI-compatible; greedy; context {a.tmax} tokens)", flush=True)
   threading.Thread(target=srv.serve_forever, daemon=True).start()

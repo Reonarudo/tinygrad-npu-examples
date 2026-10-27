@@ -27,9 +27,10 @@ os.environ.setdefault("ZHOUYI_TEXT_GM", "1")              # kernel code fetched 
 os.environ.setdefault("ZHOUYI_CHAIN_MAX", "16")           # a layer's launches as one job (8: two); -16 ms a 4-row verify pass
 os.environ.setdefault("QWEN_LAYER_BLOCK", "4")            # the verify pass's layers 4 at a time, a block one job (and the head one job)
 os.environ.setdefault("QWEN_SPEC", "4")                 # verify geometries up to 4 rows: a 5th row still costs ~+80 ms a pass (rows 6-8 ~+15 each)
-if os.environ["QWEN_MODEL"] != "bonsai2-27b": os.environ.setdefault("QWEN_KV_SLOTS", "1")   # the K / V caches in host memory behind two window slots (contexts past the NPU's 4 GiB window)
-# spare rows take the drafts' rank-2/3 candidates (+3.9 % on 10 prompts, exact) -- not with KV slots (its commit moves K / V rows in every layer's cache at once)
-os.environ.setdefault("QWEN_SPEC_TREE", "off" if os.environ.get("QWEN_KV_SLOTS") == "1" else "leaf")
+if os.environ["QWEN_MODEL"] != "bonsai2-27b": os.environ.setdefault("QWEN_KV_ASID", "1")    # the K / V caches in the NPU's ASIDs 1-3 (3 GiB each, reached by DMA): contexts past the ASID0 window
+if os.environ.get("QWEN_KV_ASID") == "1": os.environ.setdefault("ZHOUYI_ASID_BASES", "0x100000000,0x200000000,0x300000000")   # the chain head's ASID bases (the KMD's layout)
+# spare rows take the drafts' rank-2/3 candidates (+3.9 % on 10 prompts, exact) -- not with the caches in ASIDs (its commit moves K / V rows in every layer's cache through ASID0 pointers)
+os.environ.setdefault("QWEN_SPEC_TREE", "off" if os.environ.get("QWEN_KV_ASID") == "1" else "leaf")
 os.environ.setdefault("QWEN_TREE_TC", "0.5")             # the chain drafts on while its path probability >= 0.5
 os.environ.setdefault("QWEN_SPEC_GEOS", "2,3,4")
 os.environ.setdefault("QWEN_DRAFT_MAX", "3")
