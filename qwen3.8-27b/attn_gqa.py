@@ -128,9 +128,11 @@ def attn_gqa_desc(NH, NKV, HD, TMAX, M, BT=None):
   return K.V._desc_slots(*sl)
 
 
-def attn_gqa_src(NH, NKV, HD, TMAX, ROT, eps, M, tree=False, BT=None, NTE=None, name=None):
+def attn_gqa_src(NH, NKV, HD, TMAX, ROT, eps, M, tree=False, BT=None, NTE=None, name=None, nidx=False):
   """See the module docstring. args: part, q_rows, kv_rows, qnw_all, knw_all, rope, Kall, Vall, idx (layer, pos), desc
-  (attn_gqa_desc)[, tree]. NTE: the tasks that take attention records (default 12; the rest only write cache rows)."""
+  (attn_gqa_desc)[, tree]. NTE: the tasks that take attention records (default 12; the rest only write cache rows). `nidx`: idx has a
+  third word: the cache index (KV slots: the user's cache in the slot), idx[0] staying the layer (the norm weights' row, as every
+  other stacked kernel reads it)."""
   K = _K(); BT = K.ATT_BT if BT is None else BT; NT = K.NT; NTE = NT if NTE is None else NTE
   g = NH // NKV; P, CLC = K.attn_plan(NH, HD, TMAX); CL = K._attn_cl(TMAX, P); NCH = CL // 8; G = g * M
   scale = 1.0 / HD ** 0.5; LOG2E = 1.4426950408889634; QR, KR = NH * 2 * HD, 2 * NKV * HD; PW = HD + 16
@@ -193,9 +195,9 @@ def attn_gqa_src(NH, NKV, HD, TMAX, ROT, eps, M, tree=False, BT=None, NTE=None, 
 __kernel void {kname}(__global float* restrict part, __global float* restrict q_rows, __global float* restrict kv_rows,
                         __global float* restrict qnw_all, __global float* restrict knw_all, __global float* restrict rope,
                         __global float* restrict Kall, __global float* restrict Vall, __global int* restrict idx, __global int* restrict desc, {"__global int* restrict tree, " if tree else ""}const int core_id) {{
-  int L = idx[0], pos = idx[1], T = pos + {M};
+  int L = idx[{2 if nidx else 0}], pos = idx[1], T = pos + {M};{" int Ln = idx[0];" if nidx else ""}
   __global float* Kc = Kall + (L * {TMAX}) * {NKV * HD}; __global float* Vc = Vall + (L * {TMAX}) * {NKV * HD};
-  __global float* qnw = qnw_all + L * {HD}; __global float* knw = knw_all + L * {HD};
+  __global float* qnw = qnw_all + {"Ln" if nidx else "L"} * {HD}; __global float* knw = knw_all + {"Ln" if nidx else "L"} * {HD};
   /* phase 0: the M new k / v rows into the cache by DMA, a unit = (row, kv head), from the last task down (they hold the fewest records) */
   for (int u = {NT - 1} - core_id; u < {NKV * M}; u += {NT}) {{
     int r = u / {NKV}, kh = u % {NKV};
@@ -218,7 +220,7 @@ __kernel void {kname}(__global float* restrict part, __global float* restrict q_
     w += j1 - j0;
     int kvh = pr / {P}, c = pr % {P}, R = j1 - j0, NO = (R + 7) >> 3;
     int s0 = c * T / {P}, s1 = (c + 1) * T / {P};{tvars}
-    __global float* MS = QO + NO * {8 * PW}; __global float* QB = {'MS + NO * 16' if CLC else 'QO'}; __global float* SC = QB + NO * {QS if CLC else 0};   /* octet o: SC + o * CLd * 8; position t: + (t - t0) * 8 */
+    __global float* MS = QO + NO * {8 * PW}; __global float* QB = {'MS + NO * 16' if CLC else 'QO'}; __global float* SC = QB + NO * {QS};   /* octet o: SC + o * CLd * 8; position t: + (t - t0) * 8 */
     DMA_WAIT(3);                                                          /* the previous unit's record drains (they read QO) */
     /* the q rows, normed and rotated, into the octets chunk-major (chunk i of lane l at + (8 i + l) 8); one request per run of a head's rows */
     if (R & 7) for (int i = 0; i < {HD // 8}; i++) for (int l = R & 7; l < 8; l++) *(__global float8*)(QB + (NO - 1) * {QS} + (8 * i + l) * 8) = BC(0.0f);
@@ -373,7 +375,7 @@ DEC3_CL1 = 512                                                               # a
 DEC3_CLC = 256                                                               # ... and a chunk's positions when it does not (the q octets and o then both stay resident)
 
 
-def attn_dec3_src(NH, NKV, HD, TMAX, ROT, eps, U=1, BT=2):
+def attn_dec3_src(NH, NKV, HD, TMAX, ROT, eps, U=1, BT=2, nidx=False):
   """attn_dec2 (the plain decode step's attention, one row) in kv-head units: a unit = (kv head, one of U runs of its g query heads);
   the unit streams the head's K / V rows [0, pos) once by DMA (blocks of BT rows, double-buffered), scores two positions x its
   heads a step (attn_gqa's transposed sum = dot256's order), and keeps attn_dec2's arithmetic per head: the max from -1e30, the
@@ -381,7 +383,7 @@ def attn_dec3_src(NH, NKV, HD, TMAX, ROT, eps, U=1, BT=2):
   the cache by DMA on the tasks without a unit. Same arguments as attn_dec2 plus desc (attn_dec3_desc).
   Scores: TMAX <= DEC3_CL1: one chunk of TMAX x 8 floats (the text as before). Longer contexts: the positions 0..pos in chunks of
   DEC3_CLC with an online softmax -- each chunk's scores in LSRAM, the running max per head, the sum and the o accumulators
-  rescaled by exp(m_old - m_new) when the max grows (the q octets stay resident, o has a region of its own)."""
+  rescaled by exp(m_old - m_new) when the max grows (the q octets stay resident, o has a region of its own). `nidx`: as attn_gqa_src's."""
   K = _K(); NT = K.NT; g = NH // NKV; scale = 1.0 / HD ** 0.5; LOG2E = 1.4426950408889634
   assert 1 <= U <= g and NKV * U < NT and BT % 2 == 0 and g <= 8
   NHU = -(-g // U)                                                            # heads a unit (the last may hold fewer)
@@ -395,9 +397,9 @@ def attn_dec3_src(NH, NKV, HD, TMAX, ROT, eps, U=1, BT=2):
 __kernel void attn_dec2(__global float* restrict o_rows, __global float* restrict q_rows, __global float* restrict kv_rows,
                         __global float* restrict qnw_all, __global float* restrict knw_all, __global float* restrict rope,
                         __global float* restrict Kall, __global float* restrict Vall, __global int* restrict idx, __global int* restrict desc, const int core_id) {{
-  int L = idx[0], pos = idx[1];
+  int L = idx[{2 if nidx else 0}], pos = idx[1];{" int Ln = idx[0];" if nidx else ""}
   __global float* Kc = Kall + (L * {TMAX}) * {NKV * HD}; __global float* Vc = Vall + (L * {TMAX}) * {NKV * HD};
-  __global float* qnw = qnw_all + L * {HD}; __global float* knw = knw_all + L * {HD}; __global float* cs = rope + pos * {2 * ROT};
+  __global float* qnw = qnw_all + {"Ln" if nidx else "L"} * {HD}; __global float* knw = knw_all + {"Ln" if nidx else "L"} * {HD}; __global float* cs = rope + pos * {2 * ROT};
   if (core_id >= {NKV * U}) {{                                       /* the new token's k (normed, rotated) and v into the cache by DMA */
     for (int kh = core_id - {NKV * U}; kh < {NKV}; kh += {NT - NKV * U}) {{
       DMA_FILL(2, DESC(desc, 1), {KS}, (int)(kv_rows + kh * {HD})); DMA_FILL(3, DESC(desc, 1), {KB0}, (int)(kv_rows + {NKV * HD} + kh * {HD}));

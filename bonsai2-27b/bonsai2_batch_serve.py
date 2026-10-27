@@ -14,7 +14,11 @@ into the slot and the first token goes out. The context
 (`--tmax`, 65536 by default) sets the K / V caches: (1 + users) x attention layers x tmax x 2 KiB (2B: 1.5 GB a user at 64k;
 the 4B / 9B 4.3 GB a user -- fewer users or a shorter context there).
 
-  QWEN_MODEL=bonsai2-2b python3 bonsai2_batch_serve.py [--users 4] [--host 0.0.0.0] [--port 8000] [--tmax 65536]
+With KV slots (QWEN_KV_SLOTS=1, bonsai2_generate's default for the smaller sizes) the caches live in host memory and are mapped
+into two window slots a layer at a time, so `auto` reaches 65536 for 4 users of the 2B (the window holds the two slots: 4 x users x
+tmax x 2 KiB on the 2B), and the prefill writes straight into the user's cache.
+
+  QWEN_MODEL=bonsai2-2b python3 bonsai2_batch_serve.py [--users 4] [--host 0.0.0.0] [--port 8000] [--tmax auto]
   (the single-request speculative server is bonsai2_serve.py: faster for one user, one request at a time)
 """
 import argparse, os, queue, sys, threading, time
@@ -27,7 +31,8 @@ from qwen38_tokenize import Tok                                          # noqa:
 from tinygrad import Tensor                                              # noqa: E402
 
 EOS = S.EOS
-PREFILL_MIN = int(os.environ.get("BATCH_PREFILL_MIN", "48"))                   # prompts this long or longer go through the chunked prefill
+PREFILL_MIN = int(os.environ.get("BATCH_PREFILL_MIN", "48"))
+PRE = "prefilling"                                                           # a slot reserved for the prompt in the chunked prefill                   # prompts this long or longer go through the chunked prefill
 
 
 class BatchEngine:
@@ -48,19 +53,21 @@ class BatchEngine:
     self.B.Call[u * self.csz:(u + 1) * self.csz].assign(Tensor.zeros(self.csz, device=BB.DEV)).realize()
     self.slots[u] = dict(ids=ids, k=0, out=[], max_new=max(1, min(max_new, self.tmax - len(ids) - 1)), stop=stop, q=q, pos=0, sent="", t0=time.perf_counter(), tf=None)
   def _start(self, job):
-    """A job's prompt starts through the model's chunked prefill (one at a time): -> the in-flight record, or None (rejected)."""
-    ids, max_new, stop, q = job
-    M = self.M; M.prefill_prelude(); M.spec_meta = dict(prompt="(server)", n_prompt=len(ids), thinking=False, prompt_ids=[int(v) for v in ids])
-    return dict(job=job, gen=M.prefill_chunks(ids), t0=time.perf_counter())
-  def _place(self, u, pre):
+    """A job's prompt starts through the model's chunked prefill (one at a time) for the free slot it reserves (PRE): -> the
+    in-flight record. KV slots: the model prefills straight into that user's cache (kv_user)."""
+    ids, max_new, stop, q = job; u = self.slots.index(None); self.slots[u] = PRE
+    M = self.M; M.kv_user = u; M.prefill_prelude(); M.spec_meta = dict(prompt="(server)", n_prompt=len(ids), thinking=False, prompt_ids=[int(v) for v in ids])
+    return dict(job=job, gen=M.prefill_chunks(ids), t0=time.perf_counter(), u=u)
+  def _place(self, pre):
     """The prefilled prompt into slot u: the model's DeltaNet states, rings and the prompt's K / V rows copied (the model's own
     stacks were the prefill's), the first token emitted; the slot decodes from position n."""
-    ids, max_new, stop, q = pre["job"]; M, B, n = self.M, self.B, len(pre["job"][0]); NA = M.NATT; rs = R.NKV * R.HD
+    ids, max_new, stop, q = pre["job"]; M, B, n, u = self.M, self.B, len(pre["job"][0]), pre["u"]; NA = M.NATT; rs = R.NKV * R.HD
     M.flush()                                                             # (the deferred commit: the last pass's state updates into Sall)
     B.Sall[u * self.ssz:(u + 1) * self.ssz].assign(M.Sall).realize(); B.Call[u * self.csz:(u + 1) * self.csz].assign(M.Call).realize()
-    for i in range(NA):
-      src, dst = i * M.TMAX * rs, (u * NA + i) * self.tmax * rs
-      B.Kall[dst:dst + n * rs].assign(M.Kall[src:src + n * rs]).realize(); B.Vall[dst:dst + n * rs].assign(M.Vall[src:src + n * rs]).realize()
+    if not M.kvs:
+      for i in range(NA):
+        src, dst = i * M.TMAX * rs, (u * NA + i) * self.tmax * rs
+        B.Kall[dst:dst + n * rs].assign(M.Kall[src:src + n * rs]).realize(); B.Vall[dst:dst + n * rs].assign(M.Vall[src:src + n * rs]).realize()
     first = int(np.argmax(M.prefill_lg))
     s = self.slots[u] = dict(ids=ids, k=n, out=[], max_new=max(1, min(max_new, self.tmax - n - 1)), stop=stop, q=q, pos=n, sent="", t0=pre["t0"], tf=None)
     if self._emit(s, first): self.slots[u] = None
@@ -84,6 +91,7 @@ class BatchEngine:
     if len(ids) + 1 > self.tmax: job[3].put(("error", f"the prompt ({len(ids)} tokens) does not fit the context ({self.tmax})")); return None
     if len(ids) < PREFILL_MIN: self._short(self.slots.index(None), job); return None
     return self._start(job)
+  def _busy(self): return [s for s in self.slots if s is not None and s is not PRE]
   def serve_jobs(self):
     """The main thread's loop: a prefill pass (the one long prompt in flight) and a batch step (when a slot is busy) in turn; a prompt
     that is in takes a free slot; waiting requests start while a slot is free (and the prefill is, for a long one)."""
@@ -91,23 +99,23 @@ class BatchEngine:
     while True:
       if pre is None and all(s is None for s in self.slots) and self.jobs.empty(): self.jobs.put(self.jobs.get())   # (block until a request comes)
       while None in self.slots and not self.jobs.empty() and (pre is None or len(self.jobs.queue[0][0]) < PREFILL_MIN): pre = self._take() or pre
-      if pre is not None and None in self.slots:
+      if pre is not None:
         try:
-          if next(pre["gen"]) >= len(pre["job"][0]): self._place(self.slots.index(None), pre); pre = None   # (the last pass yields the prompt's length)
-        except Exception as e: pre["job"][3].put(("error", f"{type(e).__name__}: {e}")); print(f"   prefill failed: {e!r}", flush=True); pre = None
-      if all(s is None for s in self.slots): continue
+          if next(pre["gen"]) >= len(pre["job"][0]): self._place(pre); pre = None   # (the last pass yields the prompt's length)
+        except Exception as e: pre["job"][3].put(("error", f"{type(e).__name__}: {e}")); print(f"   prefill failed: {e!r}", flush=True); self.slots[pre["u"]] = None; pre = None
+      if not self._busy(): continue
       toks, pos = [], []
       for s in self.slots:
-        if s is None: toks.append(0); pos.append(0)
+        if s is None or s is PRE: toks.append(0); pos.append(0)
         elif s["k"] < len(s["ids"]): toks.append(s["ids"][s["k"]]); pos.append(s["pos"])
         else: toks.append(s["out"][-1]); pos.append(s["pos"])
       try: nxt = self.B.step(toks, pos)
       except Exception as e:
         for u, s in enumerate(self.slots):
-          if s is not None: s["q"].put(("error", f"{type(e).__name__}: {e}")); self.slots[u] = None
+          if s is not None and s is not PRE: s["q"].put(("error", f"{type(e).__name__}: {e}")); self.slots[u] = None
         print(f"   step failed: {e!r}", flush=True); continue
       for u, s in enumerate(self.slots):
-        if s is None: continue
+        if s is None or s is PRE: continue
         s["pos"] += 1
         if s["k"] < len(s["ids"]):
           s["k"] += 1
@@ -122,8 +130,9 @@ def main():
   ap.add_argument("--pin-gb", type=float, default=float(os.environ.get("QWEN_PIN_GB", "12")))
   ap.add_argument("--dir", default=os.environ["QWEN_DIR"]); ap.add_argument("--cache", default=os.environ["QWEN_NPU"]); a = ap.parse_args()
   auto = a.tmax == "auto" or os.environ.get("QWEN_TMAX_AUTO") == "1"
-  a.tmax, kv_gb = S.auto_tmax(a.users, float(os.environ.get("QWEN_KV_GB", "2.0")), R.NL // 4, R.NKV, R.HD) if a.tmax == "auto" else (int(a.tmax), (1 + a.users) * (R.NL // 4) * 2 * R.NKV * R.HD * 4 * int(a.tmax) / 1e9)
-  print(f"   context {a.tmax} tokens: K / V caches {kv_gb:.2f} GB of NPU-visible memory ({1 + a.users} x {R.NL // 4} attention layers; the NPU's window holds ~2.75 GB in all)", flush=True)
+  os.environ.setdefault("QWEN_KV_USERS", str(a.users)); slots = os.environ.get("QWEN_KV_SLOTS", "0") == "1"
+  a.tmax, kv_gb = S.auto_tmax(a.users, float(os.environ.get("QWEN_KV_GB", "2.2" if slots else "2.0")), R.NL // 4, R.NKV, R.HD, slots=slots) if a.tmax == "auto" else (int(a.tmax), S.kv_window_bytes(a.users, R.NL // 4, R.NKV, R.HD, int(a.tmax), slots) / 1e9)
+  print(f"   context {a.tmax} tokens: K / V caches {kv_gb:.2f} GB of the NPU's window ({'two slots, the caches in host memory' if slots else f'{1 + a.users} x {R.NL // 4} attention layers as buffers'}; the window holds ~2.75 GB in all)", flush=True)
   eng = S.engine_fit(BatchEngine, a, auto); srv = S.ThreadingHTTPServer((a.host, a.port), S.make_handler(eng, a.model_name))
   print(f"== serving {a.model_name} on http://{a.host}:{a.port}/v1 (OpenAI- / Ollama-compatible; greedy; {a.users} requests a step; context {a.tmax} tokens)", flush=True)
   threading.Thread(target=srv.serve_forever, daemon=True).start()

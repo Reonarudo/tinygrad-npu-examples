@@ -192,11 +192,17 @@ def make_handler(eng, name, chat_messages=chat_messages, details=OLLAMA_DETAILS)
   return H
 
 
-def auto_tmax(users, budget_gb, natt, nkv, hd, want=65536):
-  """The context: `want`, or the largest multiple of 1024 whose K / V caches ((1 + users) copies, natt layers, 2 x nkv x hd floats a
-  position) fit budget_gb -- the NPU addresses a 4 GiB window of which ~2.75 GB can hold buffers (the rest of the process's
-  buffers take ~0.3-0.5 GB)."""
-  per_pos = (1 + users) * natt * 2 * nkv * hd * 4; t = min(want, int(budget_gb * 1e9) // per_pos // 1024 * 1024)
+def kv_window_bytes(users, natt, nkv, hd, tmax, slots, mtp=True):
+  """The K / V caches' bytes in the NPU's window: as buffers (1 + users) x natt layers x 2 x nkv hd floats a position; with KV slots
+  two slots of max(1, users) users' [K | V] (+ the drafter's own slot when `mtp`)."""
+  row = 2 * nkv * hd * 4
+  return (2 * max(1, users) + (1 if mtp else 0)) * row * tmax if slots else (1 + users) * natt * row * tmax
+
+
+def auto_tmax(users, budget_gb, natt, nkv, hd, want=65536, slots=False, mtp=True):
+  """The context: `want`, or the largest multiple of 1024 whose K / V caches (kv_window_bytes) fit budget_gb -- the NPU addresses a
+  4 GiB window of which ~2.75 GB can hold buffers and slots (the rest of the process's buffers take ~0.3-0.6 GB)."""
+  per_pos = kv_window_bytes(users, natt, nkv, hd, 1, slots, mtp); t = min(want, int(budget_gb * 1e9) // per_pos // 1024 * 1024)
   return max(1024, t), per_pos * t / 1e9
 
 
@@ -222,8 +228,9 @@ def main(default_name="qwen3.8-27b", default_tmax=2048):
   a = ap.parse_args()
   import qwen38_ref as R_
   auto = a.tmax == "auto" or os.environ.get("QWEN_TMAX_AUTO") == "1"
-  a.tmax, gb = auto_tmax(0, float(os.environ.get("QWEN_KV_GB", "2.0")), R_.NL // 4, R_.NKV, R_.HD) if a.tmax == "auto" else (int(a.tmax), (R_.NL // 4) * 2 * R_.NKV * R_.HD * 4 * int(a.tmax) / 1e9)
-  print(f"   context {a.tmax} tokens: K / V caches {gb:.2f} GB of NPU-visible memory", flush=True); eng = engine_fit(Engine, a, auto)
+  slots = os.environ.get("QWEN_KV_SLOTS", "0") == "1"
+  a.tmax, gb = auto_tmax(0, float(os.environ.get("QWEN_KV_GB", "2.2" if slots else "2.0")), R_.NL // 4, R_.NKV, R_.HD, slots=slots) if a.tmax == "auto" else (int(a.tmax), kv_window_bytes(0, R_.NL // 4, R_.NKV, R_.HD, int(a.tmax), slots) / 1e9)
+  print(f"   context {a.tmax} tokens: K / V caches {gb:.2f} GB of the NPU's window{' (KV slots: the caches in host memory)' if slots else ''}", flush=True); eng = engine_fit(Engine, a, auto)
   srv = ThreadingHTTPServer((a.host, a.port), make_handler(eng, a.model_name))
   print(f"== serving {a.model_name} on http://{a.host}:{a.port}/v1 (OpenAI-compatible; greedy; context {a.tmax} tokens)", flush=True)
   threading.Thread(target=srv.serve_forever, daemon=True).start()

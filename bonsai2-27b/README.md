@@ -492,23 +492,29 @@ the batched kernel bit for bit against the one-row kernel. The 2B answers this c
 ("how many days are logged above?" over 120 repeated paragraphs: 120), prefilled in 69 s (batched server, 90 tok/s) to 87 s (the
 speculative server, 72 tok/s): the prefill is 4 tokens a pass, so long prompts take minutes.
 
-**What bounds the context now is the NPU's address window, not the kernels.** Every device pointer is a 32-bit offset in a 4 GiB
-window, and about 2.75 GB of it can hold buffers (the window slots the weights stream through share it). The K / V caches are fp32:
-24 KiB a position on the 2B (6 attention layers x 4 KiB), 64 KiB on the 4B / 9B. `--tmax auto` (the servers' default) takes the
-largest context up to 65536 whose caches fit 2 GB (`QWEN_KV_GB`), and restarts with a quarter less if the model's other buffers leave
-less room:
+**The NPU's address window, and the caches behind window slots.** Every device pointer is a 32-bit offset in a 4 GiB window, and
+about 2.75 GB of it can hold buffers and the slots the weights stream through. As fp32 buffers the K / V caches (24 KiB a position on
+the 2B, 64 KiB on the 4B / 9B) would have bounded the context at 64k for one user of the 2B, ~21k for the 9B, 15k for 4 batched users.
+So the caches now live in **host memory and are mapped into the window a layer at a time**, as the weights are (`QWEN_KV_SLOTS=1`, the
+default for the smaller sizes): each attention layer's [K | V] is a weight buffer of the KMD's, two window slots alternate by layer
+(slot i % 2 is re-pointed at layer i while layer i - 1 runs), the drafter's cache has a slot of its own, and the kernels address the
+slot with the user as their cache index. A probe showed the NPU reads and writes through a slot bit for bit (read after write, across
+remaps, every 2 MiB chunk of 64-512 MB mappings); the caches under slots equal the buffers' row for row, and the tokens are the same.
+What the window holds is then two slots of all users' caches of one layer, so `--tmax auto` (budget `QWEN_KV_GB`, 2.2 GB) reaches:
 
 | server | 2B | 9B (the 4B: the same cache shape) |
 | --- | ---: | ---: |
-| `bonsai2_serve.py` (one cache) | 65536 | 21504 (29696 asked for, restarted once) |
-| `bonsai2_batch_serve.py --users 4` (5 caches) | 15360 | ~5k |
-| `bonsai2_batch_serve.py --users 8` (9 caches) | 8192 | ~3k |
+| `bonsai2_serve.py` (speculative, one user) | 65536 | 65536 |
+| `bonsai2_batch_serve.py --users 4` | 59392 | ~29k |
+| `bonsai2_batch_serve.py --users 8` | 32768 | ~15k |
 
-The 9B at 21504: a 3142-token prompt (60 paragraphs) answered correctly ("exactly 60 days") in 127 s wall, 25 tok/s of prefill.
-
-Lifting that needs the caches in host memory, mapped into the window a layer at a time the way the weights are: a probe shows the
-NPU writes through a window slot into host memory (a kernel's stores visible on the host side), so that is the next step rather than
-a dead end. The 27B keeps its 2048 default (its one-pass prefill's part kernels are the exact path's).
+Board o6n, 2026-10-27, with the caches in slots: the 2B's speculative server answers the 6283-token prompt correctly in 86 s; the
+batched server (4 users, 59392 context) in 68 s, and its concurrent figures are the table's above (46.5 tok/s at 4 users); the 9B at
+65536 answers the 3142-token prompt ("exactly 60 days") in 127 s. The host memory the caches take: attention layers x users x tmax x
+4 KiB (2B) / 8 KiB (9B): 1.6 GB for one user of the 2B at 64k, 5.9 GB for four, 4.3 GB for the 9B. One price: the speculative server
+runs the chain verify, not the leaf tree (its commit moves K / V rows in every layer's cache at once, which a slot-at-a-time view
+cannot do): about 4 % fewer tokens a pass. The 27B keeps its 2048 default and its buffers (its one-pass prefill's part kernels are
+the exact path's).
 
 ## How it works
 
