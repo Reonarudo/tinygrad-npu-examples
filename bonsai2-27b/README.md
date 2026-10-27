@@ -503,13 +503,20 @@ sizes): buffers requested in those ASIDs (the KMD's `REQ_BUF` takes the ASID; th
 kernels' cache index, and nothing of the ASID 0 window spent. Probes on the board: a kernel's DMA with base 1 reads the ASID 1 buffer
 bit for bit and its writes reach the host, the same address through base 0 reads something else; the caches in the ASIDs equal the
 buffers' row for row and the tokens are the same (2B at 512, 4096 and 65536). `--tmax auto` is then the largest context whose fullest
-ASID holds its layers' caches (`QWEN_TMAX_MAX` caps it, 65536 by default):
+ASID holds its layers' caches, up to the model's own 262144 (`QWEN_TMAX_MAX`):
 
 | server, caches in ASIDs 1-3 | 2B | 4B / 9B |
 | --- | ---: | ---: |
-| `bonsai2_serve.py` (speculative, one user) | 65536 (262144 would fit) | 97280 with `QWEN_TMAX_MAX=131072` |
-| `bonsai2_batch_serve.py --users 4` | 65536 | 31744 |
+| `bonsai2_serve.py` (speculative, one user) | 258048 | 97280 |
+| `bonsai2_batch_serve.py --users 4` | 98304 | 31744 |
 | `bonsai2_batch_serve.py --users 8` | 48128 | ~15k |
+
+The capacity is there; the time is the other half. The prefill runs 4 tokens a pass and the attention reads the whole cache every
+pass and every token at the port's 23 GB/s (24 KiB a position on the 2B, 64 KiB on the 4B / 9B), so a 25363-token prompt took the
+2B's speculative server 543 s at a 258048 context (47 tok/s of prefill, slowing with depth), and a decode step at 100k positions reads
+2.4 GB of cache on the 2B -- about 100 ms a token before the weights. The answer to the counting question was also wrong at that
+depth ("100 days" for 480 paragraphs) where it was right at 6283 tokens: the model's doing, not the kernels'. Fewer bytes a position
+(an fp16 or quantized cache) is the lever for the time; the address spaces only gave the room.
 
 Board o6n, 2026-10-27: the 2B's batched server at 65536 (4 users) answers the 6283-token prompt in 68 s and runs 4 concurrent requests
 at 46 tok/s, 8 users at 48128 at 53 tok/s; the 9B at 97280 and the 4B at 65536 answer the 3142-token prompt ("60 days") in 127 s and

@@ -246,7 +246,7 @@ def main(default_name="qwen3.8-27b", default_tmax=2048):
   import qwen38_ref as R_
   auto = a.tmax == "auto" or os.environ.get("QWEN_TMAX_AUTO") == "1"
   asid = os.environ.get("QWEN_KV_ASID", "0") == "1"
-  a.tmax, gb = auto_tmax(0, float(os.environ.get("QWEN_KV_GB", "2.0")), R_.NL // 4, R_.NKV, R_.HD, want=int(os.environ.get("QWEN_TMAX_MAX", "65536"))) if a.tmax == "auto" else (int(a.tmax), (asid_tmax(0, R_.NL // 4, R_.NKV, R_.HD, True, int(a.tmax))[1] if asid else kv_window_bytes(0, R_.NL // 4, R_.NKV, R_.HD, int(a.tmax), False) / 1e9))
+  a.tmax, gb = auto_tmax(0, float(os.environ.get("QWEN_KV_GB", "2.0")), R_.NL // 4, R_.NKV, R_.HD, want=int(os.environ.get("QWEN_TMAX_MAX", "262144"))) if a.tmax == "auto" else (int(a.tmax), (asid_tmax(0, R_.NL // 4, R_.NKV, R_.HD, True, int(a.tmax))[1] if asid else kv_window_bytes(0, R_.NL // 4, R_.NKV, R_.HD, int(a.tmax), False) / 1e9))
   print(f"   context {a.tmax} tokens: K / V caches {gb:.2f} GB {'in the fullest of ASIDs 1-3 (3 GiB each; none of the ASID0 window)' if asid else 'of the NPU window'}", flush=True); eng = engine_fit(Engine, a, auto)
   srv = ThreadingHTTPServer((a.host, a.port), make_handler(eng, a.model_name))
   print(f"== serving {a.model_name} on http://{a.host}:{a.port}/v1 (OpenAI-compatible; greedy; context {a.tmax} tokens)", flush=True)
