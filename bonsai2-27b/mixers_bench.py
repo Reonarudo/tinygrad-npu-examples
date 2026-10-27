@@ -1,6 +1,6 @@
 """The batched mixers alone at 1 / 4 / 8 rows on the 2B (a JIT replay of 10 launches): gdn_tokb (a DeltaNet layer) and attn_decb."""
 import os, sys, time
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__))); os.environ["QWEN_MODEL"] = "bonsai2-2b"; os.environ["QWEN_DRAFT"] = "none"; os.environ["QWEN_SPEC_GEOS"] = "2,3,4"
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__))); os.environ.setdefault("QWEN_MODEL", "bonsai2-2b"); os.environ["QWEN_DRAFT"] = "none"; os.environ["QWEN_SPEC_GEOS"] = "2,3,4"
 import bonsai2_generate, numpy as np
 import qwen38_generate as QG, qwen38_ref as R, qwen38_kernels as QK, gdn_batch as GB, attn_batch as AB
 from bonsai2_batch import Batch

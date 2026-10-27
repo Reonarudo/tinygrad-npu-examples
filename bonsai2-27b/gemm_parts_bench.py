@@ -1,7 +1,7 @@
 """Where a row costs on the 2B: the GEMMs alone (gu: 12288 x 2048, dn: 2048 x 6144, qkv|z, o) and the producers around them (had_a32,
 swiglu_a, resid, unpack) at 1 / 4 / 8 / 12 rows, each as a JIT replay of 10 launches."""
 import os, sys, time
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__))); os.environ["QWEN_MODEL"] = "bonsai2-2b"; os.environ["QWEN_DRAFT"] = "none"; os.environ["QWEN_SPEC_GEOS"] = "2,3,4"
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__))); os.environ.setdefault("QWEN_MODEL", "bonsai2-2b"); os.environ["QWEN_DRAFT"] = "none"; os.environ["QWEN_SPEC_GEOS"] = "2,3,4"
 import bonsai2_generate, numpy as np
 import qwen38_generate as QG, qwen38_ref as R
 from tinygrad import Device

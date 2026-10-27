@@ -425,6 +425,21 @@ weights in a window slot of its own (`Layers.block_slots` / `map_block`), so a t
 71-85 ms a step (one layer a job vs blocks, back to back); at 1 user the gain is within the noise. The board's step times vary by
 ~15 % between runs of the same configuration (71 / 84 / 85 ms in three 8-user runs), so the figures above are ranges over 2-3 runs.
 
+**The 4B and the 9B on the same loop** (board o6n, 2026-10-27, prompts of 17 tokens, 32 new; user 0's ids = the single-request run's
+at every N). The producers now also move the norm weights by DMA (a sub-block at a time, accumulated in the mix's order) and gather
+the 9B's four mixed sub-blocks by DMA, so the 9B's 4096-block producers went from 1.31 / 1.42 ms (had_a32 / swiglu_a at 8 rows) to
+0.24 / 0.94, and `QWEN_HAD_ROWS` is on by default for them too (the 27B's tuned 1024-block producers remain the exception):
+
+| size | 1 user | 4 users | 8 users | speculative (code prompt) |
+| --- | ---: | ---: | ---: | ---: |
+| 2B | 49 ms, 20.5 tok/s | 48-62 ms, 64-84 tok/s | 86 ms, 93 tok/s | 35 tok/s |
+| 4B | 88 ms, 11.4 tok/s | 116 ms, 34.5 tok/s | 165 ms, 48.5 tok/s | 24.2 tok/s |
+| 9B | 145 ms, 6.9 tok/s | 171 ms, 23.4 tok/s | 282 ms (399 before the producer DMA), 28.4 tok/s | 14.0 tok/s (10.7 before) |
+
+Where the 9B's 282 ms at 8 users go: the GEMMs ~120 ms over its 32 layers (its 2.5 GB of codes a token are ~110 ms at the port: the
+floor), the batched DeltaNet kernel ~50 (2.1 ms a layer: 11 head groups x 8 rows of units, each re-fetching its a | b weight chunks),
+the producers ~45 (swiglu_a's four-sub-block gather 0.94 ms a layer), the rest residuals, unpacks and the jobs' gaps.
+
 **Why batching and speculative decoding are not combined here.** A row spent on a draft returns a token ~45 % of the time, a row
 spent on another user's token always; with the row costs above, plain batching beats any mix of users and drafts in a pass on this
 model. The combination pays on models whose rows are nearly free (the Q8_0 Gemma 4 E2B: a 7-row verify pass costs 1.07 plain steps).

@@ -1,6 +1,6 @@
 """The 2B's linears alone at 1 / 4 / 8 / 12 rows (the GEMM's rows mode): the cost of a row tile, decisive for batching + speculation."""
 import os, sys, time, functools
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__))); os.environ["QWEN_MODEL"] = "bonsai2-2b"; os.environ["QWEN_DRAFT"] = "none"; os.environ["QWEN_SPEC_GEOS"] = "2,3,4"
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__))); os.environ.setdefault("QWEN_MODEL", "bonsai2-2b"); os.environ["QWEN_DRAFT"] = "none"; os.environ["QWEN_SPEC_GEOS"] = "2,3,4"
 import bonsai2_generate, numpy as np
 import qwen38_generate as QG, qwen38_ref as R
 from tinygrad import Device

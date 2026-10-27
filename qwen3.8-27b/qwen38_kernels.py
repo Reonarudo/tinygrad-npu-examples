@@ -443,7 +443,51 @@ static inline __attribute__((always_inline)) float8 h8(float8 v) {
   return a + b * ((float8){1.0f, 1.0f, 1.0f, 1.0f, -1.0f, -1.0f, -1.0f, -1.0f});
 }
 """
-  if mode == "swiglu" and g == 1 and c % 48 == 0:
+  if mode == "swiglu" and c % 48 == 0:
+    # the gate | up tiles of the unit's quad by DMA, a group at a time: the quad's 3 sub-tile pieces (64 floats = [4 rows][16 cols], 256 B,
+    # DDR pitch 768 B) of the gate's group and of the up's (c / 48 groups later), double-buffered; the block's columns of the group
+    # then feed the same sw() / shuffle arithmetic as the plain path. g > 1: the g sub-blocks of the block's group gathered in turn and
+    # accumulated with their signs in the mix's order (the same bits). LSRAM: L [4][B] then 2 x 2 x 768 B of pieces.
+    LB = 4 * B * 4; GU = c // 48
+    def gather(jsub, first):
+      o = f"(b / {g} * {g} + {jsub}) * {B}" if g > 1 else f"b * {B}"; sg = f" * BC(sg{jsub})" if g > 1 else ""
+      st = (lambda v, e: f"{v} = {e};") if first else (lambda v, e: f"{v} += {e};")
+      put = lambda k, t01, t23: (f"*(__global float4*)(L + {k}) = __builtin_shufflevector({t01}, {t01}, 0, 1, 2, 3); *(__global float4*)(L + {B} + {k}) = __builtin_shufflevector({t01}, {t01}, 4, 5, 6, 7); "
+                                 f"*(__global float4*)(L + {2 * B} + {k}) = __builtin_shufflevector({t23}, {t23}, 0, 1, 2, 3); *(__global float4*)(L + {3 * B} + {k}) = __builtin_shufflevector({t23}, {t23}, 4, 5, 6, 7);")
+      acc = ("" if first else f"""
+        float8 a01 = F8(*(__global float4*)(L + k), *(__global float4*)(L + {B} + k)), a23 = F8(*(__global float4*)(L + {2 * B} + k), *(__global float4*)(L + {3 * B} + k));
+        t01 = a01 + t01; t23 = a23 + t23;""")
+      return f"""
+    {{ int cb = {o}; int g0 = cb / 48, g1 = (cb + {B} - 1) / 48;
+    DMA_FILL(0, DESC(desc, 0), {LB}, (int)(x + (g0 * {nrb} * 3) * 192 + i * 64)); DMA_FILL(2, DESC(desc, 0), {LB + 768}, (int)(x + ((g0 + {GU}) * {nrb} * 3) * 192 + i * 64));
+    for (int gg = g0; gg <= g1; gg++) {{
+      int p = (gg - g0) & 1;
+      if (gg + 1 <= g1) {{
+        if (p == 0) {{ DMA_FILL(1, DESC(desc, 0), {LB + 1536}, (int)(x + ((gg + 1) * {nrb} * 3) * 192 + i * 64)); DMA_FILL(3, DESC(desc, 0), {LB + 2304}, (int)(x + ((gg + 1 + {GU}) * {nrb} * 3) * 192 + i * 64)); }}
+        else {{ DMA_FILL(0, DESC(desc, 0), {LB}, (int)(x + ((gg + 1) * {nrb} * 3) * 192 + i * 64)); DMA_FILL(2, DESC(desc, 0), {LB + 768}, (int)(x + ((gg + 1 + {GU}) * {nrb} * 3) * 192 + i * 64)); }}
+      }}
+      if (p == 0) {{ DMA_WAIT(0); DMA_WAIT(2); }} else {{ DMA_WAIT(1); DMA_WAIT(3); }}
+      __global float* G = LSF({LB} + p * 1536); __global float* P = G + 192;
+      int c0 = gg * 48 > cb ? gg * 48 : cb, c1 = (gg + 1) * 48 < cb + {B} ? (gg + 1) * 48 : cb + {B};
+      for (int col = c0; col < c1; col += 4) {{
+        int o = ((col % 48) / 16) * 64 + ((col % 16) / 4) * 16, k = col - cb;
+        float8 t01 = sw(*(__global float8*)(G + o), *(__global float8*)(P + o)){sg}, t23 = sw(*(__global float8*)(G + o + 8), *(__global float8*)(P + o + 8)){sg};{acc}
+        {put("k", "t01", "t23")}
+      }}
+    }} }}"""
+    gathers = "".join(gather(j, j == 0) for j in range(g))
+    nq = -(-real // 4); assert LB + 3072 <= 32768 - 64
+    return V.FULL_H + TILE + EXP + H8 + f"""
+__kernel void had_rows(__global float* restrict out, __global float* restrict x, __global int* restrict desc, const int core_id) {{
+  __global float* L = LSF(0);
+  for (int u = core_id; u < {nq * nb}; u += {NT}) {{
+    int i = u / {nb}, b = u % {nb}; int nr = {real} - 4 * i; nr = nr > 4 ? 4 : nr;{sgs}{gathers}
+    for (int r = 0; r < nr; r++) {{{stages(f"L + r * {B}")}
+      for (int k = 0; k < {B}; k += 8) *(__global float8*)(out + (4 * i + r) * {c} + b * {B} + k) = *(__global float8*)(L + r * {B} + k){scale};
+    }}
+  }}
+}}"""
+  if False:
     # the gate | up tiles of the unit's quad by DMA, a group at a time: the quad's 3 sub-tile pieces (64 floats = [4 rows][16 cols], 256 B,
     # DDR pitch 768 B) of the gate's group and of the up's (c / 48 groups later), double-buffered; the block's columns of the group
     # then feed the same sw() / shuffle arithmetic as the plain path (the same bits). LSRAM: L [4][B] then 2 x 2 x 768 B of pieces.
@@ -505,11 +549,20 @@ __kernel void had_rows(__global float* restrict out, __global float* restrict x,
     }}
   }}
 }}"""
-  CB = c * 4
+  CB = c * 4; WB4 = B * 4
   inv = (f"""float8 acc = BC(0.0f); for (int k = 0; k < {c}; k += 8) {{ float8 v = *(__global float8*)(X + k); acc += v * v; }}
     float inv = 1.0f / __builtin_sqrtf(hsum8(acc) * {1.0 / c!r}f + {eps!r}f);""" if mode == "rms" else "float inv = 1.0f;")
   post_loop = f"""
     for (int k = 0; k < {B}; k += 8) *(__global float8*)(Lr + k) = *(__global float8*)(Lr + k){scale};""" if scale else ""
+  # the mix over the g sub-blocks, a sub-block's weights by DMA (slot 1, flags 1 / 2 alternating), accumulated left to right as had_a32's
+  # single expression evaluates: t_0, then + t_1, ... (the same fp32 operations in the same order)
+  terms = []
+  for j, (o, sj) in enumerate(mix):
+    t = f"*(__global float8*)(X + {o} + k) * BC(inv) * *(__global float8*)(Wj + k)" + ("" if g == 1 else f" * BC({sj})")
+    terms.append(f"""
+    DMA_FILL({1 + j % 2}, DESC(desc, 1), {CB + WB4} + {(j % 2) * WB4}, (int)(w + {o})); DMA_WAIT({1 + j % 2}); {{ __global float* Wj = LSF({CB + WB4} + {(j % 2) * WB4});
+    for (int k = 0; k < {B}; k += 8) *(__global float8*)(Lr + k) = {"" if j == 0 else "*(__global float8*)(Lr + k) + "}{t}; }}""")
+  assert CB + WB4 + 2 * WB4 <= 32768 - 64, "had_rows: the row, the block and two weight sub-blocks in LSRAM"
   return V.FULL_H + TILE + H8 + f"""
 __kernel void had_rows(__global float* restrict out, __global float* restrict x, __global float* restrict w{", __global int* restrict idx" if stacked else ""}, __global int* restrict desc, const int core_id) {{
 {"  w += idx[0] * %d;" % c if stacked else ""}
@@ -517,9 +570,8 @@ __kernel void had_rows(__global float* restrict out, __global float* restrict x,
   for (int u = core_id; u < {real * nb}; u += {NT}) {{
     int r = u / {nb}, b = u % {nb};{sgs}
     DMA_FILL(0, DESC(desc, 0), 0, (int)(x + r * {c})); DMA_WAIT(0);
-    {inv}
-    for (int k = 0; k < {B}; k += 8) *(__global float8*)(Lr + k) = {" + ".join(f"*(__global float8*)(X + {o} + k) * BC(inv) * *(__global float8*)(w + {o} + k)" + ("" if g == 1 else f" * BC({sj})") for o, sj in mix)};{stages("Lr")}{post_loop}
-    DMA_DRAIN(1, DESC(desc, 1), {CB}, (int)(out + r * {c} + b * {B})); DMA_WAIT(1);
+    {inv}{"".join(terms)}{stages("Lr")}{post_loop}
+    DMA_DRAIN(0, DESC(desc, 1), {CB}, (int)(out + r * {c} + b * {B})); DMA_WAIT(0);
   }}
 }}"""
 
@@ -3731,7 +3783,7 @@ class Kernels:
         k = self.key(f"had_a32d|fast|rec|{mode}|{c}|{self.real}|{self.had_post}", HF.had_fast_src(mode, c, self.nrb, self.eps, self.real, stacked=True, post=self.had_post, opts=op))
         d = self.desc(f"had_a32d_desc|fast|rec|{mode}|{c}", lambda: HF.had_fast_desc(mode, c, self.nrb, self.real, opts=op))
         return self.run(k, tag, self.a_size(c), dtypes.uint16, x, *ws, self.bufs[rs[0]], d)
-      if self.compact and os.environ.get("QWEN_HAD_ROWS", "1" if self.had_b != HAD_B else "0") == "1":   # had_rows on every task, then the plain packer (default on for the 512 block, which had no DMA / fast producer)
+      if self.compact and os.environ.get("QWEN_HAD_ROWS", "1" if (self.had_b != HAD_B or self.had_g > 1) else "0") == "1":   # had_rows on every task, then the plain packer (default on for the 512 block, which had no DMA / fast producer)
         k = self.key(f"had_rows|{mode}|{c}|{self.real}|{st}|{self.had_post}|{self.had_g}|{self.had_b}", had_rows_src(mode, c, self.nrb, self.eps, self.real, stacked=st and norm, post=self.had_post, g=self.had_g, hb=self.had_b))
         rows = self.run(k, f"hadrows|{c}", self.rows * c, dtypes.float32, x, *ws, self.desc(f"had_rows_desc|{c}|{self.had_b}", lambda: had_rows_desc(c, self.had_b))).reshape(self.rows, c)
         saved = self.had; self.had = None
@@ -3800,9 +3852,9 @@ class Kernels:
         return self.run(self.key(f"{ACTS[act][1]}_a32d|{m_}|{self.real}", swiglu_a32d_src(m_, self.nrb, self.real, act)), tag, self.a_size(m_), dtypes.uint16, ct, self.bufs[dk])
       k = self.key(f"{ACTS[act][1]}_a32|{m_}|{self.real}|{self.compact}", swiglu_a32_src(m_, self.nrb, real=self.real, compact=self.compact, act=act))
       return self.run(k, tag, self.a_size(m_), dtypes.uint16, ct)
-    if self.had is not None and self.compact and os.environ.get("QWEN_HAD_ROWS", "1" if self.had_b != HAD_B else "0") == "1":   # had_rows (swiglu from the tiles), then the plain packer
+    if self.had is not None and self.compact and os.environ.get("QWEN_HAD_ROWS", "1" if (self.had_b != HAD_B or self.had_g > 1) else "0") == "1":   # had_rows (swiglu from the tiles), then the plain packer
       k = self.key(f"had_rows|swiglu|{m_}|{self.real}|{self.had_post}|{self.had_g}|{self.had_b}", had_rows_src("swiglu", m_, self.nrb, self.eps, self.real, post=self.had_post, g=self.had_g, hb=self.had_b))
-      ex = (self.desc("had_rows_sw_desc", had_rows_sw_desc),) if self.had_g == 1 and m_ % 48 == 0 else ()   # the DMA gather (else the plain tile loads: the 27B's 17408)
+      ex = (self.desc("had_rows_sw_desc", had_rows_sw_desc),) if m_ % 48 == 0 else ()   # the DMA gather (else the plain tile loads: the 27B's 17408)
       rows = self.run(k, f"hadrows|{m_}", self.rows * m_, dtypes.float32, ct, *ex).reshape(self.rows, m_)
       saved = self.had; self.had = None
       try: return self.rms_a(rows, None, m_, tag, norm=False)
