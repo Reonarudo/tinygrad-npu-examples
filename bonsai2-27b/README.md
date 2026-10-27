@@ -440,9 +440,43 @@ Where the 9B's 282 ms at 8 users go: the GEMMs ~120 ms over its 32 layers (its 2
 floor), the batched DeltaNet kernel ~50 (2.1 ms a layer: 11 head groups x 8 rows of units, each re-fetching its a | b weight chunks),
 the producers ~45 (swiglu_a's four-sub-block gather 0.94 ms a layer), the rest residuals, unpacks and the jobs' gaps.
 
+**Where the step stands against the port** (`BATCH_PROF=1`: the host, each 4-layer job and the head timed with a sync after each; the
+2B at 8 users: jobs 13.4-13.7 ms each, the head 11.2, the host ~2.5; at 1 user jobs 7.3, the head 7.3). A step's bytes are the weights
+(0.54 GB for the 2B, 1.2 the 4B, 2.2 the 9B) plus the DeltaNet states, read and written once a user a layer (1 MB a layer on the 2B,
+2 MB on the 4B / 9B: 0.29 / 0.6 / 0.77 GB at 8 users), so the 8-user floors at 23 GB/s are 36 / 78 / 130 ms against 85-90 / 165 / 282
+measured: ~40-47 %. Inside that: the GEMMs run at 16-20 GB/s (the gu GEMM 0.43 ms for 6.3 MB at 8 rows), the batched DeltaNet kernel
+at ~80 % of the port for its state traffic (its a | b phase is 10-20 % of it: `gdn_diag_bench.py`), the head at its bytes at 1 row and
++4 ms for 8. The rest is the producers (~12 ms a step on the 2B), residuals / unpacks (~2), and the gaps between the ~15 launches a layer
+(~0.6 ms a layer, ~15 % of the step; eight layers a job instead of four changes nothing, so the gaps are per launch, not per job).
+Pairing the conv staging's requests on two flags changed nothing either: that phase is its bytes.
+
 **Why batching and speculative decoding are not combined here.** A row spent on a draft returns a token ~45 % of the time, a row
 spent on another user's token always; with the row costs above, plain batching beats any mix of users and drafts in a pass on this
 model. The combination pays on models whose rows are nearly free (the Q8_0 Gemma 4 E2B: a 7-row verify pass costs 1.07 plain steps).
+
+## Serving the smaller sizes, and several users at once
+
+`QWEN_MODEL=bonsai2-2b python3 bonsai2_serve.py --port 8000` (or -4b / -9b) serves that size over the same OpenAI- and Ollama-compatible
+endpoint as the 27B, with its own drafter (speculative decoding, the tokens of plain greedy): one request at a time, others queue.
+Board o6n, 2026-10-27, a 22-token prompt and a 23-token answer: the 9B in 3.1 s wall, the 4B 2.1 s, the 2B under 2 s.
+
+`bonsai2_batch_serve.py` is the same endpoint with concurrent requests **batched into one decode step** (the loop of `bonsai2_batch.py`
+behind a slot scheduler): up to `--users` requests advance together, each in a slot with its own DeltaNet states, conv ring, K / V cache
+and position; a new request takes a free slot (its state zeroed), its prompt goes in a token a step, then it decodes plain greedy and
+streams. The step costs the geometry's whatever the number of busy slots (the 2B: ~50 ms at 4 slots, ~75 at 8), so one user sees one
+token a step and N users N. Context 512 (the batched attention kernel's scores live in LSRAM). Board o6n, the 2B, `curl`s in parallel,
+wall time including each request's prompt steps:
+
+| slots | requests | completion tokens | wall | aggregate (prefill included) | decode alone |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 4 | 1 | 22 | 2.2 s | 10 tok/s | 20 tok/s a step |
+| 4 | 4 | 166 | 3.6 s | **46.5 tok/s** | 60-84 tok/s |
+| 4 | 6 (two wait) | 181 | 5.2 s | 34.8 tok/s | |
+| 8 | 8 | 346 | 6.3-6.8 s | **51-55 tok/s** | 94-112 tok/s |
+| 8 | 1 | 22 | 3.1 s | 7.1 tok/s | 12 tok/s a step |
+
+So: `bonsai2_serve.py` for one user at a time (speculative, ~30 tok/s on the 2B), `bonsai2_batch_serve.py --users 4` when several agents
+or users share the board (each at 15-20 tok/s while 4 run, ~60 in all). The two are separate processes; the NPU time-slices them.
 
 ## How it works
 

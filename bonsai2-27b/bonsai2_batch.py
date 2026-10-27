@@ -150,7 +150,7 @@ class Batch:
 
   def step(self, toks, pos):
     """toks [N] at positions pos [N] -> the next token of each user."""
-    M, L, N = self.M, self.L, self.N
+    M, L, N = self.M, self.L, self.N; t_in = time.perf_counter()
     x = np.zeros((L.R, R.H), np.float32); x[:N] = M.W.embed([int(t) for t in toks]); poke(self.X[0], x)
     poke(self.ptab, np.array(pos, np.int32))
     for i in range(M.NATT): poke(self.atab[i], np.array(sum(([u * M.NATT + i, pos[u]] for u in range(N)), []), np.int32))
@@ -159,6 +159,8 @@ class Batch:
       for i in range(M.NATT): poke(self.aix[u][i], np.array([u * M.NATT + i, pos[u]], np.int32))
     if BATCHK and BLK > 1 and R.NL % BLK == 0 and BLK % 2 == 0:            # layer blocks: BLK layers a job, each in a window slot of its own
       from qwen38_generate import one_job
+      prof = os.environ.get("BATCH_PROF") == "1"; tp = [time.perf_counter()]
+      if prof: from tinygrad import Device; Device[DEV].synchronize(); tp.append(time.perf_counter())
       L.block_slots(BLK)
       for b in range(R.NL // BLK):
         bp = b % 2; types = tuple(R.LAYER_TYPES[b * BLK + j] for j in range(BLK)); args = []
@@ -172,7 +174,15 @@ class Batch:
         if jit.cnt < 2:
           with one_job(): jit(self.ptab, *args)
         else: jit(self.ptab, *args)
+        if prof:
+          Device[DEV].synchronize(); tp.append(time.perf_counter())
+          if b == 0 and jit.cnt >= 2 and not getattr(self, "_prof_once", False):
+            import collections; self._prof_once = True; names = collections.Counter(getattr(getattr(ei, "prg", None), "name", type(ei).__name__)[:28] for ei in jit.jit_cache)
+            print(f"      prof: a block of {BLK} layers ({types}) = {len(jit.jit_cache)} launches: {dict(names)}", flush=True)
       ids, _ = M.head_top(self.X[R.NL % 2], L)
+      if prof:
+        Device[DEV].synchronize(); tp.append(time.perf_counter()); d = np.diff(tp) * 1e3
+        print(f"      prof: host (embed + pokes) {d[0]:.1f} ms | blocks {' '.join(f'{v:.1f}' for v in d[1:-1])} ms | head {d[-1]:.1f} ms | total {(tp[-1] - tp[0]) * 1e3:.1f}", flush=True)
       return [int(v) for v in ids[:N]]
     L.prefetch(0)
     for l in range(R.NL):
