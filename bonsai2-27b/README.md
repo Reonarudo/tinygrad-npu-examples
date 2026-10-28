@@ -507,13 +507,16 @@ ASID holds its layers' caches, up to the model's own 262144 (`QWEN_TMAX_MAX`):
 
 | server, caches in ASIDs 1-3 | 2B | 4B / 9B |
 | --- | ---: | ---: |
-| `bonsai2_serve.py` (speculative, one user) | 258048 | 97280 |
+| `bonsai2_serve.py` (speculative, one user) | 262144 (the model's own) | 130048 |
 | `bonsai2_batch_serve.py --users 4` | 98304 | 31744 |
 | `bonsai2_batch_serve.py --users 8` | 48128 | ~15k |
 
+(The drafter's cache takes a buffer of its own in whichever ASID has room, else the ASID 0 window: that is what lets the 2B's six
+layers fill the three ASIDs to the model's full 262144.)
+
 The capacity is there; the time is the other half. The prefill runs 4 tokens a pass and the attention reads the whole cache every
 pass and every token at the port's 23 GB/s (24 KiB a position on the 2B, 64 KiB on the 4B / 9B), so a 25363-token prompt took the
-2B's speculative server 543 s at a 258048 context (47 tok/s of prefill, slowing with depth), and a decode step at 100k positions reads
+2B's speculative server 543 s at a 258048 context (262144 now) (47 tok/s of prefill, slowing with depth), and a decode step at 100k positions reads
 2.4 GB of cache on the 2B -- about 100 ms a token before the weights. The answer to the counting question was also wrong at that
 depth ("100 days" for 480 paragraphs) where it was right at 6283 tokens: the model's doing, not the kernels'. Fewer bytes a position
 (an fp16 or quantized cache) is the lever for the time; the address spaces only gave the room.

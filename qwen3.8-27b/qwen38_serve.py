@@ -207,10 +207,10 @@ def asid_count():
 
 def asid_tmax(users, natt, nkv, hd, mtp=True, want=65536, nasid=None):
   """The caches in ASIDs 1-3 (QWEN_KV_ASID): the largest multiple of 1024 up to `want` whose fullest ASID (ceil(natt / nasid) layers x
-  max(1, users) regions, + the drafter's in ASID 1) holds its [K | V] in 3 GiB -> (tmax, that ASID's GB). nasid: the ASIDs that
-  allocate (asid_count; the stock KMD: 1)."""
+  max(1, users) regions) holds its [K | V] in 3 GiB -> (tmax, that ASID's GB); the drafter's cache takes a buffer of its own where
+  there is room. nasid: the ASIDs that allocate (asid_count; the stock KMD: 1)."""
   na = asid_count() if nasid is None else nasid
-  row = nkv * hd * 4; regs = max(-(-natt // na) * max(1, users) + (1 if mtp else 0), 1); cap = 3 * 2**30 - (16 << 20)
+  row = nkv * hd * 4; regs = max(-(-natt // na) * max(1, users), 1); cap = 3 * 2**30 - (16 << 20)   # (the drafter's region has a buffer of its own)
   t = min(want, cap // (2 * regs * row) // 1024 * 1024); return max(1024, t), 2 * regs * row * t / 1e9
 
 

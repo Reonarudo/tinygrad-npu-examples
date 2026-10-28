@@ -157,7 +157,7 @@ class KVAsid:
     self.raw, self.natt, self.users, self.tmax, self.rowf, self.mtp = raw, natt, users, tmax, rowf, mtp
     self.na = KVAsid.available(raw) if nasid is None else nasid; assert self.na, "QWEN_KV_ASID: no ASID beyond 0 allocates"
     self.nl = [len([i for i in range(natt) if i % self.na == a]) for a in range(3)]        # layers in ASID 1 + a
-    self.regions = [self.nl[a] * users + (1 if mtp and a == 0 else 0) for a in range(3)]   # tmax-row regions a buffer holds
+    self.regions = [self.nl[a] * users for a in range(3)]                                  # tmax-row regions a buffer holds (the MTP's apart)
     self.KB = [(r * tmax + ATT_BT) * rowf * 4 for r in self.regions]; t0 = time.perf_counter(); self.bufs, self.views = [None] * 3, [None] * 3
     # ASID 3 first, then 2, then 1: the KMD's IOVA allocator searches downward from its cached 64-bit node (device-wide), so a
     # request in a higher ASID made after a lower one's lands in the lower range and is refused ("IOVA ... outside ASID n range")
@@ -168,13 +168,23 @@ class KVAsid:
       except OSError as e: raise MemoryError(f"KV ASID {1 + a}: {2 * self.KB[a] / 1e9:.2f} GB: {e}") from e
       self.bufs[a] = b
       self.views[a] = (Tensor.from_blob(b.pa, (self.KB[a] // 4,), dtype=dtypes.float32, device=DEV), Tensor.from_blob(b.pa + self.KB[a], (self.KB[a] // 4,), dtype=dtypes.float32, device=DEV))
-    print(f"   KV in ASID{'s 1-3' if self.na == 3 else ' 1'}: {natt} layers x {users} user(s) x {tmax} positions{' + the drafter' if mtp else ''}: "
-          f"{' / '.join(f'{2 * kb / 1e9:.2f}' for kb in self.KB[:self.na])} GB (3 GiB each), none of the ASID0 window, in {time.perf_counter() - t0:.1f} s", flush=True)
-  def base(self, i): return 1 + (i % self.na if i < self.natt else 0)       # the DMA base code of attention layer i (the MTP's: 1)
-  def kv(self, i): return self.views[(i % self.na) if i < self.natt else 0]  # (K view, V view) of layer i's ASID (the MTP's: ASID 1)
+    # the MTP drafter's cache: one region of its own, in the ASID with room (3 GiB less the layers'), else a plain ASID0 buffer (base 0)
+    self.mbase, self.mviews = None, None
+    if mtp:
+      mkb = (tmax + ATT_BT) * rowf * 4; room = lambda a: 3 * 2**30 - (16 << 20) - (2 * self.KB[a] if a < self.na else 0)
+      for a in [a for a in (2, 1, 0) if room(a) >= 2 * mkb] + [-1]:
+        try: mb = raw.req_buf(2 * mkb, asid=1 + a if a >= 0 else 0); self.mbase = 1 + a if a >= 0 else 0; break
+        except OSError as e:
+          if a < 0: raise MemoryError(f"the drafter's cache ({2 * mkb / 1e9:.2f} GB): {e}") from e
+      self.mbuf = mb; self.mviews = (Tensor.from_blob(mb.pa, (mkb // 4,), dtype=dtypes.float32, device=DEV), Tensor.from_blob(mb.pa + mkb, (mkb // 4,), dtype=dtypes.float32, device=DEV))
+    print(f"   KV in ASID{'s 1-3' if self.na == 3 else ' 1'}: {natt} layers x {users} user(s) x {tmax} positions: "
+          f"{' / '.join(f'{2 * kb / 1e9:.2f}' for kb in self.KB[:self.na])} GB (3 GiB each){f'; the drafter' + chr(39) + 's ' + f'{2 * (tmax + ATT_BT) * rowf * 4 / 1e9:.2f} GB in ASID {self.mbase}' if mtp else ''}, "
+          f"{'none' if not mtp or self.mbase else 'only the drafter' + chr(39) + 's'} of the ASID0 window, in {time.perf_counter() - t0:.1f} s", flush=True)
+  def base(self, i): return 1 + i % self.na if i < self.natt else self.mbase   # the DMA base code of attention layer i (the MTP's: its buffer's ASID)
+  def kv(self, i): return self.views[i % self.na] if i < self.natt else self.mviews   # (K view, V view) of layer i's ASID (the MTP's: its own)
   def cidx(self, i, u):
-    """idx[2] of attention layer i for user u: its region in the ASID's buffer (the MTP, i == natt: the last region of ASID 1)."""
-    return self.nl[0] * self.users if i >= self.natt else (i // self.na) * self.users + u
+    """idx[2] of attention layer i for user u: its region in the ASID's buffer (the MTP, i == natt: its own buffer's one region)."""
+    return 0 if i >= self.natt else (i // self.na) * self.users + u
   def host(self, i, u=0):
     """Layer i's cache rows of user u as host arrays (K, V) [tmax + ATT_BT][rowf] (the device's writes made visible first)."""
     import ctypes; a = i % self.na; b = self.bufs[a]; self.raw.cache_invalidate(b); r = self.cidx(i, u) * self.tmax * self.rowf * 4; n = (self.tmax + ATT_BT) * self.rowf * 4
@@ -738,7 +748,7 @@ class Model:
     return out
   def vatt_step(self, m, par, kvb, aix, *rest):
     """kvb: the cache's DMA base code (the caches in ASIDs: the layer's ASID, whose views the kernel gets; 0: the stacks). The JIT is keyed by it."""
-    L = self.vers[m]; Kall, Vall = self.kvs.views[kvb - 1] if self.kvs else (self.Kall, self.Vall); slot = dict(zip(self.ATT_LIN, rest[:len(self.ATT_LIN)])); x = self.xbvs[m][par]; ah = L.K.hold("aix_held", aix)
+    L = self.vers[m]; Kall, Vall = self.kvs.views[kvb - 1] if self.kvs and kvb else (self.Kall, self.Vall); slot = dict(zip(self.ATT_LIN, rest[:len(self.ATT_LIN)])); x = self.xbvs[m][par]; ah = L.K.hold("aix_held", aix)
     a_h = L.K.rms_a(x, (self.Win_a, ah), R.H, "a_h"); ct = L.lin_cts(a_h, slot, self.meta_att, ("q", "kv"))   # one GEMM when fused
     q_rows = L.K.unpack(ct["q"][0], R.NH * 2 * R.HD, "q_rows", goff=ct["q"][1])
     kv_rows = L.K.unpack(ct["kv"][0], 2 * R.NKV * R.HD, "kv_rows", goff=ct["kv"][1])
@@ -1168,7 +1178,7 @@ class Model:
     a_h = L.K.rms_a(x, (self.Win_a, ah), R.H, "a_h"); ct = L.lin_cts(a_h, slot, self.meta_att, ("q", "kv"))   # one GEMM when fused
     q_rows = L.K.unpack(ct["q"][0], R.NH * 2 * R.HD, "q_rows", goff=ct["q"][1])
     kv_rows = L.K.unpack(ct["kv"][0], 2 * R.NKV * R.HD, "kv_rows", goff=ct["kv"][1])
-    oc = L.K.attn_dec2(q_rows, kv_rows, self.QN, self.KN, self.ROPE, *(self.kvs.views[kvb - 1] if self.kvs else (self.Kall, self.Vall)), ah, R.NH, R.NKV, R.HD, self.TMAX, R.ROT, nidx=bool(self.kvs), kvb=kvb)
+    oc = L.K.attn_dec2(q_rows, kv_rows, self.QN, self.KN, self.ROPE, *(self.kvs.views[kvb - 1] if self.kvs and kvb else (self.Kall, self.Vall)), ah, R.NH, R.NKV, R.HD, self.TMAX, R.ROT, nidx=bool(self.kvs), kvb=kvb)
     x = L.K.resid(x, L.lin_ct(L.K.rms_a(oc, None, R.NH * R.HD, "a_o", norm=False), slot, self.meta_att, "o"), R.H, "x1")
     return L.mlp(x, slot, self.meta_att, (self.Wpost_a, ah), f"xio{1 - par}").realize()
 
