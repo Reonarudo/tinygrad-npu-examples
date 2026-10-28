@@ -38,30 +38,32 @@ PRE = "prefilling"                                                           # a
 class BatchEngine:
   def __init__(self, a):
     self.cpus, self.lat = QG.pin_cpus(), QG.hold_cpu_latency()
-    self.tok = Tok(os.environ.get("QWEN_TOK", a.dir)); self.tmax, self.N, self.jobs = a.tmax, a.users, queue.Queue()
+    self.tok = Tok(os.environ.get("QWEN_TOK", a.dir)); self.tmax, self.N, self.jobs, self.dir = a.tmax, a.users, queue.Queue(), a.dir
     t0 = time.perf_counter(); self.M = QG.Model(1, a.cache, a.dir, a.tmax, a.pin_gb); self.B = BB.Batch(self.M, a.users, a.tmax)
     self.slots = [None] * a.users; self.lock = threading.Lock()
     NG = self.M.NGDN; self.ssz, self.csz = NG * R.NV * R.DK * R.DV, NG * R.CONV * self.B.CP
     self.B.step([0] * a.users, [0] * a.users)                              # the graphs captured before the first request
     print(f"   model set up in {time.perf_counter() - t0:.0f} s; {a.users} slots; host CPUs {self.cpus}; CPU latency {self.lat}", flush=True)
-  def submit(self, ids, max_new, stop):
-    q = queue.Queue(); self.jobs.put((list(ids), max_new, stop, q)); return q
+  vision, decode_images, embed_images, prompt = S.Engine.vision, S.Engine.decode_images, S.Engine.embed_images, S.Engine.prompt   # images: the vision tower, the template with the placeholders (qwen38_serve)
+  def submit(self, ids, max_new, stop, vis=None):
+    """`vis`: the prompt's images [(start, pixels, nx, ny)] (prompt()); they go through the chunked prefill whatever the length."""
+    q = queue.Queue(); self.jobs.put((list(ids), max_new, stop, q, vis)); return q
   def _short(self, u, job):
     """Slot u takes a short prompt: its DeltaNet states and rings zeroed, the prompt's ids go in a token a step from position 0."""
-    ids, max_new, stop, q = job
+    ids, max_new, stop, q, _ = job
     self.B.Sall[u * self.ssz:(u + 1) * self.ssz].assign(Tensor.zeros(self.ssz, device=BB.DEV)).realize()
     self.B.Call[u * self.csz:(u + 1) * self.csz].assign(Tensor.zeros(self.csz, device=BB.DEV)).realize()
-    self.slots[u] = dict(ids=ids, k=0, out=[], max_new=max(1, min(max_new, self.tmax - len(ids) - 1)), stop=stop, q=q, pos=0, sent="", t0=time.perf_counter(), tf=None)
+    self.slots[u] = dict(ids=ids, k=0, out=[], max_new=max(1, min(max_new, self.tmax - len(ids) - 1)), stop=stop, q=q, pos=0, delta=0, sent="", t0=time.perf_counter(), tf=None)
   def _start(self, job):
     """A job's prompt starts through the model's chunked prefill (one at a time) for the free slot it reserves (PRE): -> the
     in-flight record. The caches in ASIDs: the model prefills straight into that user's cache (kv_user)."""
-    ids, max_new, stop, q = job; u = self.slots.index(None); self.slots[u] = PRE
-    M = self.M; M.kv_user = u; M.prefill_prelude(); M.spec_meta = dict(prompt="(server)", n_prompt=len(ids), thinking=False, prompt_ids=[int(v) for v in ids])
-    return dict(job=job, gen=M.prefill_chunks(ids), t0=time.perf_counter(), u=u)
+    ids, max_new, stop, q, vis = job; u = self.slots.index(None); self.slots[u] = PRE
+    M = self.M; M.kv_user = u; M.set_vision(ids, self.embed_images(vis)); M.prefill_prelude(); M.spec_meta = dict(prompt="(server)", n_prompt=len(ids), thinking=False, prompt_ids=[int(v) for v in ids])
+    return dict(job=job, gen=M.prefill_chunks(ids), t0=time.perf_counter(), u=u, delta=M.pos_delta)   # delta: the m-RoPE counter's lag after the images (0 without)
   def _place(self, pre):
     """The prefilled prompt into slot u: the model's DeltaNet states, rings and the prompt's K / V rows copied (the model's own
     stacks were the prefill's), the first token emitted; the slot decodes from position n."""
-    ids, max_new, stop, q = pre["job"]; M, B, n, u = self.M, self.B, len(pre["job"][0]), pre["u"]; NA = M.NATT; rs = R.NKV * R.HD
+    ids, max_new, stop, q, _ = pre["job"]; M, B, n, u = self.M, self.B, len(pre["job"][0]), pre["u"]; NA = M.NATT; rs = R.NKV * R.HD
     M.flush()                                                             # (the deferred commit: the last pass's state updates into Sall)
     B.Sall[u * self.ssz:(u + 1) * self.ssz].assign(M.Sall).realize(); B.Call[u * self.csz:(u + 1) * self.csz].assign(M.Call).realize()
     if not M.kvs:
@@ -69,7 +71,7 @@ class BatchEngine:
         src, dst = i * M.TMAX * rs, (u * NA + i) * self.tmax * rs
         B.Kall[dst:dst + n * rs].assign(M.Kall[src:src + n * rs]).realize(); B.Vall[dst:dst + n * rs].assign(M.Vall[src:src + n * rs]).realize()
     first = int(np.argmax(M.prefill_lg))
-    s = self.slots[u] = dict(ids=ids, k=n, out=[], max_new=max(1, min(max_new, self.tmax - n - 1)), stop=stop, q=q, pos=n, sent="", t0=pre["t0"], tf=None)
+    s = self.slots[u] = dict(ids=ids, k=n, out=[], max_new=max(1, min(max_new, self.tmax - n - 1)), stop=stop, q=q, pos=n, delta=pre["delta"], sent="", t0=pre["t0"], tf=None)
     if self._emit(s, first): self.slots[u] = None
   def _emit(self, s, t):
     """Token t into slot s's output: the text's new suffix streamed; done on <eos>, a stop string or max_tokens -> True when finished."""
@@ -89,7 +91,7 @@ class BatchEngine:
     """The next waiting job: rejected (too long), or placed in a free slot (short), or started on the chunked prefill (-> its record)."""
     job = self.jobs.get_nowait(); ids = job[0]
     if len(ids) + 1 > self.tmax: job[3].put(("error", f"the prompt ({len(ids)} tokens) does not fit the context ({self.tmax})")); return None
-    if len(ids) < PREFILL_MIN: self._short(self.slots.index(None), job); return None
+    if len(ids) < PREFILL_MIN and job[4] is None: self._short(self.slots.index(None), job); return None
     return self._start(job)
   def _busy(self): return [s for s in self.slots if s is not None and s is not PRE]
   def serve_jobs(self):
@@ -104,12 +106,12 @@ class BatchEngine:
           if next(pre["gen"]) >= len(pre["job"][0]): self._place(pre); pre = None   # (the last pass yields the prompt's length)
         except Exception as e: pre["job"][3].put(("error", f"{type(e).__name__}: {e}")); print(f"   prefill failed: {e!r}", flush=True); self.slots[pre["u"]] = None; pre = None
       if not self._busy(): continue
-      toks, pos = [], []
+      toks, pos, rpos = [], [], []
       for s in self.slots:
-        if s is None or s is PRE: toks.append(0); pos.append(0)
-        elif s["k"] < len(s["ids"]): toks.append(s["ids"][s["k"]]); pos.append(s["pos"])
-        else: toks.append(s["out"][-1]); pos.append(s["pos"])
-      try: nxt = self.B.step(toks, pos)
+        if s is None or s is PRE: toks.append(0); pos.append(0); rpos.append(0)
+        elif s["k"] < len(s["ids"]): toks.append(s["ids"][s["k"]]); pos.append(s["pos"]); rpos.append(s["pos"] - s["delta"])
+        else: toks.append(s["out"][-1]); pos.append(s["pos"]); rpos.append(s["pos"] - s["delta"])
+      try: nxt = self.B.step(toks, pos, rpos)
       except Exception as e:
         for u, s in enumerate(self.slots):
           if s is not None and s is not PRE: s["q"].put(("error", f"{type(e).__name__}: {e}")); self.slots[u] = None

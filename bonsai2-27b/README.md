@@ -400,7 +400,15 @@ Board o6n, 2026-10-28, the 2B at 8192 context, a 640 x 480 test image (`vision/t
 | the 9B | *a red circle positioned to the left of a blue square, with the text "RPU" visible in the bottom left corner*; "a green triangle"; its tower vs numpy: embeddings rel err 2.3e-2, cosine >= 0.94 |
 
 The tower runs on the engine's thread before the request's prefill, so an image costs its tower time plus the prompt's (300 tokens
-~5 s on the 2B). The batched server (`bonsai2_batch_serve.py`) does not take images yet. The 27B has no mmproj.
+~5 s on the 2B). The 27B has no mmproj.
+
+**The batched server** (`bonsai2_batch_serve.py`) takes images too: a prompt with images always goes through the chunked prefill
+(whatever its length), which writes the image rows and the m-RoPE table as above; once the slot decodes, its rope rows lag its cache
+positions by the images' delta (n_img - max(nx, ny) per image), so the batched attention kernel's index record grew a fourth word,
+the row's rope row (`attn_decb`: [layer, position, cache index, rope row]; gate `attn_long_sim.py --nidx --rshift 37`, bit-identical
+to attn_dec3 on a re-rowed table), and the batch steps read a default rope table of their own, since the model's holds a prompt's
+m-RoPE rows while a prefill is interleaved with the steps. Board, the 2B, 4 slots: two image prompts and two text prompts sent at
+once all answer correctly (the same words as the single-user server's) in 13-18 s wall each; a text prompt afterwards 1.4 s.
 
 ## Batched decode: several requests a step (`bonsai2_batch.py`)
 

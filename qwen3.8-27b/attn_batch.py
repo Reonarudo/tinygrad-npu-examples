@@ -3,15 +3,16 @@ INDEPENDENT rows in one launch. Row r: q_rows row r (pitch NH 2 HD: [q | gate] a
 the q / k norm weights at index idx[2 r], position idx[2 r + 1] (the per-user replicas: user x attention layers + layer), its output
 row r of o_rows (pitch NH HD). Units = (row, kv head, part) over the 12 tasks; the new k / v rows go into the cache from the unit
 itself (part 0) before its own reads, so every row's results are attn_dec3's bits (gate: sim/attn_batch_sim.py).
-args: attn_dec3's (o_rows, q_rows, kv_rows, qnw_all, knw_all, rope, Kall, Vall, idx [M][2] ([M][3] with nidx), desc)."""
+args: attn_dec3's (o_rows, q_rows, kv_rows, qnw_all, knw_all, rope, Kall, Vall, idx [M][2] ([M][4] with nidx), desc)."""
 from qwen38_kernels import NT
 import attn_gqa as AG
 
 
 def attn_decb_src(NH, NKV, HD, TMAX, ROT, eps, M, U=1, BT=2, nidx=False, kvb=0, kvh=False):
-  """`nidx`: idx [M][3] -- a row's layer (its norm weights), position and cache index. `kvb` / `kvh`: attn_dec3_src's (the cache's DMA base
-  code; fp16 caches)."""
-  src = AG.attn_dec3_src(NH, NKV, HD, TMAX, ROT, eps, U=U, BT=BT, nidx=nidx, kvb=kvb, kvh=kvh); CT = "__global half" if kvh else "__global float"; W = 3 if nidx else 2; g = NH // NKV; QR, KR, OR = NH * 2 * HD, 2 * NKV * HD, NH * HD; NU = NKV * U
+  """`nidx`: idx [M][4] -- a row's layer (its norm weights), position (the cache row written and the causal bound), cache index, and
+  its rope row (the position minus the user's image delta: Qwen-VL's m-RoPE counter lags the index by n_img - max(nx, ny) per image; a
+  text-only user's equals the position). `kvb` / `kvh`: attn_dec3_src's (the cache's DMA base code; fp16 caches)."""
+  src = AG.attn_dec3_src(NH, NKV, HD, TMAX, ROT, eps, U=U, BT=BT, nidx=nidx, kvb=kvb, kvh=kvh); CT = "__global half" if kvh else "__global float"; W = 4 if nidx else 2; g = NH // NKV; QR, KR, OR = NH * 2 * HD, 2 * NKV * HD, NH * HD; NU = NKV * U
   def rep(a, b, n=1):
     nonlocal src; assert src.count(a) == n, (a[:70], src.count(a)); src = src.replace(a, b)
   rep("__kernel void attn_dec2(", "__kernel void attn_decb(")
@@ -22,7 +23,7 @@ def attn_decb_src(NH, NKV, HD, TMAX, ROT, eps, M, U=1, BT=2, nidx=False, kvb=0, 
   new_head = (f"  for (int un = core_id; un < {M * NU}; un += {NT}) {{ int r = un / {NU}, kvh = (un % {NU}) / {U}, part = un % {U};\n"
               f"  int L = idx[{W} * r + {2 if nidx else 0}], pos = idx[{W} * r + 1];" + (f" int Ln = idx[{W} * r];\n" if nidx else "\n")
               + f"  {CT}* Kc = Kall + (L * {TMAX}) * {NKV * HD}; {CT}* Vc = Vall + (L * {TMAX}) * {NKV * HD};\n"
-              + f"  __global float* qnw = qnw_all + {'Ln' if nidx else 'L'} * {HD}; __global float* knw = knw_all + {'Ln' if nidx else 'L'} * {HD}; __global float* cs = rope + pos * {2 * ROT};\n" + cache_w)
+              + f"  __global float* qnw = qnw_all + {'Ln' if nidx else 'L'} * {HD}; __global float* knw = knw_all + {'Ln' if nidx else 'L'} * {HD}; __global float* cs = rope + {f'idx[{W} * r + 3]' if nidx else 'pos'} * {2 * ROT};\n" + cache_w)
   src = src[:i0] + new_head + src[i1:]
   rep(f"  int kvh = core_id / {U}, part = core_id % {U}, h0 = kvh * {g} + part *", f"  int h0 = kvh * {g} + part *")
   rep(f"(int)(q_rows + h0 * {2 * HD})", f"(int)(q_rows + r * {QR} + h0 * {2 * HD})")

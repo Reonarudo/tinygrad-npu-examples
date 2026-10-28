@@ -75,7 +75,8 @@ class Batch:
     self.x1 = [k.rows_buf("x_in", H) for k in self.K1]; self.O = K.rows_buf("o_gather", max(R.NV * R.DV, R.NH * R.HD))
     self.ct_u = {}; self.jits = {}
     self.gtab = [dev(np.array([u * NG + i for u in range(N)], np.int32)) for i in range(NG)]            # the users' state indices a layer
-    self.ptab = dev(np.zeros(N, np.int32)); self.atab = [dev(np.zeros(3 * N, np.int32)) for i in range(NA)]   # positions; [layer, pos, cache index] a user, a layer
+    self.ptab = dev(np.zeros(N, np.int32)); self.atab = [dev(np.zeros(4 * N, np.int32)) for i in range(NA)]   # positions; [layer, pos, cache index, rope row] a user, a layer
+    self.ROPE = dev(OA.host_invalidate(M.ROPE).numpy().copy())              # the default rope table of its own: the model's gets a prompt's m-RoPE rows while a batch step runs
 
   def tiles_for(self, name, n):
     if name not in self.ct_u: self.ct_u[name] = [k.buf(f"ct_{name}", n, dtypes.float32) for k in self.K1]
@@ -95,14 +96,14 @@ class Batch:
 
   def kv(self, kvb): return self.kvs.views[kvb - 1] if self.kvs else (self.Kall, self.Vall)
   def att_b(self, par, kvb, aix0, atab, *views):
-    """An attention layer on the N rows with the batched kernel: atab (int32 [N][3]: the users' [layer, position, cache index]); kvb: the
+    """An attention layer on the N rows with the batched kernel: atab (int32 [N][4]: the users' [layer, position, cache index, rope row]); kvb: the
     cache's DMA base code (the layer's ASID, whose views the kernel gets; 0: the buffers). The JIT is keyed by it."""
     M, L, K, N, H = self.M, self.L, self.L.K, self.N, R.H; X = self.X[par]; slot = dict(zip(M.ATT_LIN, views)); meta = self.meta_att; Kall, Vall = self.kv(kvb)
     a0 = K.hold("b_aix0", aix0); at = K.hold("b_atab", atab)
     a_h = K.rms_a(X, (M.Win_a, a0), H, "a_h"); ct = L.lin_cts(a_h, slot, meta, ("q", "kv")); QR, KR = R.NH * 2 * R.HD, 2 * R.NKV * R.HD
     q_rows = K.unpack(ct["q"][0], QR, "q_rows", goff=ct["q"][1]); kv_rows = K.unpack(ct["kv"][0], KR, "kv_rows", goff=ct["kv"][1])
     O = K.rows_buf("o_gather", max(R.NV * R.DV, R.NH * R.HD))
-    K.call(f"attn_decb|{N}|{self.TMAX}|nidx|{kvb}|{M.kvh}", AB.attn_decb_src(R.NH, R.NKV, R.HD, self.TMAX, R.ROT, R.EPS, N, nidx=True, kvb=kvb, kvh=M.kvh), O, q_rows, kv_rows, self.QN, self.KN, M.ROPE, Kall, Vall, at, K.desc("attn_dec3_desc", lambda: __import__("attn_gqa").attn_dec3_desc(R.NH, R.NKV, R.HD)))
+    K.call(f"attn_decb|{N}|{self.TMAX}|nidx|{kvb}|{M.kvh}", AB.attn_decb_src(R.NH, R.NKV, R.HD, self.TMAX, R.ROT, R.EPS, N, nidx=True, kvb=kvb, kvh=M.kvh), O, q_rows, kv_rows, self.QN, self.KN, self.ROPE, Kall, Vall, at, K.desc("attn_dec3_desc", lambda: __import__("attn_gqa").attn_dec3_desc(R.NH, R.NKV, R.HD)))
     a_o = K.rms_a(O, None, R.NH * R.HD, "a_o", norm=False)
     x1 = K.resid(X, L.lin_ct(a_o, slot, meta, "o"), H, "x1")
     return L.mlp(x1, slot, meta, (M.Wpost_a, a0), f"xiov{1 - par}").realize()
@@ -138,7 +139,7 @@ class Batch:
     q_rows = K.unpack(ct["q"][0], QR, "q_rows", goff=ct["q"][1]); kv_rows = K.unpack(ct["kv"][0], KR, "kv_rows", goff=ct["kv"][1])
     q1 = [k.rows_buf("q_rows", QR) for k in self.K1]; kv1 = [k.rows_buf("kv_rows", KR) for k in self.K1]
     K.call(f"rows_scatter|{QR}|{N}", rows_scatter_src(QR, N), q1[0], *q1[1:], q_rows); K.call(f"rows_scatter|{KR}|{N}", rows_scatter_src(KR, N), kv1[0], *kv1[1:], kv_rows)
-    outs = [self.K1[u].attn_dec2(q1[u], kv1[u], self.QN, self.KN, M.ROPE, *self.kv(kvb), ua[u], R.NH, R.NKV, R.HD, self.TMAX, R.ROT, nidx=True, kvb=kvb, kvh=M.kvh) for u in range(N)]
+    outs = [self.K1[u].attn_dec2(q1[u], kv1[u], self.QN, self.KN, self.ROPE, *self.kv(kvb), ua[u], R.NH, R.NKV, R.HD, self.TMAX, R.ROT, nidx=True, kvb=kvb, kvh=M.kvh) for u in range(N)]
     K.call(f"rows_gather|{R.NH * R.HD}|{N}", rows_gather_src(R.NH * R.HD, N), self.O, *[self.K1[u].bufs["o_rows"] for u in range(N)])
     a_o = K.rms_a(self.O, None, R.NH * R.HD, "a_o", norm=False)
     x1 = K.resid(X, L.lin_ct(a_o, slot, meta, "o"), H, "x1")
@@ -153,12 +154,13 @@ class Batch:
       else: n = 2 + len(M.GDN_LIN); out = self.gdn_b(j % 2, a[0], a[1], ptab, *a[2:n]); a = a[n:]
     return out
 
-  def step(self, toks, pos):
-    """toks [N] at positions pos [N] -> the next token of each user."""
-    M, L, N = self.M, self.L, self.N; t_in = time.perf_counter()
+  def step(self, toks, pos, rpos=None):
+    """toks [N] at positions pos [N] -> the next token of each user. `rpos` [N]: the users' rope rows (a user whose prompt held images:
+    the position minus its image delta; default the positions)."""
+    M, L, N = self.M, self.L, self.N; t_in = time.perf_counter(); rpos = list(pos) if rpos is None else rpos
     x = np.zeros((L.R, R.H), np.float32); x[:N] = M.W.embed([int(t) for t in toks]); poke(self.X[0], x)
     poke(self.ptab, np.array(pos, np.int32))
-    for i in range(M.NATT): poke(self.atab[i], np.array(sum(([i, pos[u], self.ci(u, i)] for u in range(N)), []), np.int32))
+    for i in range(M.NATT): poke(self.atab[i], np.array(sum(([i, pos[u], self.ci(u, i), rpos[u]] for u in range(N)), []), np.int32))
     for u in range(N):
       poke(self.posb[u], np.array([pos[u]], np.int32))
       for i in range(M.NATT): poke(self.aix[u][i], np.array([i, pos[u], self.ci(u, i)], np.int32))
