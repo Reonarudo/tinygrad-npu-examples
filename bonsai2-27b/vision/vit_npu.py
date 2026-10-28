@@ -65,8 +65,18 @@ class VisionNPU:
     dev = lambda a: Tensor(np.ascontiguousarray(a, np.float32).ravel(), device=DEV).realize()
     self.small = {k: dev(z[k]) for k in z.files if k not in ("meta_names", "meta", "n_layer", "cfg", "eps") and k != "v_position_embd_weight"}
     self.pos_np = z["v_position_embd_weight"]; self.mm2_bias = dev(np.pad(z["mm_2_bias"], (0, self.meta["mm2"][1] - z["mm_2_bias"].shape[0])))   # the bias over the padded columns
-    self.W = {n: Tensor(np.fromfile(os.path.join(cache, f"{n}.bin"), np.uint8), device=DEV).realize() for n in self.meta}
+    # The ~100 linears' panels (300-450 MB) stay on the HOST by default and go to one device staging buffer right before their GEMM
+    # (~0.1 s an image): the NPU's ASID 0 window (~2.75 GB for every process's buffers and window slots) is what bounds how many
+    # servers run side by side. QWEN_VISION_RESIDENT=1: the panels resident on the device, as before (no upload a GEMM).
+    self.resident = os.environ.get("QWEN_VISION_RESIDENT") == "1"
+    self.Wh = {n: np.fromfile(os.path.join(cache, f"{n}.bin"), np.uint8) for n in self.meta}
+    if self.resident: self.W = {n: Tensor(w, device=DEV).realize() for n, w in self.Wh.items()}
+    else: self.stage = Tensor.zeros(max(w.size for w in self.Wh.values()), dtype=dtypes.uint8, device=DEV).contiguous().realize()
     self.geo = {}
+  def panels(self, name):
+    """The linear's packed panels as a device tensor: resident, or uploaded into the staging buffer (its prefix view)."""
+    if self.resident: return self.W[name]
+    w = self.Wh[name]; st = self.stage[:w.size]; st.assign(Tensor(w, device=DEV)).realize(); return st
   def _geo(self, n):
     if n not in self.geo:
       nrb = max(2, -(-(-(-n // 12)) // 2) * 2); self.geo[n] = (nrb, 12 * nrb, QK.Kernels(nrb, 12 * nrb, self.eps, real=None))
@@ -77,7 +87,7 @@ class VisionNPU:
     return max(p for p in range(2, min(nrb, 28) + 1, 2) if nrb % p == 0)
   def gemm(self, K, nrb, a, name):
     N, npad, Kin = self.meta[name]; ng = npad // 48; out = K.buf(f"ct_{name.split('_', 1)[-1] if name.startswith('blk') else name}", ng * nrb * NS * 192, dtypes.float32)
-    return OA.gemm_gs(a, self.W[name], ks=KS, ns=NS, nrb=nrb, nslices=Kin // (4 * KS), ngroups=ng, b8=True, bscale=True, q8=2, scales="dup", piece=self.piece(nrb), out=out).realize(), N, npad
+    return OA.gemm_gs(a, self.panels(name), ks=KS, ns=NS, nrb=nrb, nslices=Kin // (4 * KS), ngroups=ng, b8=True, bscale=True, q8=2, scales="dup", piece=self.piece(nrb), out=out).realize(), N, npad
   def rows_add(self, K, n, c, nrb, x, ct, bias, tag):
     k = K.key(f"residb32|{c}|{nrb}|{n}", VK.residb32_src(c, nrb, n)); return K.run(k, tag, 12 * nrb * c, dtypes.float32, x, ct, bias).reshape(12 * nrb, c)
   def ln(self, K, n, c, x, w, b, tag):

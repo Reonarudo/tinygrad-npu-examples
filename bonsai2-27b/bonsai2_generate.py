@@ -18,6 +18,8 @@ HERE = os.path.dirname(os.path.abspath(__file__)); sys.path.insert(0, HERE); sys
 from bonsai2_weights import PATHS                       # noqa: E402
 import qwen38_ref as R                                  # noqa: E402  (the profile: NL, the MTP layer's index)
 os.environ.setdefault("DEV", "ZHOUYI")                  # tinygrad's default device
+if os.environ.get("QWEN_SHARED_NPU") == "1":            # another NPU process runs beside this one (two servers): nothing of ours in the cluster's shared GM
+  os.environ.setdefault("ZHOUYI_TEXT_GM", "0"); os.environ.setdefault("QWEN_AGM", "0")   # (kernel text and the GEMMs' A operand stay in DDR; ~5 % slower)
 os.environ.setdefault("QWEN_NPU", PATHS[os.environ["QWEN_MODEL"]][1])
 os.environ.setdefault("QWEN_DIR", os.environ.get("BONSAI_GGUF", PATHS[os.environ["QWEN_MODEL"]][0]))
 os.environ.setdefault("QWEN_TOK", os.environ["QWEN_NPU"])

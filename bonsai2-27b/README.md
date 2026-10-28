@@ -400,7 +400,7 @@ Board o6n, 2026-10-28, the 2B at 8192 context, a 640 x 480 test image (`vision/t
 | the 9B | *a red circle positioned to the left of a blue square, with the text "RPU" visible in the bottom left corner*; "a green triangle"; its tower vs numpy: embeddings rel err 2.3e-2, cosine >= 0.94 |
 
 The tower runs on the engine's thread before the request's prefill, so an image costs its tower time plus the prompt's (300 tokens
-~5 s on the 2B). The 27B has no mmproj.
+~5 s on the 2B). Its weights live on the host and go to the device a GEMM at a time (see below). The 27B has no mmproj.
 
 **The batched server** (`bonsai2_batch_serve.py`) takes images too: a prompt with images always goes through the chunked prefill
 (whatever its length), which writes the image rows and the m-RoPE table as above; once the slot decodes, its rope rows lag its cache
@@ -409,6 +409,25 @@ the row's rope row (`attn_decb`: [layer, position, cache index, rope row]; gate 
 to attn_dec3 on a re-rowed table), and the batch steps read a default rope table of their own, since the model's holds a prompt's
 m-RoPE rows while a prefill is interleaved with the steps. Board, the 2B, 4 slots: two image prompts and two text prompts sent at
 once all answer correctly (the same words as the single-user server's) in 13-18 s wall each; a text prompt afterwards 1.4 s.
+
+## Two servers at once: the 9B and the 2B side by side
+
+Two processes can share the NPU, but not by default: both put their kernel text and the GEMMs' A operand into the cluster's shared
+GM and overwrite each other's, after which every job of both times out (the SMMU logs reads of address 0; two copies of the 2B do it
+too). `QWEN_SHARED_NPU=1` keeps both out of GM (`ZHOUYI_TEXT_GM=0 QWEN_AGM=0`, ~5 % slower) and the processes then interleave
+their jobs freely. The other two shared resources are memory: the ASID 0 window (~2.75 GB of buffers and window slots for ALL
+processes) and the three cache address spaces, so the first server must leave room: an explicit `--tmax` rather than `auto` (which
+fills the caches to the brim), and the vision tower's weights now stay on the host, uploaded into one staging buffer a GEMM at a time
+(about a second more per image; `QWEN_VISION_RESIDENT=1` for the old way). Board, 2026-10-28:
+
+```sh
+QWEN_SHARED_NPU=1 QWEN_MODEL=bonsai2-2b python3 bonsai2_batch_serve.py --host 0.0.0.0 --port 8000 --users 4 --tmax 32768
+QWEN_SHARED_NPU=1 QWEN_MODEL=bonsai2-9b python3 bonsai2_serve.py --host 0.0.0.0 --port 8001            # lands at 145408 (fp16)
+```
+
+The 2B's caches take 1.07 GB of each address space, the 9B's auto context settles at 145408 (1.79 GB) beside them. Two image and
+two text prompts sent to the pair at once all answer correctly; each request takes 15-18 s wall while the four run (one NPU: the
+two servers' jobs alternate), the 9B's text prompt alone 2.0 s.
 
 ## Batched decode: several requests a step (`bonsai2_batch.py`)
 
