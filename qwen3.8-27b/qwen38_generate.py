@@ -152,13 +152,14 @@ class KVAsid:
       try: b = raw.req_buf(1 << 20, asid=a); raw.free_buf(b); n += 1
       except OSError: pass
     return n if n == 3 else (1 if n else 0)
-  def __init__(self, raw, natt, users, tmax, rowf, mtp=False, nasid=None):
+  def __init__(self, raw, natt, users, tmax, rowf, mtp=False, nasid=None, half=True):
+    """`half`: fp16 caches (QWEN_KV_DTYPE=f16, the default: half the bytes a position, the kernels widen on load); else fp32."""
     assert os.environ.get("ZHOUYI_ASID_BASES"), "QWEN_KV_ASID: ZHOUYI_ASID_BASES must name the ASID 1..3 bases before the device is opened"
-    self.raw, self.natt, self.users, self.tmax, self.rowf, self.mtp = raw, natt, users, tmax, rowf, mtp
+    self.raw, self.natt, self.users, self.tmax, self.rowf, self.mtp, self.half = raw, natt, users, tmax, rowf, mtp, half; ES = 2 if half else 4; DT = dtypes.half if half else dtypes.float32
     self.na = KVAsid.available(raw) if nasid is None else nasid; assert self.na, "QWEN_KV_ASID: no ASID beyond 0 allocates"
     self.nl = [len([i for i in range(natt) if i % self.na == a]) for a in range(3)]        # layers in ASID 1 + a
     self.regions = [self.nl[a] * users for a in range(3)]                                  # tmax-row regions a buffer holds (the MTP's apart)
-    self.KB = [(r * tmax + ATT_BT) * rowf * 4 for r in self.regions]; t0 = time.perf_counter(); self.bufs, self.views = [None] * 3, [None] * 3
+    self.KB = [(r * tmax + ATT_BT) * rowf * ES for r in self.regions]; t0 = time.perf_counter(); self.bufs, self.views = [None] * 3, [None] * 3
     # ASID 3 first, then 2, then 1: the KMD's IOVA allocator searches downward from its cached 64-bit node (device-wide), so a
     # request in a higher ASID made after a lower one's lands in the lower range and is refused ("IOVA ... outside ASID n range")
     for a in (2, 1, 0):
@@ -167,18 +168,18 @@ class KVAsid:
       try: b = raw.req_buf(2 * self.KB[a], asid=1 + a)
       except OSError as e: raise MemoryError(f"KV ASID {1 + a}: {2 * self.KB[a] / 1e9:.2f} GB: {e}") from e
       self.bufs[a] = b
-      self.views[a] = (Tensor.from_blob(b.pa, (self.KB[a] // 4,), dtype=dtypes.float32, device=DEV), Tensor.from_blob(b.pa + self.KB[a], (self.KB[a] // 4,), dtype=dtypes.float32, device=DEV))
+      self.views[a] = (Tensor.from_blob(b.pa, (self.KB[a] // ES,), dtype=DT, device=DEV), Tensor.from_blob(b.pa + self.KB[a], (self.KB[a] // ES,), dtype=DT, device=DEV))
     # the MTP drafter's cache: one region of its own, in the ASID with room (3 GiB less the layers'), else a plain ASID0 buffer (base 0)
     self.mbase, self.mviews = None, None
     if mtp:
-      mkb = (tmax + ATT_BT) * rowf * 4; room = lambda a: 3 * 2**30 - (16 << 20) - (2 * self.KB[a] if a < self.na else 0)
+      mkb = (tmax + ATT_BT) * rowf * ES; room = lambda a: 3 * 2**30 - (16 << 20) - (2 * self.KB[a] if a < self.na else 0)
       for a in [a for a in (2, 1, 0) if room(a) >= 2 * mkb] + [-1]:
         try: mb = raw.req_buf(2 * mkb, asid=1 + a if a >= 0 else 0); self.mbase = 1 + a if a >= 0 else 0; break
         except OSError as e:
           if a < 0: raise MemoryError(f"the drafter's cache ({2 * mkb / 1e9:.2f} GB): {e}") from e
-      self.mbuf = mb; self.mviews = (Tensor.from_blob(mb.pa, (mkb // 4,), dtype=dtypes.float32, device=DEV), Tensor.from_blob(mb.pa + mkb, (mkb // 4,), dtype=dtypes.float32, device=DEV))
-    print(f"   KV in ASID{'s 1-3' if self.na == 3 else ' 1'}: {natt} layers x {users} user(s) x {tmax} positions: "
-          f"{' / '.join(f'{2 * kb / 1e9:.2f}' for kb in self.KB[:self.na])} GB (3 GiB each){f'; the drafter' + chr(39) + 's ' + f'{2 * (tmax + ATT_BT) * rowf * 4 / 1e9:.2f} GB in ASID {self.mbase}' if mtp else ''}, "
+      self.mbuf = mb; self.mviews = (Tensor.from_blob(mb.pa, (mkb // ES,), dtype=DT, device=DEV), Tensor.from_blob(mb.pa + mkb, (mkb // ES,), dtype=DT, device=DEV))
+    print(f"   KV in ASID{'s 1-3' if self.na == 3 else ' 1'} ({'fp16' if half else 'fp32'}): {natt} layers x {users} user(s) x {tmax} positions: "
+          f"{' / '.join(f'{2 * kb / 1e9:.2f}' for kb in self.KB[:self.na])} GB (3 GiB each){f'; the drafter' + chr(39) + 's ' + f'{2 * (tmax + ATT_BT) * rowf * ES / 1e9:.2f} GB in ASID {self.mbase}' if mtp else ''}, "
           f"{'none' if not mtp or self.mbase else 'only the drafter' + chr(39) + 's'} of the ASID0 window, in {time.perf_counter() - t0:.1f} s", flush=True)
   def base(self, i): return 1 + i % self.na if i < self.natt else self.mbase   # the DMA base code of attention layer i (the MTP's: its buffer's ASID)
   def kv(self, i): return self.views[i % self.na] if i < self.natt else self.mviews   # (K view, V view) of layer i's ASID (the MTP's: its own)
@@ -187,8 +188,8 @@ class KVAsid:
     return 0 if i >= self.natt else (i // self.na) * self.users + u
   def host(self, i, u=0):
     """Layer i's cache rows of user u as host arrays (K, V) [tmax + ATT_BT][rowf] (the device's writes made visible first)."""
-    import ctypes; a = i % self.na; b = self.bufs[a]; self.raw.cache_invalidate(b); r = self.cidx(i, u) * self.tmax * self.rowf * 4; n = (self.tmax + ATT_BT) * self.rowf * 4
-    return tuple(np.frombuffer(ctypes.string_at(b.va + off + r, n), np.float32).reshape(-1, self.rowf) for off in (0, self.KB[a]))
+    import ctypes; a = i % self.na; b = self.bufs[a]; self.raw.cache_invalidate(b); ES = 2 if self.half else 4; r = self.cidx(i, u) * self.tmax * self.rowf * ES; n = (self.tmax + ATT_BT) * self.rowf * ES
+    return tuple(np.frombuffer(ctypes.string_at(b.va + off + r, n), np.float16 if self.half else np.float32).reshape(-1, self.rowf).astype(np.float32) for off in (0, self.KB[a]))
 
 
 class Model:
@@ -253,7 +254,7 @@ class Model:
     if os.environ.get("QWEN_KV_ASID", "0") == "1":
       from tinygrad import Device
       assert not self.tree, "QWEN_KV_ASID: the chain verify only (the leaf tree's commit moves K / V rows in every layer's cache through ASID0 pointers)"
-      self.kvs = KVAsid(Device[DEV].raw, self.NATT, int(os.environ.get("QWEN_KV_USERS", "1")), tmax, R.NKV * R.HD, mtp=bool(self.MTPL))
+      self.kvs = KVAsid(Device[DEV].raw, self.NATT, int(os.environ.get("QWEN_KV_USERS", "1")), tmax, R.NKV * R.HD, mtp=bool(self.MTPL), half=os.environ.get("QWEN_KV_DTYPE", "f16") != "f32")   # (auto resolved by the servers; a bare generate run: fp16)
       self.Kall, self.Vall = self.kvs.kv(0)                                                # (ring_commit's arguments: unread with the chain's -1 move)
     else:
       self.kvs = None; ksz = (natt * tmax + ATT_BT) * R.NKV * R.HD
@@ -315,6 +316,8 @@ class Model:
   def _kvb(self, i):
     """The DMA base code of attention layer i's cache (0: ASID0, the stacks)."""
     return self.kvs.base(i) if self.kvs else 0
+  @property
+  def kvh(self): return bool(self.kvs and self.kvs.half)                     # fp16 caches
 
   # ---- speculative decoding: the verify pass (M consecutive tokens through the 64 layers, one streaming of the weights)
   def _spec_init(self, M):
@@ -646,7 +649,7 @@ class Model:
     a_h = L.K.rms_a(u, (self.Win_a, ah), R.H, "a_h"); ct = L.lin_cts(a_h, slot, self.meta_mtp, ("q", "kv"))
     q_rows = L.K.unpack(ct["q"][0], R.NH * 2 * R.HD, "q_rows", goff=ct["q"][1])
     kv_rows = L.K.unpack(ct["kv"][0], 2 * R.NKV * R.HD, "kv_rows", goff=ct["kv"][1])
-    oc = L.K.attn_decm(q_rows, kv_rows, self.QN, self.KN, self.ROPE, *self._kv(self.NATT), ah, R.NH, R.NKV, R.HD, self.TMAX, R.ROT, nidx=bool(self.kvs), kvb=self._kvb(self.NATT))
+    oc = L.K.attn_decm(q_rows, kv_rows, self.QN, self.KN, self.ROPE, *self._kv(self.NATT), ah, R.NH, R.NKV, R.HD, self.TMAX, R.ROT, nidx=bool(self.kvs), kvb=self._kvb(self.NATT), kvh=self.kvh)
     x = L.K.resid(u, L.lin_ct(L.K.rms_a(oc, None, R.NH * R.HD, "a_o", norm=False), slot, self.meta_mtp, "o"), R.H, "x1")
     return L.mlp(x, slot, self.meta_mtp, (self.Wpost_a, ah), "mtp_out").realize()
   def mtp_pass(self, rows, pos):
@@ -753,7 +756,7 @@ class Model:
     q_rows = L.K.unpack(ct["q"][0], R.NH * 2 * R.HD, "q_rows", goff=ct["q"][1])
     kv_rows = L.K.unpack(ct["kv"][0], 2 * R.NKV * R.HD, "kv_rows", goff=ct["kv"][1])
     if self.tree: oc = L.K.attn_tree(q_rows, kv_rows, self.QN, self.KN, self.ROPE, Kall, Vall, ah, self.treeb, R.NH, R.NKV, R.HD, self.TMAX, R.ROT)
-    else: oc = L.K.attn_decm(q_rows, kv_rows, self.QN, self.KN, self.ROPE, Kall, Vall, ah, R.NH, R.NKV, R.HD, self.TMAX, R.ROT, nidx=bool(self.kvs), kvb=kvb)
+    else: oc = L.K.attn_decm(q_rows, kv_rows, self.QN, self.KN, self.ROPE, Kall, Vall, ah, R.NH, R.NKV, R.HD, self.TMAX, R.ROT, nidx=bool(self.kvs), kvb=kvb, kvh=self.kvh)
     x = L.K.resid(x, L.lin_ct(L.K.rms_a(oc, None, R.NH * R.HD, "a_o", norm=False), slot, self.meta_att, "o"), R.H, "x1")
     return L.mlp(x, slot, self.meta_att, (self.Wpost_a, ah), f"xiov{1 - par}").realize()
   def _head_part(self, L, i, x, norm_w1, view, top3=False, hp=None, red=None, pick=None, x3=False):
@@ -1178,7 +1181,7 @@ class Model:
     a_h = L.K.rms_a(x, (self.Win_a, ah), R.H, "a_h"); ct = L.lin_cts(a_h, slot, self.meta_att, ("q", "kv"))   # one GEMM when fused
     q_rows = L.K.unpack(ct["q"][0], R.NH * 2 * R.HD, "q_rows", goff=ct["q"][1])
     kv_rows = L.K.unpack(ct["kv"][0], 2 * R.NKV * R.HD, "kv_rows", goff=ct["kv"][1])
-    oc = L.K.attn_dec2(q_rows, kv_rows, self.QN, self.KN, self.ROPE, *(self.kvs.views[kvb - 1] if self.kvs and kvb else (self.Kall, self.Vall)), ah, R.NH, R.NKV, R.HD, self.TMAX, R.ROT, nidx=bool(self.kvs), kvb=kvb)
+    oc = L.K.attn_dec2(q_rows, kv_rows, self.QN, self.KN, self.ROPE, *(self.kvs.views[kvb - 1] if self.kvs and kvb else (self.Kall, self.Vall)), ah, R.NH, R.NKV, R.HD, self.TMAX, R.ROT, nidx=bool(self.kvs), kvb=kvb, kvh=self.kvh)
     x = L.K.resid(x, L.lin_ct(L.K.rms_a(oc, None, R.NH * R.HD, "a_o", norm=False), slot, self.meta_att, "o"), R.H, "x1")
     return L.mlp(x, slot, self.meta_att, (self.Wpost_a, ah), f"xio{1 - par}").realize()
 

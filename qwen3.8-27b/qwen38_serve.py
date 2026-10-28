@@ -208,10 +208,17 @@ def asid_count():
 def asid_tmax(users, natt, nkv, hd, mtp=True, want=65536, nasid=None):
   """The caches in ASIDs 1-3 (QWEN_KV_ASID): the largest multiple of 1024 up to `want` whose fullest ASID (ceil(natt / nasid) layers x
   max(1, users) regions) holds its [K | V] in 3 GiB -> (tmax, that ASID's GB); the drafter's cache takes a buffer of its own where
-  there is room. nasid: the ASIDs that allocate (asid_count; the stock KMD: 1)."""
-  na = asid_count() if nasid is None else nasid
-  row = nkv * hd * 4; regs = max(-(-natt // na) * max(1, users), 1); cap = 3 * 2**30 - (16 << 20)   # (the drafter's region has a buffer of its own)
-  t = min(want, cap // (2 * regs * row) // 1024 * 1024); return max(1024, t), 2 * regs * row * t / 1e9
+  there is room. nasid: the ASIDs that allocate (asid_count; the stock KMD: 1). QWEN_KV_DTYPE: f32 | f16 | auto (default) -- auto
+  takes fp32 when `want` fits in it and fp16 otherwise (fp16 doubles the positions and costs ~10-20 % of the step: the part's fp16
+  FMAs issue slower than its fp32 ones); the choice is written back to QWEN_KV_DTYPE for the model."""
+  na = asid_count() if nasid is None else nasid; dt = os.environ.get("QWEN_KV_DTYPE", "auto")
+  regs = max(-(-natt // na) * max(1, users), 1)
+  def fit(es):
+    row = nkv * hd * es; cap = 3 * 2**30 - (16 << 20) - 2 * 4 * row                              # (the drafter's region has a buffer of its own; the ATT_BT margin rows)
+    tm = min(want, cap // (2 * regs * row) // 1024 * 1024); return max(1024, tm), 2 * regs * row * tm / 1e9
+  if dt == "auto": dt = "f32" if fit(4)[0] >= want else "f16"
+  os.environ["QWEN_KV_DTYPE"] = dt
+  return fit(2 if dt == "f16" else 4)
 
 
 def auto_tmax(users, budget_gb, natt, nkv, hd, want=65536, slots=False, mtp=True):
@@ -247,7 +254,7 @@ def main(default_name="qwen3.8-27b", default_tmax=2048):
   auto = a.tmax == "auto" or os.environ.get("QWEN_TMAX_AUTO") == "1"
   asid = os.environ.get("QWEN_KV_ASID", "0") == "1"
   a.tmax, gb = auto_tmax(0, float(os.environ.get("QWEN_KV_GB", "2.0")), R_.NL // 4, R_.NKV, R_.HD, want=int(os.environ.get("QWEN_TMAX_MAX", "262144"))) if a.tmax == "auto" else (int(a.tmax), (asid_tmax(0, R_.NL // 4, R_.NKV, R_.HD, True, int(a.tmax))[1] if asid else kv_window_bytes(0, R_.NL // 4, R_.NKV, R_.HD, int(a.tmax), False) / 1e9))
-  print(f"   context {a.tmax} tokens: K / V caches {gb:.2f} GB {'in the fullest of ASIDs 1-3 (3 GiB each; none of the ASID0 window)' if asid else 'of the NPU window'}", flush=True); eng = engine_fit(Engine, a, auto)
+  print(f"   context {a.tmax} tokens: K / V caches {gb:.2f} GB {'in the fullest of ASIDs 1-3 (3 GiB each; none of the ASID0 window; ' + os.environ.get('QWEN_KV_DTYPE', 'f16') + ')' if asid else 'of the NPU window'}", flush=True); eng = engine_fit(Engine, a, auto)
   srv = ThreadingHTTPServer((a.host, a.port), make_handler(eng, a.model_name))
   print(f"== serving {a.model_name} on http://{a.host}:{a.port}/v1 (OpenAI-compatible; greedy; context {a.tmax} tokens)", flush=True)
   threading.Thread(target=srv.serve_forever, daemon=True).start()

@@ -8,9 +8,10 @@ from qwen38_kernels import NT
 import attn_gqa as AG
 
 
-def attn_decb_src(NH, NKV, HD, TMAX, ROT, eps, M, U=1, BT=2, nidx=False, kvb=0):
-  """`nidx`: idx [M][3] -- a row's layer (its norm weights), position and cache index (KV slots)."""
-  src = AG.attn_dec3_src(NH, NKV, HD, TMAX, ROT, eps, U=U, BT=BT, nidx=nidx, kvb=kvb); W = 3 if nidx else 2; g = NH // NKV; QR, KR, OR = NH * 2 * HD, 2 * NKV * HD, NH * HD; NU = NKV * U
+def attn_decb_src(NH, NKV, HD, TMAX, ROT, eps, M, U=1, BT=2, nidx=False, kvb=0, kvh=False):
+  """`nidx`: idx [M][3] -- a row's layer (its norm weights), position and cache index. `kvb` / `kvh`: attn_dec3_src's (the cache's DMA base
+  code; fp16 caches)."""
+  src = AG.attn_dec3_src(NH, NKV, HD, TMAX, ROT, eps, U=U, BT=BT, nidx=nidx, kvb=kvb, kvh=kvh); CT = "__global half" if kvh else "__global float"; W = 3 if nidx else 2; g = NH // NKV; QR, KR, OR = NH * 2 * HD, 2 * NKV * HD, NH * HD; NU = NKV * U
   def rep(a, b, n=1):
     nonlocal src; assert src.count(a) == n, (a[:70], src.count(a)); src = src.replace(a, b)
   rep("__kernel void attn_dec2(", "__kernel void attn_decb(")
@@ -20,7 +21,7 @@ def attn_decb_src(NH, NKV, HD, TMAX, ROT, eps, M, U=1, BT=2, nidx=False, kvb=0):
   cache_w = cache_w.replace(f"(int)(kv_rows + {NKV * HD} + kh *", f"(int)(kv_rows + r * {KR} + {NKV * HD} + kh *").replace("(int)(kv_rows + kh *", f"(int)(kv_rows + r * {KR} + kh *")
   new_head = (f"  for (int un = core_id; un < {M * NU}; un += {NT}) {{ int r = un / {NU}, kvh = (un % {NU}) / {U}, part = un % {U};\n"
               f"  int L = idx[{W} * r + {2 if nidx else 0}], pos = idx[{W} * r + 1];" + (f" int Ln = idx[{W} * r];\n" if nidx else "\n")
-              + f"  __global float* Kc = Kall + (L * {TMAX}) * {NKV * HD}; __global float* Vc = Vall + (L * {TMAX}) * {NKV * HD};\n"
+              + f"  {CT}* Kc = Kall + (L * {TMAX}) * {NKV * HD}; {CT}* Vc = Vall + (L * {TMAX}) * {NKV * HD};\n"
               + f"  __global float* qnw = qnw_all + {'Ln' if nidx else 'L'} * {HD}; __global float* knw = knw_all + {'Ln' if nidx else 'L'} * {HD}; __global float* cs = rope + pos * {2 * ROT};\n" + cache_w)
   src = src[:i0] + new_head + src[i1:]
   rep(f"  int kvh = core_id / {U}, part = core_id % {U}, h0 = kvh * {g} + part *", f"  int h0 = kvh * {g} + part *")

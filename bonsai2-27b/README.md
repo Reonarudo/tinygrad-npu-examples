@@ -505,27 +505,26 @@ bit for bit and its writes reach the host, the same address through base 0 reads
 buffers' row for row and the tokens are the same (2B at 512, 4096 and 65536). `--tmax auto` is then the largest context whose fullest
 ASID holds its layers' caches, up to the model's own 262144 (`QWEN_TMAX_MAX`):
 
-| server, caches in ASIDs 1-3 | 2B | 4B / 9B |
-| --- | ---: | ---: |
-| `bonsai2_serve.py` (speculative, one user) | 262144 (the model's own) | 130048 |
-| `bonsai2_batch_serve.py --users 4` | 98304 | 31744 |
-| `bonsai2_batch_serve.py --users 8` | 48128 | ~15k |
+| server, caches in ASIDs 1-3 | 2B fp32 | 2B fp16 | 4B / 9B fp32 | 4B / 9B fp16 |
+| --- | ---: | ---: | ---: | ---: |
+| `bonsai2_serve.py` (speculative, one user) | 262144 | 262144 | 130048 | 260096 |
+| `bonsai2_batch_serve.py --users 4` | 98304 | 194560 | 31744 | 64512 |
+| `bonsai2_batch_serve.py --users 8` | 48128 | 97280 | ~15k | ~32k |
 
-(The drafter's cache takes a buffer of its own in whichever ASID has room, else the ASID 0 window: that is what lets the 2B's six
-layers fill the three ASIDs to the model's full 262144.)
+**fp16 caches** (`QWEN_KV_DTYPE=f16`) halve the bytes a position: the kernels write a half row through the part's `cvt.d` and run the
+dots on fp16 inputs with fp32 accumulation (`fmae` / `fmao`: the even and odd lane products of two fp16 vectors into eight fp32 lanes;
+q staged as fp16, the probability broadcast as 16 halves, the output accumulated in a split layout and un-split before the records
+go out). The part has no fp16-to-fp32 convert, and widening by shifts cost 2x the time (the integer side issues one op a cycle), so
+this is the way. Its price: fp16 FMAs issue slower than fp32 ones, so the attention costs more per position -- nothing at short
+contexts (2B batched, 4 concurrent requests: 46-48 tok/s either way), 8 % on the 6283-token prompt (93 s against 86), 18 % on the
+25363-token one (641 s against 543) -- and the saved bytes do not pay that back even at 25k positions. Tokens: the same on the test
+prompts, cache rows within 5e-4 of fp32. So the servers choose: the speculative server takes fp32 when the model's window fits (the
+2B) and fp16 when it does not (the 9B's 262144 needs it: `QWEN_KV_DTYPE=auto`); the batched server takes fp32 unless an explicit
+`--tmax` needs fp16 to fit. Either can be forced with `QWEN_KV_DTYPE=f16 | f32`. Board o6n, 2026-10-28, fp16: the 2B's speculative server at 262144 answers the 6283-token
+prompt in 93 s (86 fp32), the 9B at 260096 the 3142-token prompt in 131 s (127 fp32), the 4B at 260096 in 82 s.
 
-The capacity is there; the time is the other half. The prefill runs 4 tokens a pass and the attention reads the whole cache every
-pass and every token at the port's 23 GB/s (24 KiB a position on the 2B, 64 KiB on the 4B / 9B), so a 25363-token prompt took the
-2B's speculative server 543 s at a 258048 context (262144 now) (47 tok/s of prefill, slowing with depth), and a decode step at 100k positions reads
-2.4 GB of cache on the 2B -- about 100 ms a token before the weights. The answer to the counting question was also wrong at that
-depth ("100 days" for 480 paragraphs) where it was right at 6283 tokens: the model's doing, not the kernels'. Fewer bytes a position
-(an fp16 or quantized cache) is the lever for the time; the address spaces only gave the room.
-
-Board o6n, 2026-10-27: the 2B's batched server at 65536 (4 users) answers the 6283-token prompt in 68 s and runs 4 concurrent requests
-at 46 tok/s, 8 users at 48128 at 53 tok/s; the 9B at 97280 and the 4B at 65536 answer the 3142-token prompt ("60 days") in 127 s and
-78 s; the 9B's batched server (4 users, 31744) runs 4 concurrent requests at 14 tok/s. One price: the speculative server runs the
-chain verify, not the leaf tree (its commit moves K / V rows in every layer's cache through ASID 0 pointers): about 4 % fewer tokens a
-pass.
+The drafter's cache takes a buffer of its own in whichever ASID has room, else the ASID 0 window: that is what lets the 2B's six
+layers fill the three ASIDs to the model's full 262144 in fp32.
 
 **A driver fix was needed for ASIDs 2 and 3.** The KMD's IOVA allocator searches downward from its last 64-bit insertion, device-wide,
 so once anything sat in ASID 1 a request for ASID 2 or 3 was placed in ASID 1's range and refused by the range check. The slim driver

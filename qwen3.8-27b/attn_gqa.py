@@ -71,37 +71,96 @@ static inline __attribute__((always_inline)) float8 hsumT(float8 a0, float8 a1, 
 
 L8 = range(8)
 
+# fp16 caches (kvh): the X2 converts fp32 -> fp16 (cvt.d, CVT16) but not back, so a cached half row is widened by shifts: the half's
+# sign, exponent and mantissa moved into fp32 position and the magnitude scaled by 2^112 -- exact for normals, subnormals and signed
+# zeros (sim/h2f_sim.py). Eight halves come as four words, two a word.
+_H2F = """
+typedef unsigned int uint8v __attribute__((__vector_size__(32)));
+typedef unsigned int uint4v __attribute__((__vector_size__(16)));
+static inline __attribute__((always_inline)) float8 H8F(const __global half* p) {
+  uint4v w4 = *(const __global uint4v*)p; uint8v w = __builtin_shufflevector(w4, w4, 0, 0, 1, 1, 2, 2, 3, 3);
+  uint8v hw = (w >> (uint8v){0, 16, 0, 16, 0, 16, 0, 16}) & 0xffffu;
+  uint8v bits = ((hw & 0x8000u) << 16) | ((hw & 0x7fffu) << 13);
+  union { uint8v i; float8 f; } u; u.i = bits;
+  return u.f * BC(5192296858534827628530496329220096.0f);
+}
+"""
+_F2H = lambda dst, src, HD: f"for (int i_ = 0; i_ < {HD}; i_ += 16) *(__global half16*)({dst} + i_) = CVT16(*(__global float8*)({src} + i_), *(__global float8*)({src} + i_ + 8));"
+# fmae / fmao: td += ta[2i] tb[2i] / ta[2i + 1] tb[2i + 1] over 16 fp16 lanes into 8 fp32 lanes (sim/fmae_sim.py). Both into one accumulator
+# give the 16 products summed pairwise by lane; a record's dot is then the lane sum, as the fp32 path's hsumT takes it.
+_FMA16 = """
+static inline __attribute__((always_inline)) float8 FMAE(float8 acc, half16 a, half16 b) { __asm__ volatile("{ fmae %0.fp32, %1.fp16, %2.fp16, p7.w }" : "+t"(acc) : "t"(a), "t"(b)); return acc; }
+static inline __attribute__((always_inline)) float8 FMAO(float8 acc, half16 a, half16 b) { __asm__ volatile("{ fmao %0.fp32, %1.fp16, %2.fp16, p7.w }" : "+t"(acc) : "t"(a), "t"(b)); return acc; }
+#define EVN(a, b) __builtin_shufflevector((a), (b), 0, 2, 4, 6, 8, 10, 12, 14)
+#define ODD(a, b) __builtin_shufflevector((a), (b), 1, 3, 5, 7, 9, 11, 13, 15)
+"""
 
-def _p1(HD, two):
+
+def _p1h(HD, two):
+  """_p1 for fp16 q octets (chunk i of 16 halves of lane l at qb + (8 i + l) 16) against fp16 k row(s): fmae then fmao into one
+  accumulator a record (the lane sum is the dot)."""
+  d = "; ".join(f"float8 x{l} = BC(0.0f)" + (f", y{l} = BC(0.0f)" if two else "") for l in L8) + ";"
+  st = ["half16 k0 = *(__global half16*)ka;" + (" half16 k1 = *(__global half16*)kc;" if two else "")]
+  st += [f"{{ half16 q = *(__global half16*)(qq + {16 * l}); x{l} = FMAE(x{l}, q, k0); x{l} = FMAO(x{l}, q, k0);" + (f" y{l} = FMAE(y{l}, q, k1); y{l} = FMAO(y{l}, q, k1);" if two else "") + " }" for l in L8]
+  return (f"{d} {{ __global half* qq = qb; __global half* ka = kr0;" + (" __global half* kc = kr1;" if two else "") +
+          f" for (int i = 0; i < {HD // 16}; i++) {{ " + " ".join(st) + " qq += 128; ka += 16;" + (" kc += 16;" if two else "") + " } }")
+
+
+def _p2h_pair(HD, la, lb):
+  """_p2_pair for fp16 v rows with the records' o in the SPLIT layout (each 16-dim chunk: its 8 even dims, then its 8 odd dims): the
+  probability broadcast as 16 halves, fmae into the even accumulator, fmao into the odd."""
+  ld = " ".join(f"float8 a{k} = *(__global float8*)(oa + d + {8 * k}), b{k} = *(__global float8*)(ob + d + {8 * k});" for k in L8)
+  fm = " ".join(f"{{ half16 vv = *(__global half16*)(vr + {16 * c}); a{2 * c} = FMAE(a{2 * c}, sa, vv); a{2 * c + 1} = FMAO(a{2 * c + 1}, sa, vv); b{2 * c} = FMAE(b{2 * c}, sb, vv); b{2 * c + 1} = FMAO(b{2 * c + 1}, sb, vv); }}" for c in range(4))
+  st = " ".join(f"*(__global float8*)(ob + d + {8 * k}) = b{k}; *(__global float8*)(oa + d + {8 * k}) = a{k};" for k in L8)
+  return (f"for (int d = 0; d < {HD}; d += 64) {{ {ld} for (int j = 0; j < nt; j++) {{ float8 ev = *(__global float8*)(pe + j * 8); "
+          f"float8 fa = LANE(ev, {la}), fb = LANE(ev, {lb}); half16 sa = CVT16(fa, fa), sb = CVT16(fb, fb); __global half* vr = vb + j * {HD} + d; {fm} }} {st} }}")
+
+
+def _p2_one_split(HD):
+  """_p2_one (o at oa += sa v, v an fp32 row at vr) with o in the split layout."""
+  return (f"for (int d = 0; d < {HD}; d += 16) {{ float8 lo = *(__global float8*)(vr + d), hi = *(__global float8*)(vr + d + 8); "
+          f"*(__global float8*)(oa + d) += sa * EVN(lo, hi); *(__global float8*)(oa + d + 8) += sa * ODD(lo, hi); }}")
+
+
+def _unsplit(HD, rec):
+  """C: the record's o at `rec` from the split layout back to dims in order (zipl / ziph a chunk)."""
+  return (f"for (int d = 0; d < {HD}; d += 16) {{ float8 e = *(__global float8*)({rec} + d), o_ = *(__global float8*)({rec} + d + 8); "
+          f"*(__global float8*)({rec} + d) = ZL(e, o_); *(__global float8*)({rec} + d + 8) = ZH(e, o_); }}")
+_LD = lambda half, ptr: f"H8F({ptr})" if half else f"*(__global float8*)({ptr})"
+_PT = lambda half: "__global half*" if half else "__global float*"
+
+
+def _p1(HD, two, half=False):
   """C: the dots of the octet's eight records (q chunk-major at `qb`: chunk i of lane l at qb + (8 i + l) 8) with the k row(s) at
-  kr0 (and kr1 when `two`), each accumulated over the chunks in order -> x0..x7 (y0..y7); i unrolled by two (immediate offsets)."""
+  kr0 (and kr1 when `two`), each accumulated over the chunks in order -> x0..x7 (y0..y7); i unrolled by two (immediate offsets).
+  `half`: the k rows are fp16 (widened on load)."""
   d = "; ".join(f"float8 x{l} = BC(0.0f)" + (f", y{l} = BC(0.0f)" if two else "") for l in L8) + ";"
   st = []
   for h in (0, 1):
-    st.append(f"float8 k{2 * h} = *(__global float8*)(ka + {8 * h})" + (f", k{2 * h + 1} = *(__global float8*)(kc + {8 * h});" if two else ";"))
+    st.append(f"float8 k{2 * h} = {_LD(half, f'ka + {8 * h}')}" + (f", k{2 * h + 1} = {_LD(half, f'kc + {8 * h}')};" if two else ";"))
     st += [f"{{ float8 q = *(__global float8*)(qq + {64 * h + 8 * l}); x{l} += q * k{2 * h};" + (f" y{l} += q * k{2 * h + 1};" if two else "") + " }" for l in L8]
-  return (f"{d} {{ __global float* qq = qb; __global float* ka = kr0;" + (" __global float* kc = kr1;" if two else "") +
+  return (f"{d} {{ __global float* qq = qb; {_PT(half)} ka = kr0;" + (f" {_PT(half)} kc = kr1;" if two else "") +
           f" for (int i = 0; i < {HD // 8}; i += 2) {{ " + " ".join(st) + " qq += 128; ka += 16;" + (" kc += 16;" if two else "") + " } }")
 
 
-def _p2_pair(HD, la, lb):
+def _p2_pair(HD, la, lb, half=False):
   """C: o (records-major at oa / ob) += e(t) v(t) for the block's nt rows at vb (pitch HD), the e of lanes la / lb of the score
-  octet rows at pe (pitch 8): two records x 64 dims in registers, t in order."""
+  octet rows at pe (pitch 8): two records x 64 dims in registers, t in order. `half`: the v rows are fp16."""
   ld = " ".join(f"float8 a{k} = *(__global float8*)(oa + d + {8 * k}), b{k} = *(__global float8*)(ob + d + {8 * k});" for k in L8)
-  fm = " ".join(f"{{ float8 vv = *(__global float8*)(vr + {8 * k}); a{k} += sa * vv; b{k} += sb * vv; }}" for k in L8)
+  fm = " ".join(f"{{ float8 vv = {_LD(half, f'vr + {8 * k}')}; a{k} += sa * vv; b{k} += sb * vv; }}" for k in L8)
   st = " ".join(f"*(__global float8*)(ob + d + {8 * k}) = b{k}; *(__global float8*)(oa + d + {8 * k}) = a{k};" for k in L8)
   return (f"for (int d = 0; d < {HD}; d += 64) {{ {ld} for (int j = 0; j < nt; j++) {{ float8 ev = *(__global float8*)(pe + j * 8); "
-          f"float8 sa = LANE(ev, {la}), sb = LANE(ev, {lb}); __global float* vr = vb + j * {HD} + d; {fm} }} {st} }}")
+          f"float8 sa = LANE(ev, {la}), sb = LANE(ev, {lb}); {_PT(half)} vr = vb + j * {HD} + d; {fm} }} {st} }}")
 
 
-def _p2_pair_full(HD, la, lb, BT):
+def _p2_pair_full(HD, la, lb, BT, half=False):
   """_p2_pair for a whole block (nt == BT), the BT positions unrolled, one base pointer per position advanced 64 dims a step (every
   load at an immediate offset < 512 B)."""
   ld = " ".join(f"float8 a{k} = *(__global float8*)(pa_ + {8 * k}), b{k} = *(__global float8*)(pb_ + {8 * k});" for k in L8)
   ev = " ".join(f"float8 e{j} = *(__global float8*)(pe + {8 * j}); float8 sa{j} = LANE(e{j}, {la}), sb{j} = LANE(e{j}, {lb});" for j in range(BT))
-  body = " ".join(f"{{ float8 vv = *(__global float8*)(w{j} + {8 * k}); a{k} += sa{j} * vv; b{k} += sb{j} * vv; }}" for j in range(BT) for k in L8)
+  body = " ".join(f"{{ float8 vv = {_LD(half, f'w{j} + {8 * k}')}; a{k} += sa{j} * vv; b{k} += sb{j} * vv; }}" for j in range(BT) for k in L8)
   st = " ".join(f"*(__global float8*)(pb_ + {8 * k}) = b{k}; *(__global float8*)(pa_ + {8 * k}) = a{k};" for k in L8)
-  ptr = " ".join(f"__global float* w{j} = vb + {j * HD}; __asm__ volatile(\"\" : \"+r\"(w{j}));" for j in range(BT))
+  ptr = " ".join(f"{_PT(half)} w{j} = vb + {j * HD}; __asm__ volatile(\"\" : \"+r\"(w{j}));" for j in range(BT))
   adv = " ".join(f"w{j} += 64;" for j in range(BT))
   return (f"{{ {ev} {ptr} __global float* pa_ = oa; __global float* pb_ = ob; "
           f"__asm__ volatile(\"\" : \"+r\"(pa_), \"+r\"(pb_)); for (int d = 0; d < {HD // 64}; d++) {{ {ld} {body} {st} pa_ += 64; pb_ += 64; {adv} }} }}")
@@ -125,23 +184,27 @@ def attn_gqa_desc(NH, NKV, HD, TMAX, M, BT=None):
   sl = [(BT * HD * 4, HD * 4, NKV * HD * 4, HD * 4), (HD * 4,)]
   sl += [(n * HD * 4, HD * 4, QR * 4, HD * 4) for n in range(1, lay["QST"] + 1)]           # q rows of one head (pitch QR)
   sl += [(n * PW * 4, PW * 4, P * PW * 4, PW * 4) for n in range(1, M + 1)]                 # records of one head (pitch P PW)
+  sl += [(BT * HD * 2, HD * 2, NKV * HD * 2, HD * 2), (HD * 2,)]                             # fp16 caches (kvh): BT half rows of one kv head; one half row
   return K.V._desc_slots(*sl)
 
 
-def attn_gqa_src(NH, NKV, HD, TMAX, ROT, eps, M, tree=False, BT=None, NTE=None, name=None, nidx=False, kvb=0):
+def attn_gqa_src(NH, NKV, HD, TMAX, ROT, eps, M, tree=False, BT=None, NTE=None, name=None, nidx=False, kvb=0, kvh=False):
   """See the module docstring. args: part, q_rows, kv_rows, qnw_all, knw_all, rope, Kall, Vall, idx (layer, pos), desc
   (attn_gqa_desc)[, tree]. NTE: the tasks that take attention records (default 12; the rest only write cache rows). `nidx`: idx has a
   third word: the cache index (KV slots: the user's cache in the slot), idx[0] staying the layer (the norm weights' row, as every
   other stacked kernel reads it). `kvb`: the DMA base code of the cache (kGlobal1..3: Kall / Vall live in that ASID, their pointers the
-  offsets there; 0: the text as before)."""
+  offsets there; 0: the text as before). `kvh`: the caches are fp16 (half rows written through cvt.d, widened on load; the two
+  descriptor slots after the records)."""
   K = _K(); BT = K.ATT_BT if BT is None else BT; NT = K.NT; NTE = NT if NTE is None else NTE
   KF = (lambda f, d, off, a: f"DMA_FILL({f}, {d}, {off}, {a})") if not kvb else (lambda f, d, off, a: f"DMA_FILLB({f}, {d}, {off}, {a}, {kvb})")
+  ES = 2 if kvh else 4; CT = "__global half" if kvh else "__global float"                      # the cache's element size and pointer type
   KD = (lambda f, d, off, a: f"DMA_DRAIN({f}, {d}, {off}, {a})") if not kvb else (lambda f, d, off, a: f"DMA_DRAINB({f}, {d}, {off}, {a}, {kvb})")
   g = NH // NKV; P, CLC = K.attn_plan(NH, HD, TMAX); CL = K._attn_cl(TMAX, P); NCH = CL // 8; G = g * M
   scale = 1.0 / HD ** 0.5; LOG2E = 1.4426950408889634; QR, KR = NH * 2 * HD, 2 * NKV * HD; PW = HD + 16
   assert 1 <= M <= 12 and HD % 64 == 0 and BT % 2 == 0 and CL % 8 == 0 and 1 <= NTE <= NT
   lay = gqa_layout(NH, NKV, HD, TMAX, M, BT); KB0, KN, KS, REC, AV, QST = (lay[k] for k in ("KB0", "KN", "KS", "REC", "AV", "QST"))
   QD, RD = 2, 2 + QST                                                         # desc slots: q runs (n rows: QD + n - 1), record drains (RD + n - 1)
+  DB, DR = (RD + M, RD + M + 1) if kvh else (0, 1)                             # the cache's block / row descriptors (fp16: the two after the records)
   RP = (lambda r: f"(pos + tree[{r}])") if tree else (lambda r: f"(pos + ({r}))")                    # row r's position (its RoPE)
   RPN = (lambda t: f"(pos + tree[({t}) - pos])") if tree else (lambda t: f"({t})")                  # new row t's RoPE position
   VIS = (lambda r, t: f"((tree[{M} + ({r})] >> (({t}) - pos)) & 1)") if tree else (lambda r, t: f"(({t}) <= pos + ({r}))")
@@ -181,7 +244,8 @@ def attn_gqa_src(NH, NKV, HD, TMAX, ROT, eps, M, tree=False, BT=None, NTE=None, 
       *(__global float8*)ms = mn; *(__global float8*)(ms + 8) = sm;
       for (int l = 0; l < 8; l++) {{ __global float* rec = QO + (o * 8 + l) * {PW}; float8 a = BC(al[l]); for (int i = 0; i < {HD}; i += 8) *(__global float8*)(rec + i) *= a; }}
     }}"""
-  QS = 8 * HD if CLC else 8 * PW                                            # the q octets' stride: their own region when chunked (the records hold o across chunks), else the records'
+  QS = 8 * HD if CLC else 8 * PW                                            # the q octets' stride (floats): their own region when chunked (the records hold o across chunks), else the records'
+  if kvh: QS = 8 * HD                                                        # (fp16 q octets: 8 HD halves, in the same region)
   cld_decl = f"int CLd = {CLC};" if CLC else f"int smax = (T + {P - 1}) / {P}, CLd = (smax + 7) & ~7;"
   tvars = "" if CLC else " int t0 = s0, t1 = s1, tc = t1 < pos ? t1 : pos, n = t1 - t0;"
   chunk_open = f"""
@@ -192,23 +256,26 @@ def attn_gqa_src(NH, NKV, HD, TMAX, ROT, eps, M, tree=False, BT=None, NTE=None, 
   chunk_close = f"""
     }}
     for (int o = 0; o < NO; o++) for (int l = 0; l < 8; l++) {{ __global float* rec = QO + (o * 8 + l) * {PW}; rec[{HD}] = MS[o * 16 + l]; rec[{HD + 1}] = MS[o * 16 + 8 + l]; }}""" if CLC else ""
+  # (fp16 caches: fmae / fmao pairs with the records' o in the split layout, un-split before the drains)
   p2 = " ".join(f"if (o * 8 + {2 * p} < R) {{ __global float* oa = QO + (o * 8 + {2 * p}) * {PW}; __global float* ob = o * 8 + {2 * p + 1} < R ? oa + {PW} : LSF({KN}); "
-                + f"if (nt == {BT}) {{ {_p2_pair_full(HD, 2 * p, 2 * p + 1, BT)} }} else {{ {_p2_pair(HD, 2 * p, 2 * p + 1)} }} }}" for p in range(4))
-  return K.V.FULL_H + K.EXP + _norm_rope_c(HD, ROT, eps) + _HSUMT + f"""
+                + (f"{_p2h_pair(HD, 2 * p, 2 * p + 1)} }}" if kvh else f"if (nt == {BT}) {{ {_p2_pair_full(HD, 2 * p, 2 * p + 1, BT)} }} else {{ {_p2_pair(HD, 2 * p, 2 * p + 1)} }} }}") for p in range(4))
+  LSC = "LSH" if kvh else "LSF"                                                 # the cache blocks in LSRAM
+  QT = "__global half" if kvh else "__global float"                            # the q octets' element type
+  return K.V.FULL_H + K.EXP + (_FMA16 if kvh else "") + _norm_rope_c(HD, ROT, eps) + _HSUMT + f"""
 __kernel void {kname}(__global float* restrict part, __global float* restrict q_rows, __global float* restrict kv_rows,
                         __global float* restrict qnw_all, __global float* restrict knw_all, __global float* restrict rope,
-                        __global float* restrict Kall, __global float* restrict Vall, __global int* restrict idx, __global int* restrict desc, {"__global int* restrict tree, " if tree else ""}const int core_id) {{
+                        {CT}* restrict Kall, {CT}* restrict Vall, __global int* restrict idx, __global int* restrict desc, {"__global int* restrict tree, " if tree else ""}const int core_id) {{
   int L = idx[{2 if nidx else 0}], pos = idx[1], T = pos + {M};{" int Ln = idx[0];" if nidx else ""}
-  __global float* Kc = Kall + (L * {TMAX}) * {NKV * HD}; __global float* Vc = Vall + (L * {TMAX}) * {NKV * HD};
+  {CT}* Kc = Kall + (L * {TMAX}) * {NKV * HD}; {CT}* Vc = Vall + (L * {TMAX}) * {NKV * HD};
   __global float* qnw = qnw_all + {"Ln" if nidx else "L"} * {HD}; __global float* knw = knw_all + {"Ln" if nidx else "L"} * {HD};
   /* phase 0: the M new k / v rows into the cache by DMA, a unit = (row, kv head), from the last task down (they hold the fewest records) */
   for (int u = {NT - 1} - core_id; u < {NKV * M}; u += {NT}) {{
     int r = u / {NKV}, kh = u % {NKV};
     DMA_FILL(2, DESC(desc, 1), {KS}, (int)(kv_rows + r * {KR} + kh * {HD}));
     DMA_FILL(3, DESC(desc, 1), {KB0}, (int)(kv_rows + r * {KR} + {NKV * HD} + kh * {HD}));
-    DMA_WAIT(2); norm_rope(LSF({KN}), LSF({KS}), knw, rope + {RP("r")} * {2 * ROT});
-    {KD(2, "DESC(desc, 1)", KN, f"(int)(Kc + ((pos + r) * {NKV} + kh) * {HD})")};
-    DMA_WAIT(3); {KD(3, "DESC(desc, 1)", KB0, f"(int)(Vc + ((pos + r) * {NKV} + kh) * {HD})")};
+    DMA_WAIT(2); norm_rope(LSF({KN}), LSF({KS}), knw, rope + {RP("r")} * {2 * ROT});{" " + _F2H(f"LSH({KS})", f"LSF({KN})", HD) if kvh else ""}
+    {KD(2, f"DESC(desc, {DR})", KS if kvh else KN, f"(int)(Kc + ((pos + r) * {NKV} + kh) * {HD})")};
+    DMA_WAIT(3);{" " + _F2H(f"LSH({KS + HD * 2})", f"LSF({KB0})", HD) if kvh else ""} {KD(3, f"DESC(desc, {DR})", KS + HD * 2 if kvh else KB0, f"(int)(Vc + ((pos + r) * {NKV} + kh) * {HD})")};
     DMA_WAIT(2); DMA_WAIT(3);
   }}
   {"int lid = core_id;" if NTE == NT else f"int lid = (core_id & 3) * 3 + (core_id >> 2);                  /* tasks spread over the 3 cores (each core's DMA engine serialises its TECs' requests) */"}
@@ -223,37 +290,37 @@ __kernel void {kname}(__global float* restrict part, __global float* restrict q_
     w += j1 - j0;
     int kvh = pr / {P}, c = pr % {P}, R = j1 - j0, NO = (R + 7) >> 3;
     int s0 = c * T / {P}, s1 = (c + 1) * T / {P};{tvars}
-    __global float* MS = QO + NO * {8 * PW}; __global float* QB = {'MS + NO * 16' if CLC else 'QO'}; __global float* SC = QB + NO * {QS};   /* octet o: SC + o * CLd * 8; position t: + (t - t0) * 8 */
+    __global float* MS = QO + NO * {8 * PW}; {QT}* QB = ({QT}*)({'MS + NO * 16' if CLC else 'QO'}); __global float* SC = {'(__global float*)(QB + NO * ' + str(QS) + ')' if CLC else 'QO + NO * ' + str(8 * PW)};   /* octet o: SC + o * CLd * 8; position t: + (t - t0) * 8 */
     DMA_WAIT(3);                                                          /* the previous unit's record drains (they read QO) */
     /* the q rows, normed and rotated, into the octets chunk-major (chunk i of lane l at + (8 i + l) 8); one request per run of a head's rows */
-    if (R & 7) for (int i = 0; i < {HD // 8}; i++) for (int l = R & 7; l < 8; l++) *(__global float8*)(QB + (NO - 1) * {QS} + (8 * i + l) * 8) = BC(0.0f);
+    if (R & 7) for (int i = 0; i < {HD // 16 if kvh else HD // 8}; i++) for (int l = R & 7; l < 8; l++) *(__global float8*)({'(__global float*)' if kvh else ''}(QB + (NO - 1) * {QS}) + (8 * i + l) * 8) = BC(0.0f);
     for (int jj = 0; jj < R; ) {{
       int j = j0 + jj, h = kvh * {g} + j / {M}, r = j % {M}, nr = {M} - r;
       if (nr > R - jj) nr = R - jj; if (nr > {QST}) nr = {QST};
       DMA_FILL(2, DESC(desc, {QD} - 1 + nr), {KB0}, (int)(q_rows + r * {QR} + h * {2 * HD})); DMA_WAIT(2);
       for (int ii = 0; ii < nr; ii++) {{
         norm_rope(LSF({KN}), LSF({KB0}) + ii * {HD}, qnw, rope + {RP("r + ii")} * {2 * ROT});
-        __global float* qd = QB + ((jj + ii) >> 3) * {QS} + ((jj + ii) & 7) * 8;
-        for (int i = 0; i < {HD // 8}; i++) *(__global float8*)(qd + i * 64) = *(__global float8*)(LSF({KN}) + i * 8);
+        {QT}* qd = QB + ((jj + ii) >> 3) * {QS} + ((jj + ii) & 7) * {16 if kvh else 8};
+        {f"for (int i = 0; i < {HD // 16}; i++) *(__global half16*)(qd + i * 128) = CVT16(*(__global float8*)(LSF({KN}) + i * 16), *(__global float8*)(LSF({KN}) + i * 16 + 8));" if kvh else f"for (int i = 0; i < {HD // 8}; i++) *(__global float8*)(qd + i * 64) = *(__global float8*)(LSF({KN}) + i * 8);"}
       }}
       jj += nr;
     }}{chunk_open}
     for (int o = 0; o < NO; o++) for (int t = 0; t < n; t++) *(__global float8*)(SC + o * CLd * 8 + t * 8) = BC{NEG};
     /* pass 1: the cache rows [t0, tc) in blocks of {BT} (double-buffered), two positions x eight records a step */
     int nb = tc > t0 ? (tc - t0 + {BT - 1}) / {BT} : 0;
-    if (nb > 0) {KF(0, "DESC(desc, 0)", KB0, f"(int)(Kc + (t0 * {NKV} + kvh) * {HD})")};
+    if (nb > 0) {KF(0, f"DESC(desc, {DB})", KB0, f"(int)(Kc + (t0 * {NKV} + kvh) * {HD})")};
     for (int b = 0; b < nb; b++) {{
       int p = b & 1;
-      if (b + 1 < nb) {{ if (p == 0) {KF(1, "DESC(desc, 0)", KB0 + BT * HD * 4, f"(int)(Kc + ((t0 + (b + 1) * {BT}) * {NKV} + kvh) * {HD})")};
-                        else        {KF(0, "DESC(desc, 0)", KB0, f"(int)(Kc + ((t0 + (b + 1) * {BT}) * {NKV} + kvh) * {HD})")}; }}
+      if (b + 1 < nb) {{ if (p == 0) {KF(1, f"DESC(desc, {DB})", KB0 + BT * HD * ES, f"(int)(Kc + ((t0 + (b + 1) * {BT}) * {NKV} + kvh) * {HD})")};
+                        else        {KF(0, f"DESC(desc, {DB})", KB0, f"(int)(Kc + ((t0 + (b + 1) * {BT}) * {NKV} + kvh) * {HD})")}; }}
       if (p == 0) DMA_WAIT(0); else DMA_WAIT(1);
-      __global float* kb = LSF({KB0} + p * {BT * HD * 4});
+      {CT}* kb = {LSC}({KB0} + p * {BT * HD * ES});
       for (int jt = 0; jt < {BT}; jt += 2) {{
         int t = t0 + b * {BT} + jt; if (t >= tc) break;
-        __global float* kr0 = kb + jt * {HD}; __global float* kr1 = kr0 + {HD};
+        {CT}* kr0 = kb + jt * {HD}; {CT}* kr1 = kr0 + {HD};
         for (int o = 0; o < NO; o++) {{
-          __global float* qb = QB + o * {QS};
-          {_p1(HD, True)}
+          {QT}* qb = QB + o * {QS};
+          {_p1h(HD, True) if kvh else _p1(HD, True)}
           __global float* so = SC + o * CLd * 8 + (t - t0) * 8;
           *(__global float8*)so = hsumT({xs}) * BC({scale!r}f);
           if (t + 1 < tc) *(__global float8*)(so + 8) = hsumT({ys}) * BC({scale!r}f);
@@ -263,11 +330,11 @@ __kernel void {kname}(__global float* restrict part, __global float* restrict q_
     /* the new rows (t >= pos): k normed and rotated locally, scored where the record's row sees it */
     for (int t = tc > t0 ? tc : t0; t < t1; t++) {{
       DMA_FILL(2, DESC(desc, 1), {KS}, (int)(kv_rows + (t - pos) * {KR} + kvh * {HD})); DMA_WAIT(2);
-      norm_rope(LSF({KN}), LSF({KS}), knw, rope + {RPN("t")} * {2 * ROT});
-      __global float* kr0 = LSF({KN});
+      norm_rope(LSF({KN}), LSF({KS}), knw, rope + {RPN("t")} * {2 * ROT});{" " + _F2H(f"LSH({KS})", f"LSF({KN})", HD) if kvh else ""}
+      {CT}* kr0 = {LSC}({KS if kvh else KN});
       for (int o = 0; o < NO; o++) {{
-        __global float* qb = QB + o * {QS};
-        {_p1(HD, False)}
+        {QT}* qb = QB + o * {QS};
+        {_p1h(HD, False) if kvh else _p1(HD, False)}
         __global float* so = SC + o * CLd * 8 + (t - t0) * 8;
         *(__global float8*)so = hsumT({xs}) * BC({scale!r}f);
         for (int l = 0; l < 8 && o * 8 + l < R; l++) {{ int r = (j0 + o * 8 + l) % {M}; if (!{VIS("r", "t")}) so[l] = {NEG}; }}
@@ -275,13 +342,13 @@ __kernel void {kname}(__global float* restrict part, __global float* restrict q_
     }}
 {sm_online if CLC else sm_old}
     /* pass 2: o += p V, two records x 64 dims in registers over a block */
-    if (nb > 0) {KF(0, "DESC(desc, 0)", KB0, f"(int)(Vc + (t0 * {NKV} + kvh) * {HD})")};
+    if (nb > 0) {KF(0, f"DESC(desc, {DB})", KB0, f"(int)(Vc + (t0 * {NKV} + kvh) * {HD})")};
     for (int b = 0; b < nb; b++) {{
       int p = b & 1;
-      if (b + 1 < nb) {{ if (p == 0) {KF(1, "DESC(desc, 0)", KB0 + BT * HD * 4, f"(int)(Vc + ((t0 + (b + 1) * {BT}) * {NKV} + kvh) * {HD})")};
-                        else        {KF(0, "DESC(desc, 0)", KB0, f"(int)(Vc + ((t0 + (b + 1) * {BT}) * {NKV} + kvh) * {HD})")}; }}
+      if (b + 1 < nb) {{ if (p == 0) {KF(1, f"DESC(desc, {DB})", KB0 + BT * HD * ES, f"(int)(Vc + ((t0 + (b + 1) * {BT}) * {NKV} + kvh) * {HD})")};
+                        else        {KF(0, f"DESC(desc, {DB})", KB0, f"(int)(Vc + ((t0 + (b + 1) * {BT}) * {NKV} + kvh) * {HD})")}; }}
       if (p == 0) DMA_WAIT(0); else DMA_WAIT(1);
-      __global float* vb = LSF({KB0} + p * {BT * HD * 4});
+      {CT}* vb = {LSC}({KB0} + p * {BT * HD * ES});
       int tb = t0 + b * {BT}, nt = tc - tb < {BT} ? tc - tb : {BT};
       for (int o = 0; o < NO; o++) {{
         __global float* pe = SC + o * CLd * 8 + (tb - t0) * 8;
@@ -294,9 +361,9 @@ __kernel void {kname}(__global float* restrict part, __global float* restrict q_
       for (int jj = 0; jj < R; jj++) {{
         int r = (j0 + jj) % {M}; if (!{VIS("r", "t")}) continue;
         float8 sa = BC(SC[(jj >> 3) * CLd * 8 + (jj & 7) + (t - t0) * 8]); __global float* oa = QO + jj * {PW};
-        {_p2_one(HD)}
+        {_p2_one_split(HD) if kvh else _p2_one(HD)}
       }}
-    }}{chunk_close}
+    }}{chunk_close}{(chr(10) + "    for (int jj = 0; jj < R; jj++) { __global float* rec = QO + jj * " + str(PW) + "; " + _unsplit(HD, "rec") + " }") if kvh else ""}
     /* the records out: one 2-D drain per run of rows of one head */
     for (int jj = 0; jj < R; ) {{
       int j = j0 + jj, h = kvh * {g} + j / {M}, r = j % {M}, nr = {M} - r; if (nr > R - jj) nr = R - jj;
@@ -371,14 +438,14 @@ def bench_arm(kern, NH, NKV, HD, TMAX, ROT, eps, M, opts, I, desc, part):
 def attn_dec3_desc(NH, NKV, HD, BT=2):
   K = _K(); g = NH // NKV
   return K.V._desc_slots(*([(BT * HD * 4, HD * 4, NKV * HD * 4, HD * 4), (HD * 4,)] + [(n * HD * 4, HD * 4, 2 * HD * 4, HD * 4) for n in range(1, g + 1)]
-                           + [(n * HD * 4,) for n in range(1, g + 1)]))
+                           + [(n * HD * 4,) for n in range(1, g + 1)] + [(BT * HD * 2, HD * 2, NKV * HD * 2, HD * 2), (HD * 2,)]))   # (the last two: fp16 caches)
 
 
 DEC3_CL1 = 512                                                               # attn_dec3: the positions one chunk of scores holds when the whole context fits LSRAM
 DEC3_CLC = 256                                                               # ... and a chunk's positions when it does not (the q octets and o then both stay resident)
 
 
-def attn_dec3_src(NH, NKV, HD, TMAX, ROT, eps, U=1, BT=2, nidx=False, kvb=0):
+def attn_dec3_src(NH, NKV, HD, TMAX, ROT, eps, U=1, BT=2, nidx=False, kvb=0, kvh=False):
   """attn_dec2 (the plain decode step's attention, one row) in kv-head units: a unit = (kv head, one of U runs of its g query heads);
   the unit streams the head's K / V rows [0, pos) once by DMA (blocks of BT rows, double-buffered), scores two positions x its
   heads a step (attn_gqa's transposed sum = dot256's order), and keeps attn_dec2's arithmetic per head: the max from -1e30, the
@@ -390,6 +457,7 @@ def attn_dec3_src(NH, NKV, HD, TMAX, ROT, eps, U=1, BT=2, nidx=False, kvb=0):
   K = _K(); NT = K.NT; g = NH // NKV; scale = 1.0 / HD ** 0.5; LOG2E = 1.4426950408889634
   KF = (lambda f, d, off, a: f"DMA_FILL({f}, {d}, {off}, {a})") if not kvb else (lambda f, d, off, a: f"DMA_FILLB({f}, {d}, {off}, {a}, {kvb})")
   KD = (lambda f, d, off, a: f"DMA_DRAIN({f}, {d}, {off}, {a})") if not kvb else (lambda f, d, off, a: f"DMA_DRAINB({f}, {d}, {off}, {a}, {kvb})")
+  ES = 2 if kvh else 4; CT = "__global half" if kvh else "__global float"; LSC = "LSH" if kvh else "LSF"; DB, DR = (2 + 2 * g, 3 + 2 * g) if kvh else (0, 1)
   assert 1 <= U <= g and NKV * U < NT and BT % 2 == 0 and g <= 8
   NHU = -(-g // U)                                                            # heads a unit (the last may hold fewer)
   chunked = TMAX > DEC3_CL1; CLC = DEC3_CLC if chunked else TMAX
@@ -397,53 +465,53 @@ def attn_dec3_src(NH, NKV, HD, TMAX, ROT, eps, U=1, BT=2, nidx=False, kvb=0):
   assert END <= 32768 - 64 and CLC * 32 >= NHU * HD * 4 and 2 * BT * HD * 4 >= HD * 4 and CLC % BT == 0, (END, NHU)
   xs = ", ".join(f"x{l}" for l in L8); ys = ", ".join(f"y{l}" for l in L8)
   p2 = " ".join(f"if ({2 * p} < R) {{ __global float* oa = OOp + {2 * p * HD}; __global float* ob = {2 * p + 1} < R ? oa + {HD} : LSF({KS}); "
-                + _p2_pair(HD, 2 * p, 2 * p + 1) + " }" for p in range(4))
-  return K.V.FULL_H + K.EXP + _norm_rope_c(HD, ROT, eps) + _HSUMT + f"""
+                + (_p2h_pair(HD, 2 * p, 2 * p + 1) if kvh else _p2_pair(HD, 2 * p, 2 * p + 1)) + " }" for p in range(4))
+  QT = "__global half" if kvh else "__global float"
+  return K.V.FULL_H + K.EXP + (_FMA16 if kvh else "") + _norm_rope_c(HD, ROT, eps) + _HSUMT + f"""
 __kernel void attn_dec2(__global float* restrict o_rows, __global float* restrict q_rows, __global float* restrict kv_rows,
                         __global float* restrict qnw_all, __global float* restrict knw_all, __global float* restrict rope,
-                        __global float* restrict Kall, __global float* restrict Vall, __global int* restrict idx, __global int* restrict desc, const int core_id) {{
+                        {CT}* restrict Kall, {CT}* restrict Vall, __global int* restrict idx, __global int* restrict desc, const int core_id) {{
   int L = idx[{2 if nidx else 0}], pos = idx[1];{" int Ln = idx[0];" if nidx else ""}
-  __global float* Kc = Kall + (L * {TMAX}) * {NKV * HD}; __global float* Vc = Vall + (L * {TMAX}) * {NKV * HD};
+  {CT}* Kc = Kall + (L * {TMAX}) * {NKV * HD}; {CT}* Vc = Vall + (L * {TMAX}) * {NKV * HD};
   __global float* qnw = qnw_all + {"Ln" if nidx else "L"} * {HD}; __global float* knw = knw_all + {"Ln" if nidx else "L"} * {HD}; __global float* cs = rope + pos * {2 * ROT};
   if (core_id >= {NKV * U}) {{                                       /* the new token's k (normed, rotated) and v into the cache by DMA */
     for (int kh = core_id - {NKV * U}; kh < {NKV}; kh += {NT - NKV * U}) {{
       DMA_FILL(2, DESC(desc, 1), {KS}, (int)(kv_rows + kh * {HD})); DMA_FILL(3, DESC(desc, 1), {KB0}, (int)(kv_rows + {NKV * HD} + kh * {HD}));
-      DMA_WAIT(2); norm_rope(LSF({KN}), LSF({KS}), knw, cs); {KD(2, "DESC(desc, 1)", KN, f"(int)(Kc + (pos * {NKV} + kh) * {HD})")};
-      DMA_WAIT(3); {KD(3, "DESC(desc, 1)", KB0, f"(int)(Vc + (pos * {NKV} + kh) * {HD})")}; DMA_WAIT(2); DMA_WAIT(3);
+      DMA_WAIT(2); norm_rope(LSF({KN}), LSF({KS}), knw, cs);{" " + _F2H(f"LSH({KS})", f"LSF({KN})", HD) if kvh else ""} {KD(2, f"DESC(desc, {DR})", KS if kvh else KN, f"(int)(Kc + (pos * {NKV} + kh) * {HD})")};
+      DMA_WAIT(3);{" " + _F2H(f"LSH({KS + HD * 2})", f"LSF({KB0})", HD) if kvh else ""} {KD(3, f"DESC(desc, {DR})", KS + HD * 2 if kvh else KB0, f"(int)(Vc + (pos * {NKV} + kh) * {HD})")}; DMA_WAIT(2); DMA_WAIT(3);
     }}
     return;
   }}
   int kvh = core_id / {U}, part = core_id % {U}, h0 = kvh * {g} + part * {NHU}, R = {g} - part * {NHU}; if (R > {NHU}) R = {NHU};
-  __global float* QOp = LSF({QO}); __global float* OOp = LSF({OO}); __global float* S = LSF({SC});
+  __global float* QOp = LSF({QO}); __global float* OOp = LSF({OO}); __global float* S = LSF({SC}); {QT}* qb = ({QT}*)QOp;
   DMA_FILL(2, DESC(desc, 1 + R), {SC}, (int)(q_rows + h0 * {2 * HD})); DMA_FILL(3, DESC(desc, 1), {KS}, (int)(kv_rows + kvh * {HD}));
-  for (int i = 0; i < {HD // 8}; i++) for (int l = R; l < 8; l++) *(__global float8*)(QOp + (8 * i + l) * 8) = BC(0.0f);
+  for (int i = 0; i < {HD // 16 if kvh else HD // 8}; i++) for (int l = R; l < 8; l++) *(__global float8*)(QOp + (8 * i + l) * 8) = BC(0.0f);
   DMA_WAIT(2);
   for (int ii = 0; ii < R; ii++) {{
     norm_rope(LSF({KN}), S + ii * {HD}, qnw, cs);
-    for (int i = 0; i < {HD // 8}; i++) *(__global float8*)(QOp + (8 * i + ii) * 8) = *(__global float8*)(LSF({KN}) + i * 8);
+    {f"for (int i = 0; i < {HD // 16}; i++) *(__global half16*)(qb + (8 * i + ii) * 16) = CVT16(*(__global float8*)(LSF({KN}) + i * 16), *(__global float8*)(LSF({KN}) + i * 16 + 8));" if kvh else f"for (int i = 0; i < {HD // 8}; i++) *(__global float8*)(QOp + (8 * i + ii) * 8) = *(__global float8*)(LSF({KN}) + i * 8);"}
   }}
-  DMA_WAIT(3); norm_rope(LSF({KN}), LSF({KS}), knw, cs);
-  __global float* qb = QOp;
+  DMA_WAIT(3); norm_rope(LSF({KN}), LSF({KS}), knw, cs);{" " + _F2H(f"LSH({KS})", f"LSF({KN})", HD) if kvh else ""}
   float8 mx = BC(-1e30f), sum = BC(0.0f); int cz = 0;
   for (int ca = 0; ca <= pos; ca += {CLC}) {{                        /* the positions [ca, cb) of 0..pos: the cache rows [ca, ce), then the new token when cb > pos */
     int cb = ca + {CLC} < pos + 1 ? ca + {CLC} : pos + 1, ce = cb < pos ? cb : pos, n = cb - ca; cz = ca;
     int nb = (ce - ca + {BT - 1}) / {BT};
-    if (nb > 0) {KF(0, "DESC(desc, 0)", KB0, f"(int)(Kc + (ca * {NKV} + kvh) * {HD})")};
+    if (nb > 0) {KF(0, f"DESC(desc, {DB})", KB0, f"(int)(Kc + (ca * {NKV} + kvh) * {HD})")};
     for (int b = 0; b < nb; b++) {{
       int p = b & 1;
-      if (b + 1 < nb) {{ if (p == 0) {KF(1, "DESC(desc, 0)", KB0 + BT * HD * 4, f"(int)(Kc + ((ca + (b + 1) * {BT}) * {NKV} + kvh) * {HD})")};
-                        else        {KF(0, "DESC(desc, 0)", KB0, f"(int)(Kc + ((ca + (b + 1) * {BT}) * {NKV} + kvh) * {HD})")}; }}
+      if (b + 1 < nb) {{ if (p == 0) {KF(1, f"DESC(desc, {DB})", KB0 + BT * HD * ES, f"(int)(Kc + ((ca + (b + 1) * {BT}) * {NKV} + kvh) * {HD})")};
+                        else        {KF(0, f"DESC(desc, {DB})", KB0, f"(int)(Kc + ((ca + (b + 1) * {BT}) * {NKV} + kvh) * {HD})")}; }}
       if (p == 0) DMA_WAIT(0); else DMA_WAIT(1);
-      __global float* kb = LSF({KB0} + p * {BT * HD * 4});
+      {CT}* kb = {LSC}({KB0} + p * {BT * HD * ES});
       for (int jt = 0; jt < {BT}; jt += 2) {{
         int t = ca + b * {BT} + jt; if (t >= ce) break;
-        __global float* kr0 = kb + jt * {HD}; __global float* kr1 = kr0 + {HD};
-        {_p1(HD, True)}
+        {CT}* kr0 = kb + jt * {HD}; {CT}* kr1 = kr0 + {HD};
+        {_p1h(HD, True) if kvh else _p1(HD, True)}
         *(__global float8*)(S + (t - ca) * 8) = hsumT({xs}) * BC({scale!r}f);
         if (t + 1 < ce) *(__global float8*)(S + (t - ca) * 8 + 8) = hsumT({ys}) * BC({scale!r}f);
       }}
     }}
-    if (cb > pos) {{ __global float* kr0 = LSF({KN}); {_p1(HD, False)} *(__global float8*)(S + (pos - ca) * 8) = hsumT({xs}) * BC({scale!r}f); }}
+    if (cb > pos) {{ {CT}* kr0 = {LSC}({KS if kvh else KN}); {_p1h(HD, False) if kvh else _p1(HD, False)} *(__global float8*)(S + (pos - ca) * 8) = hsumT({xs}) * BC({scale!r}f); }}
     float8 mc = BC(-1e30f); for (int t = 0; t < n; t++) mc = VMAX(mc, *(__global float8*)(S + t * 8));
     float8 mn = VMAX(mx, mc);
     if (ca > 0) {{                                                    /* the max grew: the sum and o so far rescaled */
@@ -453,19 +521,19 @@ __kernel void attn_dec2(__global float* restrict o_rows, __global float* restric
     mx = mn;
     for (int t = 0; t < n; t++) {{ float8 e = exp2_d4((*(__global float8*)(S + t * 8) - mx) * BC({LOG2E!r}f)); *(__global float8*)(S + t * 8) = e; sum += e; }}
     if (ca == 0) for (int i = 0; i < R * {HD}; i += 8) *(__global float8*)(OOp + i) = BC(0.0f);
-    if (nb > 0) {KF(0, "DESC(desc, 0)", KB0, f"(int)(Vc + (ca * {NKV} + kvh) * {HD})")};
+    if (nb > 0) {KF(0, f"DESC(desc, {DB})", KB0, f"(int)(Vc + (ca * {NKV} + kvh) * {HD})")};
     for (int b = 0; b < nb; b++) {{
       int p = b & 1;
-      if (b + 1 < nb) {{ if (p == 0) {KF(1, "DESC(desc, 0)", KB0 + BT * HD * 4, f"(int)(Vc + ((ca + (b + 1) * {BT}) * {NKV} + kvh) * {HD})")};
-                        else        {KF(0, "DESC(desc, 0)", KB0, f"(int)(Vc + ((ca + (b + 1) * {BT}) * {NKV} + kvh) * {HD})")}; }}
+      if (b + 1 < nb) {{ if (p == 0) {KF(1, f"DESC(desc, {DB})", KB0 + BT * HD * ES, f"(int)(Vc + ((ca + (b + 1) * {BT}) * {NKV} + kvh) * {HD})")};
+                        else        {KF(0, f"DESC(desc, {DB})", KB0, f"(int)(Vc + ((ca + (b + 1) * {BT}) * {NKV} + kvh) * {HD})")}; }}
       if (p == 0) DMA_WAIT(0); else DMA_WAIT(1);
-      __global float* vb = LSF({KB0} + p * {BT * HD * 4});
+      {CT}* vb = {LSC}({KB0} + p * {BT * HD * ES});
       int tb = ca + b * {BT}, nt = ce - tb < {BT} ? ce - tb : {BT};
       __global float* pe = S + (tb - ca) * 8;
       {p2}
     }}
   }}
-  DMA_FILL(2, DESC(desc, 1), {KS}, (int)(kv_rows + {NKV * HD} + kvh * {HD})); DMA_WAIT(2);
+  DMA_FILL(2, DESC(desc, 1), {KS}, (int)(kv_rows + {NKV * HD} + kvh * {HD})); DMA_WAIT(2);{(" for (int jj = 0; jj < R; jj++) { __global float* rec = OOp + jj * " + str(HD) + "; " + _unsplit(HD, "rec") + " }") if kvh else ""}
   for (int j0 = 0; j0 < R; j0 += {2 * BT}) {{
     int ng = R - j0 < {2 * BT} ? R - j0 : {2 * BT};
     DMA_FILL(3, DESC(desc, 1 + ng), {KB0}, (int)(q_rows + (h0 + j0) * {2 * HD} + {HD})); DMA_WAIT(3);

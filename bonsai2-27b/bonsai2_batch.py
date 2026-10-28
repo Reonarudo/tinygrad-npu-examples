@@ -102,7 +102,7 @@ class Batch:
     a_h = K.rms_a(X, (M.Win_a, a0), H, "a_h"); ct = L.lin_cts(a_h, slot, meta, ("q", "kv")); QR, KR = R.NH * 2 * R.HD, 2 * R.NKV * R.HD
     q_rows = K.unpack(ct["q"][0], QR, "q_rows", goff=ct["q"][1]); kv_rows = K.unpack(ct["kv"][0], KR, "kv_rows", goff=ct["kv"][1])
     O = K.rows_buf("o_gather", max(R.NV * R.DV, R.NH * R.HD))
-    K.call(f"attn_decb|{N}|{self.TMAX}|nidx|{kvb}", AB.attn_decb_src(R.NH, R.NKV, R.HD, self.TMAX, R.ROT, R.EPS, N, nidx=True, kvb=kvb), O, q_rows, kv_rows, self.QN, self.KN, M.ROPE, Kall, Vall, at, K.desc("attn_dec3_desc", lambda: __import__("attn_gqa").attn_dec3_desc(R.NH, R.NKV, R.HD)))
+    K.call(f"attn_decb|{N}|{self.TMAX}|nidx|{kvb}|{M.kvh}", AB.attn_decb_src(R.NH, R.NKV, R.HD, self.TMAX, R.ROT, R.EPS, N, nidx=True, kvb=kvb, kvh=M.kvh), O, q_rows, kv_rows, self.QN, self.KN, M.ROPE, Kall, Vall, at, K.desc("attn_dec3_desc", lambda: __import__("attn_gqa").attn_dec3_desc(R.NH, R.NKV, R.HD)))
     a_o = K.rms_a(O, None, R.NH * R.HD, "a_o", norm=False)
     x1 = K.resid(X, L.lin_ct(a_o, slot, meta, "o"), H, "x1")
     return L.mlp(x1, slot, meta, (M.Wpost_a, a0), f"xiov{1 - par}").realize()
@@ -138,7 +138,7 @@ class Batch:
     q_rows = K.unpack(ct["q"][0], QR, "q_rows", goff=ct["q"][1]); kv_rows = K.unpack(ct["kv"][0], KR, "kv_rows", goff=ct["kv"][1])
     q1 = [k.rows_buf("q_rows", QR) for k in self.K1]; kv1 = [k.rows_buf("kv_rows", KR) for k in self.K1]
     K.call(f"rows_scatter|{QR}|{N}", rows_scatter_src(QR, N), q1[0], *q1[1:], q_rows); K.call(f"rows_scatter|{KR}|{N}", rows_scatter_src(KR, N), kv1[0], *kv1[1:], kv_rows)
-    outs = [self.K1[u].attn_dec2(q1[u], kv1[u], self.QN, self.KN, M.ROPE, *self.kv(kvb), ua[u], R.NH, R.NKV, R.HD, self.TMAX, R.ROT, nidx=True, kvb=kvb) for u in range(N)]
+    outs = [self.K1[u].attn_dec2(q1[u], kv1[u], self.QN, self.KN, M.ROPE, *self.kv(kvb), ua[u], R.NH, R.NKV, R.HD, self.TMAX, R.ROT, nidx=True, kvb=kvb, kvh=M.kvh) for u in range(N)]
     K.call(f"rows_gather|{R.NH * R.HD}|{N}", rows_gather_src(R.NH * R.HD, N), self.O, *[self.K1[u].bufs["o_rows"] for u in range(N)])
     a_o = K.rms_a(self.O, None, R.NH * R.HD, "a_o", norm=False)
     x1 = K.resid(X, L.lin_ct(a_o, slot, meta, "o"), H, "x1")

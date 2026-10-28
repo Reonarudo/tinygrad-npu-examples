@@ -131,8 +131,12 @@ def main():
   ap.add_argument("--dir", default=os.environ["QWEN_DIR"]); ap.add_argument("--cache", default=os.environ["QWEN_NPU"]); a = ap.parse_args()
   auto = a.tmax == "auto" or os.environ.get("QWEN_TMAX_AUTO") == "1"
   os.environ.setdefault("QWEN_KV_USERS", str(a.users)); asid = os.environ.get("QWEN_KV_ASID", "0") == "1"
+  # the batched server is for throughput: fp32 caches unless an explicit --tmax needs fp16 to fit (QWEN_KV_DTYPE overrides)
+  if "QWEN_KV_DTYPE" not in os.environ:
+    if a.tmax == "auto" or S.asid_tmax(a.users, R.NL // 4, R.NKV, R.HD, False, int(a.tmax))[0] >= int(a.tmax): os.environ["QWEN_KV_DTYPE"] = "f32"
+    else: os.environ["QWEN_KV_DTYPE"] = "f16"
   a.tmax, kv_gb = S.auto_tmax(a.users, float(os.environ.get("QWEN_KV_GB", "2.0")), R.NL // 4, R.NKV, R.HD, want=int(os.environ.get("QWEN_TMAX_MAX", "262144")), mtp=False) if a.tmax == "auto" else (int(a.tmax), (S.asid_tmax(a.users, R.NL // 4, R.NKV, R.HD, False, int(a.tmax))[1] if asid else S.kv_window_bytes(a.users, R.NL // 4, R.NKV, R.HD, int(a.tmax), False) / 1e9))
-  print(f"   context {a.tmax} tokens: K / V caches {kv_gb:.2f} GB {'in the fullest of ASIDs 1-3 (3 GiB each; none of the ASID0 window)' if asid else f'of the NPU window ({1 + a.users} x {R.NL // 4} attention layers as buffers; ~2.75 GB in all)'}", flush=True)
+  print(f"   context {a.tmax} tokens: K / V caches {kv_gb:.2f} GB {'in the fullest of ASIDs 1-3 (3 GiB each; none of the ASID0 window; ' + os.environ.get('QWEN_KV_DTYPE', 'f16') + ')' if asid else f'of the NPU window ({1 + a.users} x {R.NL // 4} attention layers as buffers; ~2.75 GB in all)'}", flush=True)
   eng = S.engine_fit(BatchEngine, a, auto); srv = S.ThreadingHTTPServer((a.host, a.port), S.make_handler(eng, a.model_name))
   print(f"== serving {a.model_name} on http://{a.host}:{a.port}/v1 (OpenAI- / Ollama-compatible; greedy; {a.users} requests a step; context {a.tmax} tokens)", flush=True)
   threading.Thread(target=srv.serve_forever, daemon=True).start()

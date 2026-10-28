@@ -3974,16 +3974,16 @@ class Kernels:
     kk = self.key(f"attn_decode|{TMAX}", attn_decode_src(NH, NKV, HD, TMAX))
     o = self.buf("attn_o", NH * HD, dtypes.float32)
     OA.csrc_call(kk, o, q, Kall, Vall, knew, vnew, idx).realize(); return o.reshape(NH, HD)
-  def attn_dec2(self, q_rows, kv_rows, qnw, knw, rope, Kall, Vall, idx, NH, NKV, HD, TMAX, ROT, nidx=False, kvb=0):
+  def attn_dec2(self, q_rows, kv_rows, qnw, knw, rope, Kall, Vall, idx, NH, NKV, HD, TMAX, ROT, nidx=False, kvb=0, kvh=False):
     """The fused decode attention (attn_dec2_src) -> the persistent o_rows [rows, NH*HD], the token in row 0. `nidx`: idx[2] is the
     norm weights' layer (KV slots; attn_dec3 only)."""
     if attn_gqa_on() and NH // NKV <= 8:                                # attn_dec3 (attn_gqa.py): byte-identical o_rows / cache; chunked past 512 positions
       import attn_gqa as AG
       U = int(os.environ.get("QWEN_ATTN_DEC_U", "1"))
       if f"attn_dec3_desc" not in self.bufs: self.bufs["attn_dec3_desc"] = Tensor(AG.attn_dec3_desc(NH, NKV, HD), device=DEV).realize()
-      kk = self.key(f"attn_dec2|kv|{TMAX}|{U}|{nidx}|{kvb}", AG.attn_dec3_src(NH, NKV, HD, TMAX, ROT, self.eps, U=U, nidx=nidx, kvb=kvb))
+      kk = self.key(f"attn_dec2|kv|{TMAX}|{U}|{nidx}|{kvb}|{kvh}", AG.attn_dec3_src(NH, NKV, HD, TMAX, ROT, self.eps, U=U, nidx=nidx, kvb=kvb, kvh=kvh))
       return self.run(kk, "o_rows", self.rows * NH * HD, dtypes.float32, q_rows, kv_rows, qnw, knw, rope, Kall, Vall, idx, self.bufs["attn_dec3_desc"]).reshape(self.rows, NH * HD)
-    assert not nidx and not kvb, "attn_dec2_src has neither the norm index word nor a cache base code (QWEN_ATTN_GQA=0 with the caches in an ASID)"
+    assert not nidx and not kvb and not kvh, "attn_dec2_src has neither the norm index word nor a cache base code nor fp16 caches (QWEN_ATTN_GQA=0 with the caches in an ASID)"
     kk = self.key(f"attn_dec2|{TMAX}", attn_dec2_src(NH, NKV, HD, TMAX, ROT, self.eps))
     return self.run(kk, "o_rows", self.rows * NH * HD, dtypes.float32, q_rows, kv_rows, qnw, knw, rope, Kall, Vall, idx).reshape(self.rows, NH * HD)
   def gdn_lsr(self, Sall, idx, q, k, v, beta, decay, NV, DK, DV, n, diag=None):
@@ -4083,12 +4083,12 @@ class Kernels:
     part = self.run(kp, "attn_part", NH * M * P * (HD + 16), dtypes.float32, q_rows, kv_rows, qnw, knw, rope, Kall, Vall, idx, self.bufs["attn_part_desc"], treeb)
     kc = self.key(f"attn_comb|{TMAX}|{M}", attn_comb_src(NH, HD, M, TMAX))
     return self.run(kc, "o_rows", self.rows * NH * HD, dtypes.float32, part, q_rows).reshape(self.rows, NH * HD)
-  def attn_decm(self, q_rows, kv_rows, qnw, knw, rope, Kall, Vall, idx, NH, NKV, HD, TMAX, ROT, nidx=False, kvb=0):
+  def attn_decm(self, q_rows, kv_rows, qnw, knw, rope, Kall, Vall, idx, NH, NKV, HD, TMAX, ROT, nidx=False, kvb=0, kvh=False):
     """attn_dec2 for the `real` rows at positions pos .. pos + real - 1 -> the persistent o_rows: attn_part + attn_comb (the cache
     streamed through LSRAM by (head, position slice) units); QWEN_ATTN=decm: the one-kernel attn_decm_src. `nidx`: attn_gqa_src's."""
     if os.environ.get("QWEN_ATTN", "split") == "split" and attn_gqa_on():
-      return self._attn_gqa(q_rows, kv_rows, qnw, knw, rope, Kall, Vall, idx, None, NH, NKV, HD, TMAX, ROT, nidx=nidx, kvb=kvb)
-    assert not nidx and not kvb, "the norm index word is attn_gqa's (QWEN_ATTN_GQA=1)"
+      return self._attn_gqa(q_rows, kv_rows, qnw, knw, rope, Kall, Vall, idx, None, NH, NKV, HD, TMAX, ROT, nidx=nidx, kvb=kvb, kvh=kvh)
+    assert not nidx and not kvb and not kvh, "the norm index word is attn_gqa's (QWEN_ATTN_GQA=1)"
     if os.environ.get("QWEN_ATTN", "split") == "split":
       M = self.real; P = attn_parts(NH, HD, TMAX)
       if "attn_part_desc" not in self.bufs: self.bufs["attn_part_desc"] = Tensor(attn_part_desc(NKV, HD), device=DEV).realize()
@@ -4098,7 +4098,7 @@ class Kernels:
       return self.run(kc, "o_rows", self.rows * NH * HD, dtypes.float32, part, q_rows).reshape(self.rows, NH * HD)
     kk = self.key(f"attn_decm|{TMAX}|{self.real}", attn_decm_src(NH, NKV, HD, TMAX, ROT, self.eps, self.real))
     return self.run(kk, "o_rows", self.rows * NH * HD, dtypes.float32, q_rows, kv_rows, qnw, knw, rope, Kall, Vall, idx).reshape(self.rows, NH * HD)
-  def _attn_gqa(self, q_rows, kv_rows, qnw, knw, rope, Kall, Vall, idx, treeb, NH, NKV, HD, TMAX, ROT, nidx=False, kvb=0):
+  def _attn_gqa(self, q_rows, kv_rows, qnw, knw, rope, Kall, Vall, idx, treeb, NH, NKV, HD, TMAX, ROT, nidx=False, kvb=0, kvh=False):
     """attn_part / attn_partt + attn_comb as the kv-head kernels (attn_gqa.py): the same records, the same o_rows, byte for byte
     (checked on the vendor simulator). `treeb` None: the chain rule; else the tree table."""
     import attn_gqa as AG
@@ -4106,7 +4106,7 @@ class Kernels:
     dk, ck = f"attn_gqa_desc{M}", f"attn_comb2_desc{M}"
     if dk not in self.bufs: self.bufs[dk] = Tensor(AG.attn_gqa_desc(NH, NKV, HD, TMAX, M), device=DEV).realize()
     if ck not in self.bufs: self.bufs[ck] = Tensor(AG.attn_comb2_desc(NH, HD, TMAX, M), device=DEV).realize()
-    kp = self.key(f"{'attn_partt' if tree else 'attn_part'}|gqa|{TMAX}|{M}|{nte}|{nidx}|{kvb}", AG.attn_gqa_src(NH, NKV, HD, TMAX, ROT, self.eps, M, tree=tree, NTE=nte, nidx=nidx, kvb=kvb))
+    kp = self.key(f"{'attn_partt' if tree else 'attn_part'}|gqa|{TMAX}|{M}|{nte}|{nidx}|{kvb}|{kvh}", AG.attn_gqa_src(NH, NKV, HD, TMAX, ROT, self.eps, M, tree=tree, NTE=nte, nidx=nidx, kvb=kvb, kvh=kvh))
     part = self.run(kp, "attn_part", NH * M * P * (HD + 16), dtypes.float32, q_rows, kv_rows, qnw, knw, rope, Kall, Vall, idx, self.bufs[dk], *([treeb] if tree else []))
     kc = self.key(f"attn_comb|dma|{TMAX}|{M}", AG.attn_comb2_src(NH, HD, TMAX, M))
     return self.run(kc, "o_rows", self.rows * NH * HD, dtypes.float32, part, q_rows, self.bufs[ck]).reshape(self.rows, NH * HD)
