@@ -364,6 +364,44 @@ safetensors file, then `--mtp-gguf` on that file). Board o6n, 2026-10-26, three 
 The prompt goes through the verify path (`QWEN_PREFILL=chunked`: the one-pass prefill's DeltaNet kernel wants 48 value heads). Plain
 decoding on these sizes is `QWEN_DRAFT=none` (the verify path without drafts); `QWEN_SPEC=0` has no geometries for the chunked prefill.
 
+## Images: the vision tower (`vision/`)
+
+The 2B / 4B / 9B are Qwen3.5 shapes and their checkpoints ship a vision encoder (`Ternary-Bonsai-2-*-mmproj-Q8_0.gguf`, the
+Qwen3-VL tower: patch 16, 2 x 2 patch merge, 2-D rotary embedding, a bilinear interpolation of the 48 x 48 position grid, then the
+merger `mm.0` -> GELU -> `mm.2` into the language model's width; the 2B and 4B share one tower of 24 blocks, width 1024, 16 heads of
+64, MLP 4096; the 9B's is 27 blocks, width 1152, 16 heads of 72, MLP 4304, with F16 tensors among the Q8_0). `vision/vit_npu.py` runs
+the whole tower on the NPU: the ~100 linears on the Q8 GEMM path (`gemm_fp16.pack_b_group_q8f` panels, `gemm_gs` with 8-bit A), the
+layer norms, GELUs, residual adds and the 2-D rope as rows-mode kernels (`vision/vision_kernels.py`), and the attention as an
+online-softmax kernel over (head, 24 query rows) units streaming the keys in chunks (128 positions at 64 dims, 120 at 80). The patch
+embedding is a GEMM over the 768-wide flattened patches (the two temporal conv taps summed, as llama.cpp does). The pack requantises
+every linear to Q8_0 from fp32 after padding to the kernels' shapes: the 9B's 72-dim heads to 80 as [36 | 4 zeros | 36 | 4 zeros]
+(each rope half padded to 40, so the kernels' pairs (i, i + 40) are the model's (i, i + 36); the softmax scale keeps 1 / sqrt(72)) and
+its MLP to 4352 (zero rows / columns; GELU(0) = 0).
+`vision/vit_ref.py` is the numpy reference.
+
+The servers take images the OpenAI way (`image_url` content parts: `data:` base64 or an http URL) and Ollama's (`images` on a
+message, `/api/generate`'s `images`). The image is resized bicubically to multiples of 32 keeping its aspect (llama.cpp's smart
+resize; at most 1024 tokens of 32 x 32 pixels, 8 at least), its tokens replace the `<|image_pad|>` rows of the prompt's embedding,
+and the rope table gets Qwen-VL's m-RoPE rows: an image's tokens share the time axis, take their row / column on the height / width
+axes, the position counter advances by max(nx, ny) for the whole image, and the pairs of the 64 rotary dims take the three axes in
+turn (the interleaved 11 / 11 / 10 sections). Text-only requests get the plain table back. The pack happens on the first image
+(`<cache>/vision`, from the model directory's mmproj or `BONSAI_MMPROJ`).
+
+Board o6n, 2026-10-28, the 2B at 8192 context, a 640 x 480 test image (`vision/test.png`: a red circle, a blue rectangle, the text
+"NPU"; `python3 vision/vit_npu.py vision/test.png` runs the tower alone, `--ref` compares with `vit_ref.py`'s dumps):
+
+| | |
+| --- | --- |
+| tower, 1200 patches -> 300 tokens (20 x 15) | 2B 6.8-8.3 s, 4B 9.8 s (its wider projector), 9B 6.9-8.2 s (the Q8 GEMMs dominate: ~100 linears of 1024-4352 wide on 1200 rows) |
+| embeddings vs the numpy reference | rel err 5.7e-2, per-token cosine >= 0.90 (the tower is numerically sensitive: llama.cpp's own bf16 and Q8_0 mmproj differ by 24 %) |
+| "Describe the image in one sentence." | *a large red circle on the left and a solid blue square on the right, separated by a white background, with the text "KPU" in the bottom left corner* (llama.cpp's answer: *a red circle and a blue rectangle positioned side by side on a white background, with the text 'KPU'*) |
+| a second image (a green triangle), two images in one prompt, text after images | correct: "a green triangle"; "the second image contains a green triangle, which is not present in the first" |
+| the 4B | *a red circle on the left and a blue square on the right, both set against a white background with the text "RPU"*; "a green triangle" |
+| the 9B | *a red circle positioned to the left of a blue square, with the text "RPU" visible in the bottom left corner*; "a green triangle"; its tower vs numpy: embeddings rel err 2.3e-2, cosine >= 0.94 |
+
+The tower runs on the engine's thread before the request's prefill, so an image costs its tower time plus the prompt's (300 tokens
+~5 s on the 2B). The batched server (`bonsai2_batch_serve.py`) does not take images yet. The 27B has no mmproj.
+
 ## Batched decode: several requests a step (`bonsai2_batch.py`)
 
 N independent requests through one decode step: the linears -- the weight bytes -- run once for all N rows on the GEMM's rows mode (a
@@ -567,6 +605,7 @@ its 2048 default and its buffers (its one-pass prefill's part kernels are the ex
 | `bonsai2_serve.py` | the OpenAI- and Ollama-compatible server (`qwen3.8-27b/qwen38_serve.py` with these defaults) |
 | `bonsai2_gguf.py`, `bonsai2_weights.py` | the GGUF reader, the `PTQ1_0` decoder and the Hadamard contract; the GGUF under the HF tensor names |
 | `bonsai2_ref.py` | the numpy reference forward pass |
+| `vision/` | the vision tower on the NPU (`vit_npu.py`: pack + run; `vision_kernels.py`: its rows-mode kernels and the attention; `vit_ref.py`: the numpy reference) |
 | `serve-demo.gif` | the recording above |
 | `check/check_pack.py` | the pack round trip (no device) |
 | `check/emulate_layer.py` | a host emulation of the NPU's layers and head from the cache, against the reference (no device) |

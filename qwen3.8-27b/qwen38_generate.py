@@ -291,7 +291,7 @@ class Model:
         stack[i * R.H:(i + 1) * R.H].assign(dev(np.ascontiguousarray(small[key]).reshape(-1))).realize()
     self.xb = [K.rows_buf("xio0", R.H), K.rows_buf("xio1", R.H)]                             # decode: the residual stream ping-pongs between two persistent buffers
     self.jit_gdn, self.jit_att = {}, {}                                   # keyed (parity, the layer's kind: Layers.kind(l), None unless the streams differ by layer)
-    self.cos_dec, self.sin_dec = {}, {}
+    self.cos_dec, self.sin_dec = {}, {}; self.vis = None; self.rope_default = True
     # speculative decoding: M rows (the token + M - 1 drafts) a verify pass; the Q8_0 models prefill through the same geometries
     self.M = int(os.environ.get("QWEN_SPEC", spec_default))
     if R.Q8 and not self.M:                # QWEN_SPEC=0 on a Q8_0 model: plain decoding (no drafter: MTPL is None), but its prompt is
@@ -874,7 +874,7 @@ class Model:
     if NPU_IDS and not getattr(self, "_prompt_pass", False):              # vt holds [cur, drafts] (accept / pick_id wrote them)
       if self.need_feats: assert OA.host_invalidate(self.vtok).numpy()[:M].tolist() == [int(t) for t in toks], ("vt", OA.host_invalidate(self.vtok).numpy()[:M], toks)
       self._vemb(M)
-    else: poke(xbv[0], self.W.embed(list(toks)).astype(np.float32))       # rows M.. stay zero (no kernel writes them)
+    else: poke(xbv[0], self._embed_prompt(toks, pos) if getattr(self, "_prompt_pass", False) else self.W.embed(list(toks)).astype(np.float32))   # rows M.. stay zero (no kernel writes them)
     for i, t in enumerate(self.aix): poke(t, self._aixw(i, pos))
     poke(self.posb, np.array([pos], np.int32))
     if self.tree: assert M == self.M or self.leaf; poke(self.treeb, spec_tree.table(tree) if tree is not None else spec_tree.chain_table(M))
@@ -1127,9 +1127,42 @@ class Model:
     """True when the context is past the exact attention path's slices (attn_plan): the one-pass prefill's part kernels do not
     apply, the prompt goes through the verify path."""
     return QK.attn_plan(R.NH, R.HD, self.TMAX)[1] is not None
-  def prefill(self, ids, nlayers=None):
+  def set_vision(self, ids, vis):
+    """The prompt's images for the next prefill: `vis` = [(start index in ids, embeddings [n_img, H], nx, ny), ...] or None. The
+    embedding rows at the <|image_pad|> positions are replaced by the vision tower's, and the rope table gets the m-RoPE rows
+    (Qwen-VL): a text token's three axes are its position; an image's tokens share t = the position where it starts, h = that + the
+    row, w = that + the column, and the position counter advances by max(nx, ny) for the whole image; the pairs of the 64 rotary
+    dims take the axes t, h, w in turn (the interleaved sections 11 / 11 / 10). Rows are indexed by the sequence index the
+    kernels pass as `pos`, so every row of the table is that token's rope; after the prompt, position = index - delta."""
+    self.vis = vis or None; self.pos_delta = 0
+    if not vis:
+      if getattr(self, "rope_default", True) is False: self.ROPE.assign(dev(self._rope_rows(np.arange(self.TMAX, dtype=np.float64)[:, None].repeat(3, 1)))).realize(); self.rope_default = True
+      return
+    n = len(ids); pos3 = np.zeros((self.TMAX, 3), np.float64); c = 0; p = 0; starts = {s: (len(e), nx, ny) for s, e, nx, ny in vis}
+    while p < n:
+      if p in starts:
+        ni, nx, ny = starts[p]; i = np.arange(ni); pos3[p:p + ni, 0] = c; pos3[p:p + ni, 1] = c + i // nx; pos3[p:p + ni, 2] = c + i % nx; c += max(nx, ny); p += ni
+      else: pos3[p] = c; c += 1; p += 1
+    self.pos_delta = n - c; pos3[n:] = (np.arange(n, self.TMAX, dtype=np.float64) - self.pos_delta)[:, None]
+    self.ROPE.assign(dev(self._rope_rows(pos3))).realize(); self.rope_default = False
+  def _rope_rows(self, pos3):
+    """The rope table [TMAX, 2 ROT] (cos | cos | sin | sin over the 32 pairs) from per-row axis positions [TMAX, 3]: pair j turns by
+    pos[axis j % 3] x THETA^(-2 j / ROT)."""
+    inv = 1.0 / (R.THETA ** (np.arange(0, R.ROT, 2, dtype=np.float64) / R.ROT)); ax = np.arange(R.ROT // 2) % 3
+    ang = pos3[:, ax] * inv[None]; emb = np.concatenate([ang, ang], -1)
+    return np.concatenate([np.cos(emb), np.sin(emb)], -1).astype(np.float32).ravel()
+  def _embed_prompt(self, chunk, c0):
+    """The chunk's embedding rows (the host's), the image tokens' replaced by the vision tower's."""
+    x = self.W.embed(list(chunk)).astype(np.float32)
+    for s_, e, nx, ny in (self.vis or []):
+      lo, hi = max(c0, s_), min(c0 + len(chunk), s_ + len(e))
+      if lo < hi: x[lo - c0:hi - c0] = e[lo - s_:hi - s_]
+    return x
+  def prefill(self, ids, nlayers=None, vis=None):
+    self.set_vision(ids, vis)
     self.prefill_prelude()
     if R.Q8 or os.environ.get("QWEN_PREFILL") == "chunked" or self.prefill_long() or self.kvs: return self.prefill_chunked(ids)
+    assert not vis, "images need the chunked prefill (QWEN_PREFILL=chunked)"
     nlayers = R.NL if nlayers is None else nlayers
     n = len(ids); L = self.pre; assert n <= self.TMAX; self.ids_prompt = list(ids)
     x = np.zeros((L.R, R.H), np.float32); x[:n] = self.W.embed(ids); x = dev(x)
@@ -1197,7 +1230,8 @@ class Model:
     L = self.dec; assert pos < self.TMAX
     self.flush()
     x = np.zeros((L.R, R.H), np.float32); x[0] = self.W.embed([tok])[0]; self.xb[0].assign(dev(x)).realize()
-    if pos not in self.cos_dec: self.cos_dec[pos], self.sin_dec[pos] = rope_tables(pos, L.R)
+    pr = pos - getattr(self, 'pos_delta', 0)                                 # the rope position (images: the m-RoPE counter lags the index)
+    if pr not in self.cos_dec: self.cos_dec[pr], self.sin_dec[pr] = rope_tables(pr, L.R)
     for i, t in enumerate(self.aix): poke(t, self._aixw(i, pos))
     self.posb.assign(Tensor([pos], device=DEV, dtype=dtypes.int32)).realize()
     L.prefetch(0)
@@ -1207,7 +1241,7 @@ class Model:
       if R.LAYER_TYPES[l] == "full":
         self.meta_att = meta; kvb = self._kvb(self.aidx[l])
         if (kp := (par, L.kind(l), kvb)) not in self.jit_att: self.jit_att[kp] = TinyJit(functools.partial(self.att_step, par, kvb))
-        self.jit_att[kp](self.aix[self.aidx[l]], self.cos_dec[pos], self.sin_dec[pos], *[slot[k] for k in self.ATT_LIN], *[sm[k] for k in self.ATT_SMALL])
+        self.jit_att[kp](self.aix[self.aidx[l]], self.cos_dec[pr], self.sin_dec[pr], *[slot[k] for k in self.ATT_LIN], *[sm[k] for k in self.ATT_SMALL])
       else:
         self.meta_gdn = meta
         if (kp := (par, L.kind(l))) not in self.jit_gdn: self.jit_gdn[kp] = TinyJit(functools.partial(self.gdn_step, par))

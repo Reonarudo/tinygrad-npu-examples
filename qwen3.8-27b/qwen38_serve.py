@@ -19,13 +19,14 @@ unless the request sets "chat_template_kwargs": {"enable_thinking": true} (or "e
   curl localhost:8000/v1/chat/completions -H 'Content-Type: application/json' \\
        -d '{"messages": [{"role": "user", "content": "Hello"}], "stream": true}'
 """
-import argparse, json, os, queue, threading, time, uuid
+import argparse, json, os, queue, sys, threading, time, uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 os.environ.setdefault("QWEN_PREFILL", "chunked")
 os.environ.setdefault("QWEN_SPEC", "6")                   # the server runs the verify path: speculative decoding up to 6 rows unless set
                                                           # (bonsai2_serve / ornith set their own defaults before this import)
 import numpy as np                                                        # noqa: E402
-from qwen38_tokenize import Tok, chat_messages, EOS                       # noqa: E402
+from qwen38_tokenize import Tok, chat_messages, image_parts, IMAGE_PAD, EOS   # noqa: E402
+VISION_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "bonsai2-27b", "vision")
 
 class Stop(Exception): pass
 
@@ -36,24 +37,67 @@ class Engine:
   def __init__(self, a):
     import qwen38_generate as G                                           # (imported here: gemma4_serve uses this module for its HTTP side only)
     self.cpus, self.lat = G.pin_cpus(), G.hold_cpu_latency()
-    self.tok = Tok(os.environ.get("QWEN_TOK", a.dir)); self.tmax, self.lock, self.jobs = a.tmax, threading.Lock(), queue.Queue()
+    self.tok = Tok(os.environ.get("QWEN_TOK", a.dir)); self.tmax, self.lock, self.jobs, self.dir = a.tmax, threading.Lock(), queue.Queue(), a.dir
     t0 = time.perf_counter(); self.M = G.Model(12, a.cache, a.dir, a.tmax, a.pin_gb)
     assert self.M.M, "the server runs the verify path (QWEN_SPEC >= 2 geometries)"
     print(f"   model set up in {time.perf_counter() - t0:.0f} s; host CPUs {self.cpus}; CPU latency {self.lat}", flush=True)
-  def submit(self, ids, max_new, stop):
-    """Queue a request (from any thread) -> a queue of ("delta", text) ... then ("done", tokens, finish) or ("error", message)."""
-    q = queue.Queue(); self.jobs.put((ids, max_new, stop, q)); return q
+  def submit(self, ids, max_new, stop, vis=None):
+    """Queue a request (from any thread) -> a queue of ("delta", text) ... then ("done", tokens, finish) or ("error", message).
+    `vis`: the prompt's images, [(embeddings, nx, ny)] in order, placed at the ids' <|image_pad|> runs."""
+    q = queue.Queue(); self.jobs.put((ids, max_new, stop, q, vis)); return q
+  def prompt(self, messages, think):
+    """An OpenAI / Ollama message list -> (ids, vis): the images through the vision tower, the template with their token counts."""
+    parts = image_parts(messages)
+    if not parts: return self.tok.encode(chat_messages(messages, think)), None
+    imgs = self.decode_images(parts); pad = self.tok.encode(IMAGE_PAD)[0]
+    ids = self.tok.encode(chat_messages(messages, think, image_tokens=[nx * ny for x, nx, ny in imgs]))
+    starts = [i for i in range(len(ids)) if ids[i] == pad and (i == 0 or ids[i - 1] != pad)]
+    assert len(starts) == len(imgs), "image placeholder runs vs images"
+    return ids, [(s, x, nx, ny) for s, (x, nx, ny) in zip(starts, imgs)]
   def serve_jobs(self):
     """The main thread's loop: one request at a time, on the thread that built the model."""
     while True:
-      ids, max_new, stop, q = self.jobs.get()
+      ids, max_new, stop, q, vis = self.jobs.get()
       try:
-        t0 = time.perf_counter(); r = self.run(ids, max_new, stop, lambda d: q.put(("delta", d))); t1 = time.perf_counter()
+        t0 = time.perf_counter(); r = self.run(ids, max_new, stop, lambda d: q.put(("delta", d)), vis=self.embed_images(vis)); t1 = time.perf_counter()
         tf = self.t_first or t1; q.put(("done",) + r + (tf - t0, t1 - tf))      # + the prompt's seconds, the generation's
       except ValueError as e: q.put(("error", str(e)))
       except Exception as e: q.put(("error", f"{type(e).__name__}: {e}")); print(f"   request failed: {e!r}", flush=True)
-  def run(self, ids, max_new, stop, on_delta):
-    """Greedy generation after `ids`; on_delta(text) per accepted chunk. Returns (completion tokens, finish_reason)."""
+  def vision(self):
+    """The size's vision tower on the NPU (bonsai2-27b/vision), loaded on the first image; the mmproj (BONSAI_MMPROJ, else the model
+    directory's *mmproj*Q8_0.gguf) packed into <cache>/vision on first use. Called on the engine's thread only."""
+    if getattr(self, "_vision", None) is None:
+      import glob; sys.path.insert(0, VISION_DIR); import vit_npu
+      cache = os.path.join(self.M.cache, "vision"); d = self.dir if os.path.isdir(self.dir) else os.path.dirname(self.dir)   # Bonsai: the GGUF's directory
+      if not os.path.exists(os.path.join(cache, "vision_small.npz")):
+        mm = os.environ.get("BONSAI_MMPROJ") or next(iter(sorted(glob.glob(os.path.join(d, "*mmproj*Q8_0.gguf"))) + sorted(glob.glob(os.path.join(d, "*mmproj*.gguf")))), None)
+        if not mm: raise ValueError(f"no mmproj GGUF in {d} (set BONSAI_MMPROJ)")
+        print(f"   packing the vision tower from {mm} ...", flush=True); vit_npu.pack_vision(mm, cache)
+      self._vision = vit_npu.VisionNPU(cache)
+    return self._vision
+  def decode_images(self, parts, max_tokens=1024):
+    """The request's images -> [(pixels [H, W, 3] in [-1, 1], nx, ny)]: bicubic smart resize to multiples of 32, at most `max_tokens`
+    tokens (32 x 32 pixel blocks) each. Runs on the handler's thread; the tower runs later, on the engine's."""
+    import base64, io, urllib.request; from PIL import Image; sys.path.insert(0, VISION_DIR); import vit_ref as VR
+    out = []
+    for kind, v in parts:
+      if kind == "b64" or (kind == "url" and v.startswith("data:")): data = base64.b64decode(v.split(",", 1)[1] if v.startswith("data:") else v)
+      elif kind == "url": data = urllib.request.urlopen(v, timeout=30).read()
+      else: data = v
+      im = Image.open(io.BytesIO(data)).convert("RGB"); wb, hb = VR.smart_size(im.width, im.height, max_tokens=max_tokens)
+      x = (np.asarray(im.resize((wb, hb), Image.BICUBIC), np.float32) / 255.0 - 0.5) / 0.5
+      out.append((x, wb // (VR.PATCH * VR.MERGE), hb // (VR.PATCH * VR.MERGE)))
+    return out
+  def embed_images(self, vis):
+    """[(start, pixels, nx, ny)] -> [(start, embeddings, nx, ny)] through the tower (the engine's thread)."""
+    if not vis: return None
+    out = []
+    for s_, x, nx, ny in vis:
+      t0 = time.perf_counter(); e, (nx_, ny_) = self.vision().forward(x, x.shape[1] // 16, x.shape[0] // 16); assert (nx_, ny_) == (nx, ny)
+      print(f"   image {x.shape[1]}x{x.shape[0]} -> {len(e)} tokens ({nx}x{ny}) in {time.perf_counter() - t0:.2f} s", flush=True); out.append((s_, e, nx, ny))
+    return out
+  def run(self, ids, max_new, stop, on_delta, vis=None):
+    """Greedy generation after `ids`; on_delta(text) per accepted chunk; `vis`: the prompt's images (set_vision). Returns (completion tokens, finish_reason)."""
     M, tok = self.M, self.tok; out, sent = [], [""]; self.t_first = None
     if len(ids) + 1 > self.tmax: raise ValueError(f"the prompt ({len(ids)} tokens) does not fit the context ({self.tmax})")
     max_new = max(1, min(max_new, self.tmax - len(ids) - 1)); finish = ["length"]
@@ -69,7 +113,7 @@ class Engine:
       if finish[0] == "stop": raise Stop
     with self.lock:
       M.reset(); M.spec_meta = dict(prompt="(server)", n_prompt=len(ids), thinking=False, prompt_ids=[int(v) for v in ids])
-      lg = M.prefill(ids); first = int(np.argmax(lg))
+      lg = M.prefill(ids, vis=vis); first = int(np.argmax(lg))
       try:
         emit([first])
         if first not in EOS and max_new > 1:
@@ -107,13 +151,13 @@ def make_handler(eng, name, chat_messages=chat_messages, details=OLLAMA_DETAILS)
       opts = req.get("options") or {}; think = bool(req.get("think", False))
       if route == "/api/chat":
         if not req.get("messages"): return self._json(400, {"error": "messages is required"})
-        text = chat_messages(req["messages"], think)
+        ids, vis = eng.prompt(req["messages"], think)
       else:
-        p = req.get("prompt", "")
-        text = p if req.get("raw") else chat_messages(([{"role": "system", "content": req["system"]}] if req.get("system") else []) + [{"role": "user", "content": p}], think)
-      ids = eng.tok.encode(text); n0 = int(opts.get("num_predict") or 512); max_new = 512 if n0 < 0 else n0
+        p = req.get("prompt", ""); msgs = ([{"role": "system", "content": req["system"]}] if req.get("system") else []) + [{"role": "user", "content": p, "images": req.get("images") or []}]
+        ids, vis = (eng.tok.encode(p), None) if req.get("raw") else eng.prompt(msgs, think)
+      n0 = int(opts.get("num_predict") or 512); max_new = 512 if n0 < 0 else n0
       stop = opts.get("stop") or []; stop = [stop] if isinstance(stop, str) else list(stop)
-      t0 = time.perf_counter(); q = eng.submit(ids, max_new, stop); chat = route == "/api/chat"
+      t0 = time.perf_counter(); q = eng.submit(ids, max_new, stop, vis); chat = route == "/api/chat"
       now = lambda: time.strftime("%Y-%m-%dT%H:%M:%S.000Z", time.gmtime())
       piece = lambda d: {"message": {"role": "assistant", "content": d}} if chat else {"response": d}
       def final(n, finish, tp, tg):
@@ -155,10 +199,10 @@ def make_handler(eng, name, chat_messages=chat_messages, details=OLLAMA_DETAILS)
       kw = req.get("chat_template_kwargs") or {}; think = bool(kw.get("enable_thinking", req.get("enable_thinking", False)))
       if chat:
         if not req.get("messages"): return self._err(400, "messages is required")
-        text = chat_messages(req["messages"], think)
+        ids, vis = eng.prompt(req["messages"], think)
       else:
-        text = req.get("prompt", ""); text = text[0] if isinstance(text, list) else text
-      ids = eng.tok.encode(text); max_new = int(req.get("max_completion_tokens") or req.get("max_tokens") or 512)
+        text = req.get("prompt", ""); text = text[0] if isinstance(text, list) else text; ids, vis = eng.tok.encode(text), None
+      max_new = int(req.get("max_completion_tokens") or req.get("max_tokens") or 512)
       stop = req.get("stop") or []; stop = [stop] if isinstance(stop, str) else list(stop)
       rid, created = ("chatcmpl-" if chat else "cmpl-") + uuid.uuid4().hex[:24], int(time.time())
       obj = "chat.completion" if chat else "text_completion"
@@ -173,7 +217,7 @@ def make_handler(eng, name, chat_messages=chat_messages, details=OLLAMA_DETAILS)
           self.wfile.write(f"{len(b):x}\r\n".encode() + b + b"\r\n"); self.wfile.flush()
         base = {"id": rid, "object": obj + ".chunk" if chat else obj, "created": created, "model": name}
         if chat: sse(dict(base, choices=[{"index": 0, "delta": {"role": "assistant", "content": ""}, "finish_reason": None}]))
-        q = eng.submit(ids, max_new, stop)
+        q = eng.submit(ids, max_new, stop, vis)
         try:
           while (m := q.get())[0] == "delta": sse(dict(base, choices=[choice(m[1], None, delta=True)]))
           if m[0] == "error": sse({"error": {"message": m[1], "type": "invalid_request_error"}})
@@ -183,7 +227,7 @@ def make_handler(eng, name, chat_messages=chat_messages, details=OLLAMA_DETAILS)
             sse(last); sse("[DONE]")
         except (BrokenPipeError, ConnectionResetError): return     # the client left; its request still runs to its end
         self.wfile.write(b"0\r\n\r\n"); self.wfile.flush(); return
-      parts, q = [], eng.submit(ids, max_new, stop)
+      parts, q = [], eng.submit(ids, max_new, stop, vis)
       while (m := q.get())[0] == "delta": parts.append(m[1])
       if m[0] == "error": return self._err(400, m[1])
       n, finish = m[1], m[2]
