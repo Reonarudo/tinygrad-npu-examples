@@ -410,6 +410,43 @@ to attn_dec3 on a re-rowed table), and the batch steps read a default rope table
 m-RoPE rows while a prefill is interleaved with the steps. Board, the 2B, 4 slots: two image prompts and two text prompts sent at
 once all answer correctly (the same words as the single-user server's) in 13-18 s wall each; a text prompt afterwards 1.4 s.
 
+## Serving an agent: tool calls, long system prompts, the prefix cache
+
+Agents such as [Hermes](https://hermes-agent.nousresearch.com) talk to the server the OpenAI way and need three things the plain
+chat path did not have:
+
+- **Tool calling.** A request's `tools` are rendered in Qwen's chat template (the `# Tools` section with the JSON signatures in the
+  system turn); earlier assistant turns' `tool_calls` are re-rendered as `<tool_call>` JSON and `tool` results as `<tool_response>`
+  blocks in a user turn; the model's `<tool_call>` blocks come back as OpenAI `tool_calls` with `finish_reason: tool_calls`, plain or
+  streamed (the text before the first call streams as content, the calls arrive in one delta at the end).
+- **Keep-alives.** A streamed request gets an empty delta every 20 s while its prompt prefills, so a client that drops a silent
+  stream (Hermes after 900 s) keeps waiting.
+- **The prefix cache** (`QWEN_PREFIX_CACHE=1`, the default; single-user server). Hermes sends ~16k tokens of system prompt and tool
+  definitions with every turn, and the 9B prefills at ~19 tok/s: 14 minutes a turn from scratch. The server remembers which tokens
+  the K / V caches hold and keeps snapshots of the recurrent state (the DeltaNet states and conv rings, ~0.1 GB each on the host) at a
+  few positions: after the first message (the system turn), at the prompt's end and at the generation's end (`QWEN_PREFIX_SNAPS`, 6).
+  A new prompt resumes from the largest snapshot inside its common prefix with the cached tokens and prefills only the rest; the
+  drafter's prompt pass starts there too. A turn that continues a conversation (the previous prompt, the answer, the tool results)
+  prefills its new tokens only; a new conversation with the same system prompt starts after it. Images bypass the cache. Past
+  assistant turns are rendered with the empty `<think>` block the model generated them after, so a continuation matches the cached
+  tokens exactly. The single-user server keeps **two cache regions** (`QWEN_PREFIX_REGIONS`, the model's KV users, each with its own
+  drafter cache; the context halves): a request goes to the region it can resume furthest in, else to the one holding the least, so an
+  agent's side requests (titles, summaries) land in the other region and leave the conversation's prefix in place. The batched server
+  does the same per slot (a slot's end-of-generation state comes from the batch's own stacks; a short prompt takes the emptiest slot).
+
+  Board o6n, the 9B (72704 context, two regions): a 1964-token prompt cold 74 s; its continuation 19 new tokens in 0.8 s, with a
+  22-token side request in between; a new conversation on the same system prompt 23 tokens in 1.1 s. Answers identical to the cold
+  path token for token. Hermes's 16k-token first turn: 929 s cold. The batched 2B: a continuation 20 tokens in ~9 s wall (the step
+  cadence) after a 113 s cold prompt.
+
+Hermes end to end against the pair (the 9B as the agent, the 2B for its sub-agents): the first turn 929 s (16k tokens cold), the
+second turn (the tool result appended) 371 new tokens in 26 s, the sub-agent's 12k-token prompt 199 s on the batched 2B, the
+answer right.
+
+Hermes itself (`~/.hermes/config.yaml`): a custom provider per server (`base_url`, `api_mode: chat_completions`, `api_key: not-needed`,
+`context_length` -- Hermes refuses models under 64k, so the batched 2B serves 65536 a slot in fp16), the 9B as `model.default` and
+the 2B as `delegation.model` / `delegation.provider` for its sub-agents.
+
 ## Two servers at once: the 9B and the 2B side by side
 
 Two processes can share the NPU, but not by default: both put their kernel text and the GEMMs' A operand into the cluster's shared

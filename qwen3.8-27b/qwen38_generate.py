@@ -171,21 +171,21 @@ class KVAsid:
       self.views[a] = (Tensor.from_blob(b.pa, (self.KB[a] // ES,), dtype=DT, device=DEV), Tensor.from_blob(b.pa + self.KB[a], (self.KB[a] // ES,), dtype=DT, device=DEV))
     # the MTP drafter's cache: one region of its own, in the ASID with room (3 GiB less the layers'), else a plain ASID0 buffer (base 0)
     self.mbase, self.mviews = None, None
-    if mtp:
-      mkb = (tmax + ATT_BT) * rowf * ES; room = lambda a: 3 * 2**30 - (16 << 20) - (2 * self.KB[a] if a < self.na else 0)
+    if mtp:                                                                # (a region a user, like the layers': a server's prefix regions keep their drafts)
+      mkb = (users * tmax + ATT_BT) * rowf * ES; room = lambda a: 3 * 2**30 - (16 << 20) - (2 * self.KB[a] if a < self.na else 0)
       for a in [a for a in (2, 1, 0) if room(a) >= 2 * mkb] + [-1]:
         try: mb = raw.req_buf(2 * mkb, asid=1 + a if a >= 0 else 0); self.mbase = 1 + a if a >= 0 else 0; break
         except OSError as e:
           if a < 0: raise MemoryError(f"the drafter's cache ({2 * mkb / 1e9:.2f} GB): {e}") from e
       self.mbuf = mb; self.mviews = (Tensor.from_blob(mb.pa, (mkb // ES,), dtype=DT, device=DEV), Tensor.from_blob(mb.pa + mkb, (mkb // ES,), dtype=DT, device=DEV))
     print(f"   KV in ASID{'s 1-3' if self.na == 3 else ' 1'} ({'fp16' if half else 'fp32'}): {natt} layers x {users} user(s) x {tmax} positions: "
-          f"{' / '.join(f'{2 * kb / 1e9:.2f}' for kb in self.KB[:self.na])} GB (3 GiB each){f'; the drafter' + chr(39) + 's ' + f'{2 * (tmax + ATT_BT) * rowf * ES / 1e9:.2f} GB in ASID {self.mbase}' if mtp else ''}, "
+          f"{' / '.join(f'{2 * kb / 1e9:.2f}' for kb in self.KB[:self.na])} GB (3 GiB each){f'; the drafter' + chr(39) + 's ' + f'{2 * (users * tmax + ATT_BT) * rowf * ES / 1e9:.2f} GB in ASID {self.mbase}' if mtp else ''}, "
           f"{'none' if not mtp or self.mbase else 'only the drafter' + chr(39) + 's'} of the ASID0 window, in {time.perf_counter() - t0:.1f} s", flush=True)
   def base(self, i): return 1 + i % self.na if i < self.natt else self.mbase   # the DMA base code of attention layer i (the MTP's: its buffer's ASID)
   def kv(self, i): return self.views[i % self.na] if i < self.natt else self.mviews   # (K view, V view) of layer i's ASID (the MTP's: its own)
   def cidx(self, i, u):
-    """idx[2] of attention layer i for user u: its region in the ASID's buffer (the MTP, i == natt: its own buffer's one region)."""
-    return 0 if i >= self.natt else (i // self.na) * self.users + u
+    """idx[2] of attention layer i for user u: its region in the ASID's buffer (the MTP, i == natt: region u of its own buffer)."""
+    return u if i >= self.natt else (i // self.na) * self.users + u
   def host(self, i, u=0):
     """Layer i's cache rows of user u as host arrays (K, V) [tmax + ATT_BT][rowf] (the device's writes made visible first)."""
     import ctypes; a = i % self.na; b = self.bufs[a]; self.raw.cache_invalidate(b); ES = 2 if self.half else 4; r = self.cidx(i, u) * self.tmax * self.rowf * ES; n = (self.tmax + ATT_BT) * self.rowf * ES
@@ -961,8 +961,8 @@ class Model:
         env={k: v for k, v in os.environ.items() if k.startswith("QWEN_")})}) + "\n")
     if mtp:                                                               # the MTP cache over the prompt, then the first drafts
       t0 = time.perf_counter(); n = len(self.pre_hidden); nxt_all = self.ids_prompt[1:] + [first]
-      cm = max(self.mtp_geos)
-      for c0 in range(0, n, cm):
+      cm = max(self.mtp_geos); p0 = min(getattr(self, "mtp_from", 0), n - 1)   # the prefix cache: the drafter's rows for [0, p0) are in its cache
+      for c0 in range(p0, n, cm):
         c1 = min(n, c0 + cm)
         if c1 < n: self.mtp_pass(self.mtp_rows(self.pre_hidden[c0:c1], nxt_all[c0:c1]), c0)
         else: dnext = self.mtp_draft(self.pre_hidden[c0:c1], nxt_all[c0:c1], c0, self.kmax)
@@ -1092,27 +1092,45 @@ class Model:
     x = L.K.resid(x, L.lin_ct(L.K.rms_a(oc, None, OC, "a_o", norm=False), slot, meta, "o"), R.H, "x1")
     return L.mlp(x, slot, meta, sm["post_attention_layernorm_weight"]).realize()
 
-  def prefill_chunked(self, ids):
+  def prefill_chunked(self, ids, start=0, snap_at=(), on_snap=None):
     """The prompt through the verify path, up to max(geometries) tokens a pass (each pass one streaming of the weights; the
     DeltaNet states and caches carried like a decode), the last chunk padded and committed to its real length -> the logits of
     the last prompt token. The rows-mode (compact) layouts only: the Q8_0 models' prefill (and any model past ATT_PMAX slices)."""
-    for _ in self.prefill_chunks(ids): pass
+    for _ in self.prefill_chunks(ids, start, snap_at, on_snap): pass
     return self.prefill_lg
-  def prefill_chunks(self, ids):
+  def prefill_chunks(self, ids, start=0, snap_at=(), on_snap=None):
     """prefill_chunked a pass at a time: yields the prompt positions done after each pass (a server interleaves other work between
-    them); the last prompt token's logits are left in `prefill_lg`. The caller runs the prelude of prefill() first (prefill_prelude)."""
-    self.ids_prompt = list(ids); n = len(ids); m = max(self.geos); lg = None
-    self.reset()                                                          # (the first chunk reads Sall as the state before position 0: zero it --
+    them); the last prompt token's logits are left in `prefill_lg`. The caller runs the prelude of prefill() first (prefill_prelude).
+    `start` > 0: the prefix cache -- positions [0, start) are in the K / V caches (this user's) and the DeltaNet states / conv rings
+    were restored to position `start` (restore_state), so only ids[start:] go through (the drafter's pass too: mtp_from). `snap_at`:
+    positions to stop a pass at exactly and hand the states to on_snap(pos, snapshot_state()) -- a server keeps them for the next
+    prompt that shares the prefix."""
+    self.ids_prompt = list(ids); n = len(ids); m = max(self.geos); lg = None; stops = sorted({b for b in snap_at if start < b <= n})
+    if start == 0: self.reset()                                           # (the first chunk reads Sall as the state before position 0: zero it --
     #                                                                        spec_warmup's bank-path passes, a previous prompt or plain steps left one there)
     self._prompt_pass = True                                              # QWEN_NPU_IDS: the prompt's ids / rows come from the host
-    for c0 in range(0, n, m):
-      chunk = list(ids[c0:c0 + m]); a = len(chunk); mm = min(g for g in self.geos if g >= max(2, a))
-      lg = self.verify(chunk + [chunk[-1]] * (mm - a), c0, head="full" if c0 + m >= n else None); self.commit(a, c0, mm)
-      if self.dump is not None or self.MTPL: self.pre_hidden = np.concatenate([getattr(self, "pre_hidden", np.zeros((0, R.H), np.float32))[:c0], self.v_hidden[:a]])
-      if c0 + m < n: yield c0 + a
-    if self.dump is not None: self.dump.extend(self.pre_hidden)           # QWEN_DUMP_HIDDEN: every prompt position
+    if self.dump is not None or self.MTPL:                                # the prompt's hidden rows (the drafter's prompt pass reads [mtp_from, n))
+      old = getattr(self, "pre_hidden", None); self.pre_hidden = np.zeros((n, R.H), np.float32)
+      if old is not None and start > 0: k = min(start, len(old)); self.pre_hidden[:k] = old[:k]
+    self.mtp_from = start; c0 = start
+    while c0 < n:
+      nb = next((b for b in stops if b > c0), n); chunk = list(ids[c0:min(c0 + m, nb)]); a = len(chunk); mm = min(g for g in self.geos if g >= max(2, a))
+      lg = self.verify(chunk + [chunk[-1]] * (mm - a), c0, head="full" if c0 + a >= n else None); self.commit(a, c0, mm)
+      if self.dump is not None or self.MTPL: self.pre_hidden[c0:c0 + a] = self.v_hidden[:a]
+      c0 += a
+      if c0 in stops and on_snap is not None and c0 < n: on_snap(c0, self.snapshot_state())
+      if c0 < n: yield c0
+    if self.dump is not None: self.dump.extend(self.pre_hidden[start:])  # QWEN_DUMP_HIDDEN: every prompt position
     self._prompt_pass = False; self.prefill_lg = lg[a - 1]
     yield n
+  def snapshot_state(self):
+    """The recurrent state at the current position, on the host: (the DeltaNet states, the conv rings), the deferred commit folded in
+    first. With the K / V rows the prompt wrote, enough to continue from here later (restore_state + prefill_chunks(start=))."""
+    self.prefill_prelude()
+    return OA.host_invalidate(self.Sall).numpy().copy(), OA.host_invalidate(self.Call).numpy().copy()
+  def restore_state(self, snap):
+    """The states of snapshot_state back on the device (the caches' rows are untouched: the caller knows they still hold the prefix)."""
+    S, C = snap; self.Sall.assign(Tensor(S, device=DEV)).realize(); self.Call.assign(Tensor(C, device=DEV)).realize()
   def reset(self):
     """Before an unrelated prompt in the same process (a server's next request): the DeltaNet states to zero (a chunked prefill
     starts from them; the default prefill overwrites them anyway). The rings and the K / V caches are only read at positions the
@@ -1158,11 +1176,11 @@ class Model:
       lo, hi = max(c0, s_), min(c0 + len(chunk), s_ + len(e))
       if lo < hi: x[lo - c0:hi - c0] = e[lo - s_:hi - s_]
     return x
-  def prefill(self, ids, nlayers=None, vis=None):
+  def prefill(self, ids, nlayers=None, vis=None, start=0, snap_at=(), on_snap=None):
     self.set_vision(ids, vis)
     self.prefill_prelude()
-    if R.Q8 or os.environ.get("QWEN_PREFILL") == "chunked" or self.prefill_long() or self.kvs: return self.prefill_chunked(ids)
-    assert not vis, "images need the chunked prefill (QWEN_PREFILL=chunked)"
+    if R.Q8 or os.environ.get("QWEN_PREFILL") == "chunked" or self.prefill_long() or self.kvs: return self.prefill_chunked(ids, start, snap_at, on_snap)
+    assert not vis and start == 0, "images and the prefix cache need the chunked prefill (QWEN_PREFILL=chunked)"
     nlayers = R.NL if nlayers is None else nlayers
     n = len(ids); L = self.pre; assert n <= self.TMAX; self.ids_prompt = list(ids)
     x = np.zeros((L.R, R.H), np.float32); x[:n] = self.W.embed(ids); x = dev(x)

@@ -27,6 +27,7 @@ os.environ.setdefault("QWEN_MODEL", "bonsai2-2b")
 import bonsai2_batch as BB                                               # noqa: E402  (sets the environment, imports the runtime)
 import numpy as np                                                       # noqa: E402
 import qwen38_generate as QG, qwen38_ref as R, qwen38_serve as S         # noqa: E402
+from zy import OA                                                        # noqa: E402
 from qwen38_tokenize import Tok                                          # noqa: E402
 from tinygrad import Tensor                                              # noqa: E402
 
@@ -43,6 +44,10 @@ class BatchEngine:
     self.slots = [None] * a.users; self.lock = threading.Lock()
     NG = self.M.NGDN; self.ssz, self.csz = NG * R.NV * R.DK * R.DV, NG * R.CONV * self.B.CP
     self.B.step([0] * a.users, [0] * a.users)                              # the graphs captured before the first request
+    # the prefix cache, a slot's own (qwen38_serve.PrefixCache): what its K / V region holds and state snapshots to resume from; a
+    # request takes the free slot it can resume furthest in (an agent's sub-agents share the system prompt: after the first round
+    # every slot holds it), else the one holding the least. A slot's end-of-generation state comes from the batch's own stacks.
+    self.pfx = [S.PrefixCache(self.M) for _ in range(a.users)] if os.environ.get("QWEN_PREFIX_CACHE", "1") == "1" else None; self.im_end = self.tok.encode("<|im_end|>")[0]
     print(f"   model set up in {time.perf_counter() - t0:.0f} s; {a.users} slots; host CPUs {self.cpus}; CPU latency {self.lat}", flush=True)
   vision, decode_images, embed_images, prompt = S.Engine.vision, S.Engine.decode_images, S.Engine.embed_images, S.Engine.prompt   # images: the vision tower, the template with the placeholders (qwen38_serve)
   def submit(self, ids, max_new, stop, vis=None):
@@ -51,15 +56,20 @@ class BatchEngine:
   def _short(self, u, job):
     """Slot u takes a short prompt: its DeltaNet states and rings zeroed, the prompt's ids go in a token a step from position 0."""
     ids, max_new, stop, q, _ = job
+    if self.pfx: self.pfx[u].invalidate()                                  # (the prompt goes in from position 0, a token a step: no snapshots)
     self.B.Sall[u * self.ssz:(u + 1) * self.ssz].assign(Tensor.zeros(self.ssz, device=BB.DEV)).realize()
     self.B.Call[u * self.csz:(u + 1) * self.csz].assign(Tensor.zeros(self.csz, device=BB.DEV)).realize()
     self.slots[u] = dict(ids=ids, k=0, out=[], max_new=max(1, min(max_new, self.tmax - len(ids) - 1)), stop=stop, q=q, pos=0, delta=0, sent="", t0=time.perf_counter(), tf=None)
   def _start(self, job):
     """A job's prompt starts through the model's chunked prefill (one at a time) for the free slot it reserves (PRE): -> the
     in-flight record. The caches in ASIDs: the model prefills straight into that user's cache (kv_user)."""
-    ids, max_new, stop, q, vis = job; u = self.slots.index(None); self.slots[u] = PRE
+    ids, max_new, stop, q, vis = job; u = self._free_slot(ids); self.slots[u] = PRE
     M = self.M; M.kv_user = u; M.set_vision(ids, self.embed_images(vis)); M.prefill_prelude(); M.spec_meta = dict(prompt="(server)", n_prompt=len(ids), thinking=False, prompt_ids=[int(v) for v in ids])
-    return dict(job=job, gen=M.prefill_chunks(ids), t0=time.perf_counter(), u=u, delta=M.pos_delta)   # delta: the m-RoPE counter's lag after the images (0 without)
+    pfx = self.pfx[u] if self.pfx and not vis else None
+    if self.pfx and vis: self.pfx[u].invalidate()
+    p = pfx.plan(ids) if pfx else 0; b = S.PrefixCache.boundaries(ids, self.im_end) if pfx else []
+    print(f"   slot {u}: prompt {len(ids)} tokens, {len(ids) - p} to prefill ({p} from the prefix cache; the slots hold {[len(c.ids) for c in self.pfx] if self.pfx else '-'})", flush=True)
+    return dict(job=job, gen=M.prefill_chunks(ids, start=p, snap_at=b[:1], on_snap=pfx.add if pfx else None), t0=time.perf_counter(), u=u, delta=M.pos_delta)   # delta: the m-RoPE counter's lag after the images (0 without)
   def _place(self, pre):
     """The prefilled prompt into slot u: the model's DeltaNet states, rings and the prompt's K / V rows copied (the model's own
     stacks were the prefill's), the first token emitted; the slot decodes from position n."""
@@ -91,8 +101,22 @@ class BatchEngine:
     """The next waiting job: rejected (too long), or placed in a free slot (short), or started on the chunked prefill (-> its record)."""
     job = self.jobs.get_nowait(); ids = job[0]
     if len(ids) + 1 > self.tmax: job[3].put(("error", f"the prompt ({len(ids)} tokens) does not fit the context ({self.tmax})")); return None
-    if len(ids) < PREFILL_MIN and job[4] is None: self._short(self.slots.index(None), job); return None
+    if len(ids) < PREFILL_MIN and job[4] is None: self._short(self._free_slot(), job); return None
     return self._start(job)
+  def _finished(self, u, s):
+    """Slot u's request is done: its region holds the prompt and the fed generated tokens; the slot's state (the batch's stacks) is the
+    snapshot the next prompt sharing that prefix resumes from."""
+    if not self.pfx or s["delta"]: return
+    try:
+      B = self.B; Sb = OA.host_invalidate(B.Sall).numpy()[u * self.ssz:(u + 1) * self.ssz].copy(); Cb = OA.host_invalidate(B.Call).numpy()[u * self.csz:(u + 1) * self.csz].copy()
+      self.pfx[u].commit(list(s["ids"]) + s["out"][:-1], (Sb, Cb))
+    except Exception as e: print(f"   prefix cache: slot {u} not kept ({e!r})", flush=True); self.pfx[u].invalidate()
+  def _free_slot(self, ids=None):
+    """A free slot for a prompt: the one it can resume furthest in (prefix cache), else the one holding the fewest cached tokens (a
+    short prompt, fed from position 0, spares the slots that hold a conversation's prefix)."""
+    free = [u for u, s in enumerate(self.slots) if s is None]
+    if not self.pfx: return free[0]
+    return max(free, key=lambda r: (self.pfx[r].resume_at(ids) if ids is not None else 0, -len(self.pfx[r].ids)))
   def _busy(self): return [s for s in self.slots if s is not None and s is not PRE]
   def serve_jobs(self):
     """The main thread's loop: a prefill pass (the one long prompt in flight) and a batch step (when a slot is busy) in turn; a prompt
@@ -104,7 +128,10 @@ class BatchEngine:
       if pre is not None:
         try:
           if next(pre["gen"]) >= len(pre["job"][0]): self._place(pre); pre = None   # (the last pass yields the prompt's length)
-        except Exception as e: pre["job"][3].put(("error", f"{type(e).__name__}: {e}")); print(f"   prefill failed: {e!r}", flush=True); self.slots[pre["u"]] = None; pre = None
+        except Exception as e:
+          pre["job"][3].put(("error", f"{type(e).__name__}: {e}")); print(f"   prefill failed: {e!r}", flush=True)
+          if self.pfx: self.pfx[pre["u"]].invalidate()
+          self.slots[pre["u"]] = None; pre = None
       if not self._busy(): continue
       toks, pos, rpos = [], [], []
       for s in self.slots:
@@ -115,6 +142,7 @@ class BatchEngine:
       except Exception as e:
         for u, s in enumerate(self.slots):
           if s is not None and s is not PRE: s["q"].put(("error", f"{type(e).__name__}: {e}")); self.slots[u] = None
+          if self.pfx: self.pfx[u].invalidate()
         print(f"   step failed: {e!r}", flush=True); continue
       for u, s in enumerate(self.slots):
         if s is None or s is PRE: continue
@@ -122,7 +150,7 @@ class BatchEngine:
         if s["k"] < len(s["ids"]):
           s["k"] += 1
           if s["k"] < len(s["ids"]): continue                             # the prompt still going in: the row's output discarded
-        if self._emit(s, nxt[u]): self.slots[u] = None
+        if self._emit(s, nxt[u]): self.slots[u] = None; self._finished(u, s)
 
 
 def main():

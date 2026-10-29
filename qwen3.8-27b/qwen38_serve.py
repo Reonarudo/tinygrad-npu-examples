@@ -25,12 +25,51 @@ os.environ.setdefault("QWEN_PREFILL", "chunked")
 os.environ.setdefault("QWEN_SPEC", "6")                   # the server runs the verify path: speculative decoding up to 6 rows unless set
                                                           # (bonsai2_serve / ornith set their own defaults before this import)
 import numpy as np                                                        # noqa: E402
-from qwen38_tokenize import Tok, chat_messages, image_parts, IMAGE_PAD, EOS   # noqa: E402
+from qwen38_tokenize import Tok, chat_messages, image_parts, parse_tool_calls, IMAGE_PAD, EOS   # noqa: E402
 VISION_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "bonsai2-27b", "vision")
 
 class Stop(Exception): pass
 
 OLLAMA_DETAILS = {"format": "npu", "family": "qwen35", "families": ["qwen35"], "parameter_size": "27B", "quantization_level": "ternary"}
+
+class PrefixCache:
+  """What the model's K / V caches hold and where it can resume: `ids` = the tokens whose rows are in the cache (positions 0..), and
+  snapshots of the recurrent state (snapshot_state) at a few of those positions. A new prompt resumes from the largest snapshot
+  within its common prefix with `ids` -- Hermes-style agents resend ~16k tokens of system prompt and tools every turn, and a turn
+  that continues a conversation shares everything up to the previous answer. Snapshots: after the first message (the system turn),
+  at the prompt's end, at the generation's end; QWEN_PREFIX_SNAPS (6) kept, the earliest position always."""
+  def __init__(self, M, keep=int(os.environ.get("QWEN_PREFIX_SNAPS", "6"))): self.M, self.keep, self.ids, self.snaps, self.order = M, keep, [], {}, []
+  def invalidate(self): self.ids, self.snaps, self.order = [], {}, []
+  def shared(self, ids):
+    n = min(len(ids), len(self.ids)); k = 0
+    while k < n and ids[k] == self.ids[k]: k += 1
+    return k
+  def resume_at(self, ids):
+    """The position a prompt could resume from here: the largest snapshot inside its shared prefix (0: none)."""
+    k = self.shared(ids); return max((q for q in self.snaps if q <= min(k, len(ids) - 1)), default=0)
+  def plan(self, ids):
+    """-> the position to resume the prompt from (the state restored; 0 = from scratch). Snapshots past the shared prefix go."""
+    k = self.shared(ids); p = self.resume_at(ids)
+    for q in [q for q in self.snaps if q > k]: self.drop(q)
+    if p > 0: self.M.restore_state(self.snaps[p])
+    return p
+  def add(self, pos, snap):
+    if pos in self.snaps: self.order.remove(pos)
+    self.snaps[pos] = snap; self.order.append(pos)
+    while len(self.snaps) > self.keep:
+      lo = min(self.snaps); victim = next(q for q in self.order if q != lo); self.drop(victim)
+  def drop(self, pos): self.snaps.pop(pos, None); self.order.remove(pos)
+  def commit(self, ids, snap=None):
+    """After a request: the cache holds `ids` (the prompt and the fed generated tokens); a snapshot at its end (`snap`: the state
+    from elsewhere -- a batched slot's; default the model's own)."""
+    self.ids = list(ids)
+    try: self.add(len(ids), snap if snap is not None else self.M.snapshot_state())
+    except Exception as e: print(f"   prefix cache: no end snapshot ({e!r})", flush=True)
+  @staticmethod
+  def boundaries(ids, im_end):
+    """Message boundaries: the position after each <|im_end|> + newline pair (the first one: after the system turn)."""
+    return [i + 2 for i in range(len(ids) - 1) if ids[i] == im_end]
+
 
 class Engine:
   """The model and its one-request-at-a-time generation (`run` yields text deltas)."""
@@ -41,16 +80,21 @@ class Engine:
     t0 = time.perf_counter(); self.M = G.Model(12, a.cache, a.dir, a.tmax, a.pin_gb)
     assert self.M.M, "the server runs the verify path (QWEN_SPEC >= 2 geometries)"
     print(f"   model set up in {time.perf_counter() - t0:.0f} s; host CPUs {self.cpus}; CPU latency {self.lat}", flush=True)
+    # the prefix cache: a region a prefix (QWEN_PREFIX_REGIONS, 2: an agent's side requests -- titles, summaries -- land in the other
+    # region and leave the conversation's 16k-token prefix in place); the regions are the model's KV users (QWEN_KV_USERS, set by main)
+    self.regions = self.M.kvs.users if self.M.kvs else 1
+    self.pfx = [PrefixCache(self.M) for _ in range(self.regions)] if os.environ.get("QWEN_PREFIX_CACHE", "1") == "1" else None; self.im_end = self.tok.encode("<|im_end|>")[0]
   def submit(self, ids, max_new, stop, vis=None):
     """Queue a request (from any thread) -> a queue of ("delta", text) ... then ("done", tokens, finish) or ("error", message).
     `vis`: the prompt's images, [(embeddings, nx, ny)] in order, placed at the ids' <|image_pad|> runs."""
     q = queue.Queue(); self.jobs.put((ids, max_new, stop, q, vis)); return q
-  def prompt(self, messages, think):
-    """An OpenAI / Ollama message list -> (ids, vis): the images through the vision tower, the template with their token counts."""
+  def prompt(self, messages, think, tools=None):
+    """An OpenAI / Ollama message list (+ OpenAI tool definitions) -> (ids, vis): the images decoded (the tower runs on the engine's
+    thread), the template with their token counts."""
     parts = image_parts(messages)
-    if not parts: return self.tok.encode(chat_messages(messages, think)), None
+    if not parts: return self.tok.encode(chat_messages(messages, think, tools=tools)), None
     imgs = self.decode_images(parts); pad = self.tok.encode(IMAGE_PAD)[0]
-    ids = self.tok.encode(chat_messages(messages, think, image_tokens=[nx * ny for x, nx, ny in imgs]))
+    ids = self.tok.encode(chat_messages(messages, think, image_tokens=[nx * ny for x, nx, ny in imgs], tools=tools))
     starts = [i for i in range(len(ids)) if ids[i] == pad and (i == 0 or ids[i - 1] != pad)]
     assert len(starts) == len(imgs), "image placeholder runs vs images"
     return ids, [(s, x, nx, ny) for s, (x, nx, ny) in zip(starts, imgs)]
@@ -112,8 +156,20 @@ class Engine:
       if any(t in EOS for t in new): finish[0] = "stop"
       if finish[0] == "stop": raise Stop
     with self.lock:
-      M.reset(); M.spec_meta = dict(prompt="(server)", n_prompt=len(ids), thinking=False, prompt_ids=[int(v) for v in ids])
-      lg = M.prefill(ids, vis=vis); first = int(np.argmax(lg))
+      M.spec_meta = dict(prompt="(server)", n_prompt=len(ids), thinking=False, prompt_ids=[int(v) for v in ids]); pfx = None
+      if self.pfx:                                                        # the region: the furthest resume point, else the one holding the least
+        sh = [c.resume_at(ids) for c in self.pfx]; u = max(range(self.regions), key=lambda r: (sh[r], -len(self.pfx[r].ids)))
+        M.kv_user = u; pfx = self.pfx[u]
+        if vis: pfx.invalidate(); pfx = None                              # (image rows in the cache: not a token prefix)
+      p = pfx.plan(ids) if pfx else 0; t0 = time.perf_counter()
+      if p == 0: M.reset()
+      b = PrefixCache.boundaries(ids, self.im_end); snap_at = ([b[0]] if b else []) + [len(ids)] if pfx else ()
+      try: lg = M.prefill(ids, vis=vis, start=p, snap_at=snap_at, on_snap=pfx.add if pfx else None)
+      except Exception:
+        if pfx: pfx.invalidate()
+        raise
+      first = int(np.argmax(lg))
+      if pfx: print(f"   prompt {len(ids)} tokens, {len(ids) - p} prefilled ({p} from the prefix cache, region {M.kv_user}; the regions hold {[len(c.ids) for c in self.pfx]}) in {time.perf_counter() - t0:.1f} s", flush=True)
       try:
         emit([first])
         if first not in EOS and max_new > 1:
@@ -122,6 +178,9 @@ class Engine:
             for i in range(1, max_new):
               lg = M.step(out[-1], len(ids) + i - 1); emit([int(np.argmax(lg))])
       except Stop: pass
+      if pfx:                                                             # the rows written: the prompt and every generated token fed back
+        try: pfx.commit(list(ids) + [int(t) for t in out[:-1]])
+        except Exception as e: print(f"   prefix cache: commit failed ({e!r})", flush=True); pfx.invalidate()
     return min(len(out), max_new), finish[0]
 
 def make_handler(eng, name, chat_messages=chat_messages, details=OLLAMA_DETAILS):
@@ -197,12 +256,20 @@ def make_handler(eng, name, chat_messages=chat_messages, details=OLLAMA_DETAILS)
       chat = route == "/chat/completions"
       if int(req.get("n", 1)) != 1: return self._err(400, "n must be 1 (greedy decoding)")
       kw = req.get("chat_template_kwargs") or {}; think = bool(kw.get("enable_thinking", req.get("enable_thinking", False)))
+      tools = req.get("tools") if chat and req.get("tool_choice") != "none" else None
+      if os.environ.get("QWEN_SERVE_DUMP"):                               # every request's body appended as one JSON line (what agents send)
+        with open(os.environ["QWEN_SERVE_DUMP"], "a") as f: f.write(json.dumps({"t": time.time(), "route": route, "body": req}) + "\n")
       if chat:
         if not req.get("messages"): return self._err(400, "messages is required")
-        ids, vis = eng.prompt(req["messages"], think)
+        ids, vis = eng.prompt(req["messages"], think, tools=tools or None)
       else:
         text = req.get("prompt", ""); text = text[0] if isinstance(text, list) else text; ids, vis = eng.tok.encode(text), None
       max_new = int(req.get("max_completion_tokens") or req.get("max_tokens") or 512)
+      def tool_calls_of(text):
+        """The completion's <tool_call> blocks as OpenAI tool_calls (with tools in the request) -> (content, tool_calls or None)."""
+        if not tools: return text, None
+        content, calls = parse_tool_calls(text)
+        return content, ([{"index": i, "id": "call_" + uuid.uuid4().hex[:24], "type": "function", "function": c} for i, c in enumerate(calls)] or None)
       stop = req.get("stop") or []; stop = [stop] if isinstance(stop, str) else list(stop)
       rid, created = ("chatcmpl-" if chat else "cmpl-") + uuid.uuid4().hex[:24], int(time.time())
       obj = "chat.completion" if chat else "text_completion"
@@ -217,12 +284,26 @@ def make_handler(eng, name, chat_messages=chat_messages, details=OLLAMA_DETAILS)
           self.wfile.write(f"{len(b):x}\r\n".encode() + b + b"\r\n"); self.wfile.flush()
         base = {"id": rid, "object": obj + ".chunk" if chat else obj, "created": created, "model": name}
         if chat: sse(dict(base, choices=[{"index": 0, "delta": {"role": "assistant", "content": ""}, "finish_reason": None}]))
-        q = eng.submit(ids, max_new, stop, vis)
+        q = eng.submit(ids, max_new, stop, vis); acc = ""; sent = 0; TAG = "<tool_call>"
+        def nextmsg():
+          while True:
+            try: return q.get(timeout=20)
+            except queue.Empty: sse(dict(base, choices=[choice("", None, delta=True)]))   # keep-alive during a long prefill
         try:
-          while (m := q.get())[0] == "delta": sse(dict(base, choices=[choice(m[1], None, delta=True)]))
+          while (m := nextmsg())[0] == "delta":
+            if not tools: sse(dict(base, choices=[choice(m[1], None, delta=True)])); continue
+            acc += m[1]                                                   # with tools: stream the text before a <tool_call>, hold back a tag's possible start
+            if TAG in acc: cut = acc.index(TAG)
+            else: cut = len(acc) - max((k for k in range(1, len(TAG)) if acc.endswith(TAG[:k])), default=0)
+            if cut > sent: sse(dict(base, choices=[choice(acc[sent:cut], None, delta=True)])); sent = cut
           if m[0] == "error": sse({"error": {"message": m[1], "type": "invalid_request_error"}})
           else:
-            n, finish = m[1], m[2]; last = dict(base, choices=[choice("", finish, delta=True)])
+            n, finish = m[1], m[2]
+            if tools:
+              content, calls = tool_calls_of(acc)
+              if calls: sse(dict(base, choices=[{"index": 0, "delta": {"tool_calls": calls}, "finish_reason": None}])); finish = "tool_calls"
+              elif len(acc) > sent: sse(dict(base, choices=[choice(acc[sent:], None, delta=True)]))
+            last = dict(base, choices=[choice("", finish, delta=True)])
             if (req.get("stream_options") or {}).get("include_usage"): last["usage"] = {"prompt_tokens": len(ids), "completion_tokens": n, "total_tokens": len(ids) + n}
             sse(last); sse("[DONE]")
         except (BrokenPipeError, ConnectionResetError): return     # the client left; its request still runs to its end
@@ -230,8 +311,9 @@ def make_handler(eng, name, chat_messages=chat_messages, details=OLLAMA_DETAILS)
       parts, q = [], eng.submit(ids, max_new, stop, vis)
       while (m := q.get())[0] == "delta": parts.append(m[1])
       if m[0] == "error": return self._err(400, m[1])
-      n, finish = m[1], m[2]
-      self._json(200, {"id": rid, "object": obj, "created": created, "model": name, "choices": [choice("".join(parts), finish)],
+      n, finish = m[1], m[2]; content, calls = tool_calls_of("".join(parts)); ch = choice(content, "tool_calls" if calls else finish)
+      if calls: ch["message"]["tool_calls"] = calls; ch["message"]["content"] = content or None
+      self._json(200, {"id": rid, "object": obj, "created": created, "model": name, "choices": [ch],
                        "usage": {"prompt_tokens": len(ids), "completion_tokens": n, "total_tokens": len(ids) + n}})
   return H
 
@@ -297,7 +379,9 @@ def main(default_name="qwen3.8-27b", default_tmax=2048):
   import qwen38_ref as R_
   auto = a.tmax == "auto" or os.environ.get("QWEN_TMAX_AUTO") == "1"
   asid = os.environ.get("QWEN_KV_ASID", "0") == "1"
-  a.tmax, gb = auto_tmax(0, float(os.environ.get("QWEN_KV_GB", "2.0")), R_.NL // 4, R_.NKV, R_.HD, want=int(os.environ.get("QWEN_TMAX_MAX", "262144"))) if a.tmax == "auto" else (int(a.tmax), (asid_tmax(0, R_.NL // 4, R_.NKV, R_.HD, True, int(a.tmax))[1] if asid else kv_window_bytes(0, R_.NL // 4, R_.NKV, R_.HD, int(a.tmax), False) / 1e9))
+  nreg = int(os.environ.get("QWEN_PREFIX_REGIONS", "2")) if asid and os.environ.get("QWEN_PREFIX_CACHE", "1") == "1" else 1   # the prefix cache's regions = KV users
+  os.environ["QWEN_KV_USERS"] = str(nreg); ureg = nreg if nreg > 1 else 0
+  a.tmax, gb = auto_tmax(ureg, float(os.environ.get("QWEN_KV_GB", "2.0")), R_.NL // 4, R_.NKV, R_.HD, want=int(os.environ.get("QWEN_TMAX_MAX", "262144"))) if a.tmax == "auto" else (int(a.tmax), (asid_tmax(ureg, R_.NL // 4, R_.NKV, R_.HD, True, int(a.tmax))[1] if asid else kv_window_bytes(0, R_.NL // 4, R_.NKV, R_.HD, int(a.tmax), False) / 1e9))
   print(f"   context {a.tmax} tokens: K / V caches {gb:.2f} GB {'in the fullest of ASIDs 1-3 (3 GiB each; none of the ASID0 window; ' + os.environ.get('QWEN_KV_DTYPE', 'f16') + ')' if asid else 'of the NPU window'}", flush=True); eng = engine_fit(Engine, a, auto)
   srv = ThreadingHTTPServer((a.host, a.port), make_handler(eng, a.model_name))
   print(f"== serving {a.model_name} on http://{a.host}:{a.port}/v1 (OpenAI-compatible; greedy; context {a.tmax} tokens)", flush=True)
