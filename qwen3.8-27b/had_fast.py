@@ -54,20 +54,22 @@ def p1_pitch(c, real, opts):
   return p1_ch(c, real) * 4 + (64 if "asm" in opts and real <= 8 else 0)
 
 
-def had_fast_desc(mode, c, nrb, real, opts=()):
-  """had_a32d_desc with slot 0 = phase 1's chunk (p1_ch columns of the real rows, pitch c; LSRAM pitch p1_pitch)."""
+def had_fast_desc(mode, c, nrb, real, opts=(), hb=None):
+  """had_a32d_desc with slot 0 = phase 1's chunk (p1_ch columns of the real rows, pitch c; LSRAM pitch p1_pitch). `hb`: the
+  transformed block (default HAD_B; 512 for Bonsai 2 2B / 4B, v2 only)."""
   if "v2" in opts: opts = tuple(opts) + ("asm", "swasm")
-  iqr = min(3, -(-real // 4)); nl = real - 4 * (iqr - 1); RB = HAD_B * 4; ch = p1_ch(c, real); LP = RB + (512 if ("asm" in opts or "swasm" in opts) else 0)
+  iqr = min(3, -(-real // 4)); nl = real - 4 * (iqr - 1); RB = (hb or HAD_B) * 4; ch = p1_ch(c, real); LP = RB + (512 if ("asm" in opts or "swasm" in opts) else 0)
   if "rec" in opts:   # the norm record's real lines (qwen38_kernels.resid32q), the last slot (rec_slot)
-    base = had_fast_desc(mode, c, nrb, real, tuple(o for o in opts if o != "rec")); return __import__("numpy").concatenate([base, V._desc_slots((real * 64,))])
+    base = had_fast_desc(mode, c, nrb, real, tuple(o for o in opts if o != "rec"), hb=hb); return __import__("numpy").concatenate([base, V._desc_slots((real * 64,))])
   return V._desc_slots((real * ch * 4, ch * 4, c * 4, p1_pitch(c, real, opts)), (4 * RB, RB, c * 4, LP), (nl * RB, RB, c * 4, LP), (RB,),
-                       (8192,) if iqr == 1 else (8192, 32, 32 * iqr, 32),
+                       (RB * 2,) if iqr == 1 else (RB * 2, 32, 32 * iqr, 32),   # the drain: a block's A lines (8192 B at 1024; was a constant)
                        *([((3 * nrb + 3) * 256 // (3 if "dmab" in opts else 1), 256, 768, 256)] if not ("sx" in opts or "swasm" in opts) else
                          [(256,)] + [(cnt * 256, 256, 3 * nrb * 768, 768) for cnt in range(1, 6)]))
 
 
-def had_fast_src(mode, c, nrb, eps, real, stacked=False, post=1.0, opts=()):
-  if "v2" in opts: return had_fast2_src(mode, c, nrb, eps, real, stacked=stacked, post=post, opts=opts)
+def had_fast_src(mode, c, nrb, eps, real, stacked=False, post=1.0, opts=(), hb=None):
+  if "v2" in opts: return had_fast2_src(mode, c, nrb, eps, real, stacked=stacked, post=post, opts=opts, hb=hb)
+  assert hb in (None, HAD_B), "had_fast v1: HAD_B blocks only (v2 takes hb = 512)"
   assert mode in ("rms", "plain", "swiglu") and c % HAD_B == 0 and 1 <= real <= 12; nb = c // HAD_B; iqr = min(3, -(-real // 4))
   RB = HAD_B * 4; SWB = (3 * nrb + 3) * 256
   # L: the quad's 4 rows. "asm": rows 4608 B apart from byte 512 (a 512-B gap before each row takes the prologue-free asm loops'
@@ -333,13 +335,13 @@ def _hsum_rsqrt_vec(real, c, eps):
   return "\n  ".join(s)
 
 
-def had_fast2_src(mode, c, nrb, eps, real, stacked=False, post=1.0, opts=()):
-  assert mode in ("rms", "plain", "swiglu") and c % HAD_B == 0 and 1 <= real <= 12 and nrb >= 1
-  assert post == 1.0, "v2: post == 1.0 only (the production setting)"
-  nb = c // HAD_B; iqr = min(3, -(-real // 4)); RB = HAD_B * 4
+def had_fast2_src(mode, c, nrb, eps, real, stacked=False, post=1.0, opts=(), hb=None):
+  HB = hb or HAD_B; assert HB in (512, 1024)   # the transformed block: 1024 (Bonsai 2 27B), 512 (2B / 4B: pass C radix 4, `post` 1 / sqrt(512))
+  assert mode in ("rms", "plain", "swiglu") and c % HB == 0 and 1 <= real <= 12 and nrb >= 1
+  nb = c // HB; iqr = min(3, -(-real // 4)); RB = HB * 4
   L0, LP = 512, RB + 512; LPF = LP // 4                   # the quad's rows 4608 B apart from byte 512 (A's / B's garbage gaps)
-  W0 = L0 + 4 * LP; OUT0, IN0 = W0 + RB, W0; SCR = OUT0 + 512
-  CH = p1_ch(c, real); CHP = p1_pitch(c, real, ("asm",)); CHB = real * CHP; NCH = c // CH
+  W0 = L0 + 4 * LP; CH = p1_ch(c, real); CHP = p1_pitch(c, real, ("asm",)); CHB = real * CHP; NCH = c // CH
+  OUT0, IN0 = max(W0 + RB, -(-2 * CHB // 64) * 64), W0; SCR = OUT0 + 512   # (a 512 block: OUT past phase 1's two chunks; 1024: W0 + RB)
   assert 2 * CHB <= OUT0 and OUT0 + 8192 <= INV0 and SCR + 4096 + 128 <= OUT0 + 8192
   PH = "phases" in opts; WARM = "warm" in opts and mode != "swiglu"; P1W = "p1w" in opts and mode == "rms"
   T0 = lambda v: f" int {v} = CYC();" if PH else ""
@@ -348,8 +350,8 @@ def had_fast2_src(mode, c, nrb, eps, real, stacked=False, post=1.0, opts=()):
   ONEU = nb <= NT                                  # one unit per task: no unit loop
   ONEQ = iqr == 1                                  # one row quad: no quad loop, no pending drain, nr a constant
   MULTI = not (ONEU and ONEQ)
-  SXN = 13; NCK = -(-64 // SXN); SB = 2 * SXN * 256
-  zero = ("NOUNROLL for (int r = nr; r < 4; r++) NOUNROLL for (int k = 0; k < %d; k += 8) *(__global float8*)(L + r * %d + k) = BC(0.0f);" % (HAD_B, LPF)) \
+  SXN = 13; NS16 = HB // 16; NCK = -(-NS16 // SXN); SB = 2 * SXN * 256
+  zero = ("NOUNROLL for (int r = nr; r < 4; r++) NOUNROLL for (int k = 0; k < %d; k += 8) *(__global float8*)(L + r * %d + k) = BC(0.0f);" % (HB, LPF)) \
     if (not ONEQ or real % 4) else ""
   if mode == "swiglu":
     assert IN0 + 2 * SB <= INV0
@@ -359,11 +361,11 @@ def had_fast2_src(mode, c, nrb, eps, real, stacked=False, post=1.0, opts=()):
                        "l1": f"L0p + (2 * h + 1) * {LPF}"}, consts=consts)
     load = f"""
    {T0("ts_")} NOUNROLL for (int s = 0; s <= {NCK}; s++) {{
-      if (s < {NCK}) {{ int ci = {NCK - 1} - s, q = s & 1; int j0 = 64 * b + {SXN} * ci; int n = ci == {NCK - 1} ? {64 - SXN * (NCK - 1)} : {SXN};
+      if (s < {NCK}) {{ int ci = {NCK - 1} - s, q = s & 1; int j0 = {NS16} * b + {SXN} * ci; int n = ci == {NCK - 1} ? {NS16 - SXN * (NCK - 1)} : {SXN};
         NOUNROLL for (int t = 0; t < 3; t++) {{ int js = j0 + t, ju = js + {c // 16}, cnt = (n - t + 2) / 3;
           DMA_FILL(q, DESC(desc, 5) + 64 * cnt, {IN0} + q * {SB} + 256 * t, (int)(x + ((js / 3) * {3 * nrb} + js % 3) * 192 + i * 64));
           DMA_FILL(q + 2, DESC(desc, 5) + 64 * cnt, {IN0} + q * {SB} + {SXN * 256} + 256 * t, (int)(x + ((ju / 3) * {3 * nrb} + ju % 3) * 192 + i * 64)); NOHWL(t); }} }}
-      if (s > 0) {{ int cp = {NCK} - s, p = (s - 1) & 1; int n = cp == {NCK - 1} ? {64 - SXN * (NCK - 1)} : {SXN};
+      if (s > 0) {{ int cp = {NCK} - s, p = (s - 1) & 1; int n = cp == {NCK - 1} ? {NS16 - SXN * (NCK - 1)} : {SXN};
        {T0("tw_")} DMA_WAIT(p); DMA_WAIT(p + 2);{T(5, "tw_")}
         __global float* G = LSF({IN0} + p * {SB}); __global float* U = G + {SXN * 64}; __global float* L0p = L + cp * {16 * SXN}; int tsw = 2 * n;
         NOUNROLL for (int h = 0; h < 2; h++) {{ {blk} NOHWL(h); }} }}{HW("s")}
@@ -404,22 +406,24 @@ def had_fast2_src(mode, c, nrb, eps, real, stacked=False, post=1.0, opts=()):
   else {{ {phase1} }}"""
     nrx = "nr == 4 ? 1 : 2" if not ONEQ else ("1" if real == 4 else "2")
     load = f"""
-   {T0("tl_")} {"if (i == 0) " if not ONEQ else ""}DMA_FILL(0, DESC(desc, 3), {W0}, (int)(w + b * {HAD_B}));
-    DMA_FILL(2, DESC(desc, {nrx}), {L0}, (int)(x + 4 * i * {c} + b * {HAD_B}));{T(3, "tl_")}"""
+   {T0("tl_")} {"if (i == 0) " if not ONEQ else ""}DMA_FILL(0, DESC(desc, 3), {W0}, (int)(w + b * {HB}));
+    DMA_FILL(2, DESC(desc, {nrx}), {L0}, (int)(x + 4 * i * {c} + b * {HB}));{T(3, "tl_")}"""
     waits = f"{T0('tlw_')} {'if (i == 0) ' if not ONEQ else ''}DMA_WAIT(0); DMA_WAIT(2);{T(3, 'tlw_')}"
     ivs = "INVP[4 * i + r]" if mode == "rms" else None
   # the passes: A (prologue-free), B (prologue-free, both halves), C (c_j derived), the conversion (rows derived)
   sA = sch(f"A-{mode}-np", lambda: hasm.ops_passA(mode), nopro=True); sB = sch("B-np", lambda: hasm.ops_radix8("B"), nopro=True)
-  sC = sch("C", lambda: hasm.ops_radix8("C")); sV = sch("conv", hasm.ops_conv)
+  NC = 8 if HB == 1024 else 4; PST = post != 1.0
+  sC = sch("C" if NC == 8 else "C4", lambda: hasm.ops_radix8("C" if NC == 8 else "C4")); sV = sch("conv-post" if PST else "conv", lambda: hasm.ops_conv(post=PST))
   bA = {"rl": "Lr", "rs": "Lr"} | ({} if mode == "swiglu" else {"rw": "W"})
-  dC = {f"c{j}": (f"c{j - 1}", 512) for j in range(1, 8)}; dV = {f"c{r}": (f"c{r - 1}", "lp") for r in range(1, 4)}
+  dC = {f"c{j}": (f"c{j - 1}", 512) for j in range(1, NC)}; dV = {f"c{r}": (f"c{r - 1}", "lp") for r in range(1, 4)}
   DRY = WARM or P1W
+  assert not DRY or (HB == HAD_B and not PST), "the dry ablations: HAD_B blocks, post 1.0"
   tr = (lambda v, n: v) if DRY else (lambda v, n: n)      # the dry ablations: trip counts in registers (`loop rN`)
-  passA = hasm.c_block(sA, tr("tA", HAD_B // 32), bA, consts=[("ivv", "BC(iv)")] if mode == "rms" else [])
-  passB = hasm.c_block(sB, tr("tB", 8), {"bl": "Lr + 8 * e", "bs": "Lr + 8 * e"})
-  passC = hasm.c_block(sC, tr("tC", 16), {f"c{j}": f"Lr + {128 * j}" for j in range(8)}, derive=dC)
-  conv = hasm.c_block(sV, tr("tV", HAD_B // 16), {"c0": "Cv0", "c1": f"Cv0 + {LPF}", "c2": f"Cv0 + {2 * LPF}", "c3": f"Cv0 + {3 * LPF}", "o": "Ov"},
-                      regs=[("lp", "lpv" if DRY else str(LP))], derive=dV)
+  passA = hasm.c_block(sA, tr("tA", HB // 32), bA, consts=[("ivv", "BC(iv)")] if mode == "rms" else [])
+  passB = hasm.c_block(sB, tr("tB", HB // 128), {"bl": "Lr + 8 * e", "bs": "Lr + 8 * e"})
+  passC = hasm.c_block(sC, tr("tC", 16), {f"c{j}": f"Lr + {128 * j}" for j in range(NC)}, derive=dC)
+  conv = hasm.c_block(sV, tr("tV", HB // 16), {"c0": "Cv0", "c1": f"Cv0 + {LPF}", "c2": f"Cv0 + {2 * LPF}", "c3": f"Cv0 + {3 * LPF}", "o": "Ov"},
+                      regs=[("lp", "lpv" if DRY else str(LP))], derive=dV, consts=[("pvv", f"BC({post!r}f)")] if PST else [])
   if not DRY:
     rows = f"""
     {zero}
@@ -440,17 +444,17 @@ def had_fast2_src(mode, c, nrb, eps, real, stacked=False, post=1.0, opts=()):
       int dry = r < 0;
       if (r == 0) {{ {waits} }}
       if (r < nr) {{
-        __global float* Lr = dry ? LSF({SCR}) : L + r * {LPF};{f" float iv = INVP[4 * i + (dry ? 0 : r)];" if ivs else ""} int tA = dry ? 1 : {HAD_B // 32}, tB = dry ? 1 : 8, tC = dry ? 1 : 16;
+        __global float* Lr = dry ? LSF({SCR}) : L + r * {LPF};{f" float iv = INVP[4 * i + (dry ? 0 : r)];" if ivs else ""} int tA = dry ? 1 : {HB // 32}, tB = dry ? 1 : 8, tC = dry ? 1 : 16;
        {T0("tA_")} {passA}{PT(1, 6, "tA_")}{T0("tB_")}
         NOUNROLL for (int e = 0; e < 2; e++) {{ {passB}{HW("e")} }}{PT(2, 7, "tB_")}{T0("tC_")}
         {passC}{PT(4, 8, "tC_")}
       }}
       if (dry | (r == nr)) {{
-        __global float* Cv0 = dry ? LSF({SCR}) : L; __global half* Ov = dry ? LSH({SCR + 4096}) : O; int lpv = dry ? 0 : {LP}, tV = dry ? 1 : {HAD_B // 16};
+        __global float* Cv0 = dry ? LSF({SCR}) : L; __global half* Ov = dry ? LSH({SCR + 4096}) : O; int lpv = dry ? 0 : {LP}, tV = dry ? 1 : {HB // 16};
        {T0("tV_")} {conv}{PT(5, 9, "tV_")}
       }}{HW("r")}
     }}"""
-  drain = f"DMA_DRAIN(3, DESC(desc, 4), {OUT0}, (int)(out + b * {HAD_B // 128 * 512 * iqr} + i * 16));" + (" pend = 1;" if MULTI else "")
+  drain = f"DMA_DRAIN(3, DESC(desc, 4), {OUT0}, (int)(out + b * {HB // 128 * 512 * iqr} + i * 16));" + (" pend = 1;" if MULTI else "")
   if ONEQ:
     quad = f"""  {{ const int i = 0; const int nr = {real};{"" if not MULTI else f"{T0('td_')} if (pend) {{ DMA_WAIT(3); pend = 0; }}{T(10, 'td_')}"}
     {load}{rows}
@@ -478,20 +482,20 @@ def had_fast2_src(mode, c, nrb, eps, real, stacked=False, post=1.0, opts=()):
     else if (k == 0) {{
       if (i == 0) {{ {_hsum_rsqrt_vec(real, c, eps)}{T(1, "tp1_")} }}{" else { DMA_WAIT(3); }" if iqr > 1 else ""}
       {zero1}
-     {T0("tl_")} if (i == 0) DMA_FILL(0, DESC(desc, 3), {W0}, (int)(w + b * {HAD_B}));
-      DMA_FILL(2, DESC(desc, nr == 4 ? 1 : 2), {L0}, (int)(x + 4 * i * {c} + b * {HAD_B}));
+     {T0("tl_")} if (i == 0) DMA_FILL(0, DESC(desc, 3), {W0}, (int)(w + b * {HB}));
+      DMA_FILL(2, DESC(desc, nr == 4 ? 1 : 2), {L0}, (int)(x + 4 * i * {c} + b * {HB}));
       if (i == 0) DMA_WAIT(0); DMA_WAIT(2);{T(3, "tl_")}
     }}
     int dry = p1s; int dA = p1s ? s == 0 : k < nr, dB = p1s ? s == 1 : k < nr, dC = p1s ? s == 2 : k < nr, dVv = p1s ? s == 3 : k == 4;
     __global float* Lr = dry ? LSF({SCRW}) : L + k * {LPF}; float iv = INVP[dry ? 0 : 4 * i + (k & 3)];
-    int tA = dry ? 1 : {HAD_B // 32}, tB = dry ? 1 : 8, tC = dry ? 1 : 16;
+    int tA = dry ? 1 : {HB // 32}, tB = dry ? 1 : 8, tC = dry ? 1 : 16;
    {T0("tR_")} if (dA) {{ {passA} }}
     if (dB) {{ NOUNROLL for (int e = 0; e < 2; e++) {{ {passB}{HW("e")} }} }}
     if (dC) {{ {passC} }}
     if (dVv) {{
-      __global float* Cv0 = dry ? LSF({SCRW}) : L; __global half* Ov = dry ? LSH({SCRW + 3712}) : O; int lpv = dry ? 0 : {LP}, tV = dry ? 1 : {HAD_B // 16};
+      __global float* Cv0 = dry ? LSF({SCRW}) : L; __global half* Ov = dry ? LSH({SCRW + 3712}) : O; int lpv = dry ? 0 : {LP}, tV = dry ? 1 : {HB // 16};
       {conv}
-      if (!dry) {{ DMA_DRAIN(3, DESC(desc, 4), {OUT0}, (int)(out + b * {HAD_B // 128 * 512 * iqr} + i * 16)); }}
+      if (!dry) {{ DMA_DRAIN(3, DESC(desc, 4), {OUT0}, (int)(out + b * {HB // 128 * 512 * iqr} + i * 16)); }}
     }}{T(6, "tR_")}
     if (p1s) {{
      {T0("tw_")} DMA_WAIT(s & 1);{T(2, "tw_")}
@@ -502,7 +506,7 @@ def had_fast2_src(mode, c, nrb, eps, real, stacked=False, post=1.0, opts=()):
   }}"""
   elif ONEU: unit = f"  {{ const int b = core_id;{' dg_[13] += 1;' if PH else ''}{quad}\n  }}"
   else: unit = f"  for (int b = core_id; b < {nb}; b += {NT}) {{{' dg_[13] += 1;' if PH else ''}\n{quad}{HW('b')}\n  }}"
-  src = K.had_a32_src(mode, c, nrb, eps, real=real, compact=True, stacked=stacked, post=post)
+  src = K.had_a32_src(mode, c, nrb, eps, real=real, compact=True, stacked=stacked, post=post, hb=HB)
   pre = src[:src.index("static inline __attribute__((always_inline)) float8 h8(")] + H16 + NOUNROLL + (CYCDEF if PH else "") + \
     '#define NOHWL(i) __asm__ volatile("" : "+r"(i))\n'
   dg_arg = ", __global int* restrict dg" if PH else ""
@@ -513,7 +517,12 @@ def had_fast2_src(mode, c, nrb, eps, real, stacked=False, post=1.0, opts=()):
   fin = (f"""{T0("tf_")} DMA_WAIT_ALL();{T(11, "tf_")}
   dg_[0] += CYC() - t00_;
   for (int q_ = 0; q_ < 16; q_++) dg[core_id * 16 + q_] = dg_[q_];""" if PH else "  DMA_WAIT_ALL();")
-  return pre + f"""__kernel void had_a32d(__global half* restrict out, __global float* restrict x{"" if mode == "swiglu" else ", __global float* restrict w"}{", __global int* restrict idx" if stacked else ""}{", __global float* restrict rec" if "rec" in opts else ""}, __global int* restrict desc{dg_arg}, const int core_id) {{
+  REQ = "req" in opts; assert not (REQ and (PH or TW)), "req: not with the phase counters / twice"
+  if REQ:   # the CPU split's REQ folded in (qwen38_kernels.cpu_req_copy's work): each A drain also to the DDR mirror, then a REQ line a task
+    fin += """
+  { __global volatile int* rq_ = (__global volatile int*)LSF(0); rq_[0] = 1; DMA_DRAIN(0, DESC(rdesc, 0), 0, (int)(reqw + core_id * 16)); }
+  DMA_WAIT_ALL();"""
+  src_ = pre + f"""__kernel void had_a32d(__global half* restrict out, __global float* restrict x{"" if mode == "swiglu" else ", __global float* restrict w"}{", __global int* restrict idx" if stacked else ""}{", __global float* restrict rec" if "rec" in opts else ""}, __global int* restrict desc{dg_arg}{", __global half* restrict mirror, __global int* restrict reqw, __global int* restrict rdesc" if REQ else ""}, const int core_id) {{
 {"  w += idx[0] * %d;" % c if stacked else ""}
 {phd}  if (core_id < {nb}) {{
 {rep0}  __global float* INVP = LSF({INV0});{phase1}
@@ -522,3 +531,12 @@ def had_fast2_src(mode, c, nrb, eps, real, stacked=False, post=1.0, opts=()):
 {rep1}  }}
 {fin}
 }}"""
+  if not REQ: return src_
+  # the mirror drain beside each A drain (same LSRAM, same offset, same flag); a wait on the drain flag before the output buffer's
+  # reuse becomes a wait on every request, so it covers both drains (two requests on one flag: the flag alone does not say both are done)
+  import re as _re
+  n0 = src_.count("(int)(out + ")
+  src_ = _re.sub(r"DMA_DRAIN\(3, DESC\(desc, 4\), (\d+), \(int\)\(out \+ ([^;]*?)\)\);",
+                 lambda m_: m_.group(0) + f" DMA_DRAIN(3, DESC(desc, 4), {m_.group(1)}, (int)(mirror + {m_.group(2)}));", src_)
+  assert src_.count("(int)(mirror + ") == n0 >= 1, "req: every A drain mirrored"
+  return src_.replace("DMA_WAIT(3)", "DMA_WAIT_ALL()")

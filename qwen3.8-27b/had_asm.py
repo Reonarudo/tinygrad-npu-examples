@@ -277,35 +277,39 @@ def ops_radix8(kind):
   """Pass B ("B": stages 16, 32, 64; one group a trip: vectors at 64 j, a trip 512 B; the caller runs it twice, from L and L + 32 B) or pass C ("C": stages
   128, 256, 512; one group a trip: vectors at 512 j, a trip 32 B; base c_j per j, shared by the loads and the stores).
   Stages on j's bits 0, 1, 2 in turn (a + b at the lower j, a - b at the upper)."""
-  ops = []
+  ops = []; nj = 4 if kind == "C4" else 8     # "C4": pass C of a 512 block (Bonsai 2 2B / 4B): stages 128, 256 on four vectors 512 B apart
   if kind == "B": bases = {"bl": 512, "bs": 512}; groups = 1
-  else: bases = {f"c{j}": 32 for j in range(8)}; groups = 1
+  else: bases = {f"c{j}": 32 for j in range(nj)}; groups = 1
   for q in range(groups):
     a = {}; offs = {}
-    for j in range(8):
+    for j in range(nj):
       if kind == "B": off, bl, bs = 32 * q + 64 * j, "bl", "bs"
       else: off, bl, bs = 0, f"c{j}", f"c{j}"
       offs[j] = (off, bs); bk = ((32 * q + 64 * j) >> 6) & 1 if kind == "B" else 0
       a[j] = f"a{q}_{j}"; ops.append(Op("ld", "ld {d}, [{b}+{o}]", a[j], (), bl, off, bk))
-    for dd in (1, 2, 4):
-      for j in range(8):
+    for dd in ((1, 2) if nj == 4 else (1, 2, 4)):
+      for j in range(nj):
         if j & dd: continue
         s_, d_ = f"a{q}_{j}_{dd}", f"a{q}_{j + dd}_{dd}"
         ops.append(Op("v", "add {d}.fp32, {s0}.fp32, {s1}.fp32, p7.w", s_, (a[j], a[j + dd]))); ops.append(Op("v", "sub {d}.fp32, {s0}.fp32, {s1}.fp32, p7.w", d_, (a[j], a[j + dd])))
         a[j], a[j + dd] = s_, d_
-    for j in range(8):
+    for j in range(nj):
       off, bs = offs[j]; bk = ((32 * q + 64 * j) >> 6) & 1 if kind == "B" else 0
       ops.append(Op("st", "st {s0}, [{b}+{o}]", None, (a[j],), bs, off, bk))
   return ops, bases
 
 
-def ops_conv():
+def ops_conv(post=False):
   """4 pieces a trip (16 columns of the 4 rows: r0..r3 at +0, q0..q3 at +32; rows 4 KiB apart): extl / exth row pairs, cvt.d, 4
-  stores of 32 B (O advances 128 B a trip). bases: c0..c3 (row loads), o (stores)."""
+  stores of 32 B (O advances 128 B a trip). bases: c0..c3 (row loads), o (stores). `post`: each loaded value times the constant
+  %pvv first (had_a32's `* BC(post)` before its conversion: a 512 block's 1 / sqrt(512), not foldable into the scale tables)."""
   ops = []; bases = {"c0": 64, "c1": 64, "c2": 64, "c3": 64, "o": 128}
   for h in range(2):
     rr = [f"r{h}_{r}" for r in range(4)]
     for r in range(4): ops.append(Op("ld", "ld {d}, [{b}+{o}]", rr[r], (), f"c{r}", 32 * h, 0))
+    if post:
+      for r in range(4): ops.append(Op("v", "mul {d}.fp32, {s0}.fp32, {s1}.fp32, p7.w", f"p{h}_{r}", (rr[r], "%pvv")))
+      rr = [f"p{h}_{r}" for r in range(4)]
     for sel, nm in (("extl", "L"), ("exth", "H")):
       x01, x23 = f"{nm}{h}01", f"{nm}{h}23"
       ops.append(Op("x", sel + " {d}.w, {s0}.w, {s1}.w", x01, (rr[0], rr[1]))); ops.append(Op("x", sel + " {d}.w, {s0}.w, {s1}.w", x23, (rr[2], rr[3])))

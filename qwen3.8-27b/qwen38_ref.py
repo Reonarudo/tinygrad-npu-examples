@@ -35,6 +35,7 @@ H, INTER, NH, NKV, HD, VOCAB, EPS, THETA = _P["H"], _P["INTER"], _P["NH"], _P["N
 NK, DK, NV, DV, CONV = _P["NK"], 128, _P["NV"], 128, 4       # Gated DeltaNet: key heads x 128, value heads x 128, conv kernel 4
 NL = _P["NL"]                                                  # layers
 Q8 = _P["Q8"]                                                  # linears as GGUF Q8_0 (int8, a scale per 32) instead of E4M3 128 x 128 blocks
+if BONSAI and os.environ.get("QWEN_BONSAI_Q8") == "1": Q8 = True     # a Bonsai 2 GGUF requantised to Q8_0 (bonsai2_pack_q8.py): the Q8_0 GEMM with the Hadamard producers
 # HAD: every linear's input is rotated (bonsai2-27b: a 1024-block Walsh-Hadamard transform with per-width signs, folded into the
 # stored weights), so the device's A producers apply the transform (qwen38_kernels.had_a32_src) and the head is ternary
 HAD = _P.get("HAD", False)

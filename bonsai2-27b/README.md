@@ -293,7 +293,10 @@ pass's own argmax, so the output is the same as plain greedy decoding.
 | `BONSAI_GGUF` | `/mnt/ssd/bonsai2/Ternary-Bonsai-2-27B-PTQ1_0.gguf` | the checkpoint (the host reads the embedding rows from it). Set it to your path |
 | `QWEN_NPU` | `/mnt/ssd/bonsai2-npu` | the packed cache. Set it to your path |
 | `QWEN_TOK` | the cache | the folder holding `tokenizer.json` |
-| `QWEN_MTP_CACHE` | `$QWEN_NPU/mtp` | the drafter's cache: Qwen3.8-27B's MTP layer, in FP8 with single-layout scales |
+| `QWEN_MTP_CACHE` | `$QWEN_NPU/mtp_q4t` with the CPU split (if it exists), else `$QWEN_NPU/mtp` | the drafter's cache: Qwen3.8-27B's MTP layer (FP8 with single-layout scales, or its 4-bit q4t packing) |
+| `QWEN_CPU_SPLIT` | on, when the cache has its CPU files: `qkvz=0.70,qkv=0.65,gu=0.50,o=0.44,dn=0.44,head=0.50` (`qkv=0.50` without the gate tail); the 2B `qkvz=0.35,qkv=0.35,gu=0.35,o=0.30,dn=0.30,head=0.35` | the NPU + CPU column split of every ternary linear: the share of each linear's columns the CPU computes. `0`: the NPU alone |
+| `QWEN_CPU_SPLIT_MTP` | `0.55` with the split, if the drafter cache has its CPU files | the drafter's linears split the same way: a q4t cache's 4-bit ones (`cpu_split_pack.py --mtp`), or an fp8 cache's E4M3 ones as they are (`--mtp8`: the 2B's drafter) |
+| `QWEN_CPUS` | `irq` with the split (the CPU taking the NPU's interrupt, alone), else `auto` | the host's CPUs; the split's pool takes the other big cores, never the little ones (`QWEN_CPU_SPLIT_CPUS` to choose) |
 | `QWEN_MTP_HEAD` | `bonsai` | the draft head: Bonsai's own ternary head, or `qwen`: Qwen3.8-27B's FP8 head, read from `QWEN_MTP_CACHE` |
 | `QWEN_MTP_EMBED` | `bonsai` | the drafted token's embedding: Bonsai's, or `qwen`: Qwen3.8-27B's table, from `QWEN_MTP_DIR` |
 | `QWEN_MTP_DIR` | unset | Qwen3.8-27B-FP8's folder (its `outside.safetensors`), needed only with `QWEN_MTP_EMBED=qwen` |
@@ -306,7 +309,26 @@ pass's own argmax, so the output is the same as plain greedy decoding.
 | `QWEN_DRAFT_PARTS` | `2` (`2,thresh:20` with the Qwen head) | the draft head reads the first 2 of the head's 4 parts (token ids < 124 416) |
 | `QWEN_CPUS`, `QWEN_CPU_LATENCY` | `auto`, `0` | the host's CPU pinning and the CPU-latency request ([above](#the-cpu-latency-request)) |
 
-`QWEN_SPEC_TREE` is not available for this model.
+With the split the decode verifies a chain of drafts (`QWEN_SPEC_TREE=off`, set for you); the split's deferred steps run in the
+chain's kernels.
+
+**The NPU + CPU split (default on the 27B and the 2B).** The NPU streams part of each ternary linear's columns and the big CPU cores compute
+the rest into the same output tiles; the outputs are plain greedy's (10 / 10 on the 10-prompt gate: 6.70 -> 11.42 tok/s). It needs the CPU's copies of the weights, made once from the packed cache (~6 GB):
+
+```bash
+python3 cpu_split_pack.py --cache $QWEN_NPU --kinds gu,dn,o,fused   # every layer's linears
+python3 cpu_split_pack.py --cache $QWEN_NPU --head                  # the ternary head's parts
+python3 cpu_split_pack.py --mtp $QWEN_NPU/mtp_q4t                   # the q4t drafter's linears (its cache: ../qwen3.8-27b/pack_mtp_q4t.py)
+python3 cpu_split_pack.py --cache $QWEN_NPU --gtail $QWEN_NPU-gt    # the attention layers' gates at the q|kv tail (a new cache of
+                                                                    # symlinks + 0.65 GB: then QWEN_NPU=$QWEN_NPU-gt)
+```
+
+Without these files the generator runs the NPU alone, as before.
+
+The 2B takes the split too (10 / 10 identical on the same gate: 30.62 -> 33.66 tok/s, +10 %; its GEMMs are small against their
+fixed cost a call, so its shares are lower). Its files, once (~0.5 GB, seconds): `cpu_split_pack.py --cache /mnt/ssd/bonsai2-2b-npu
+--layers 0-23 --kinds gu,dn,o,fused`, then `--head`. The gate tail buys it nothing. Its fp8 drafter is split once its CPU files exist
+(`cpu_split_pack.py --mtp8 <cache>/mtp`; below).
 
 **The Qwen-head option (+3 %).** If you already have Qwen3.8-27B packed for the [qwen3.8-27b](../qwen3.8-27b/) example, with
 single-layout scales (`qwen38_pack.py --scales single`, or `qwen38_repack_scales.py`), its FP8 head (`--lm-head-fp8`) and its MTP
@@ -361,8 +383,36 @@ safetensors file, then `--mtp-gguf` on that file). Board o6n, 2026-10-26, three 
 | 4B | 1.5 GB | 29-35 | 6.9 | **16.2-24.2** | 1.0-2.0 |
 | 9B | 2.7 GB | 15-17 | 4.5 | **9.2-10.7** | 1.5-1.9 |
 
+**The 2B's fastest single-user decode (opt-in, 2026-11-18).** The defaults above are tuned for three drafts a pass. One draft a
+pass with the ids on the device, the shares retuned and the host's round trips cut gives **56.3 tok/s** pooled over the 10
+EXPLORE prompts (120 tokens each), against 32.4 for the default on the same pool, every output identical to plain greedy's:
+
+```sh
+python3 cpu_split_pack.py --mtp8 /mnt/ssd/bonsai2-2b-npu/mtp      # once: the drafter's CPU files
+QWEN_MODEL=bonsai2-2b QWEN_DRAFT_MAX=1 QWEN_DRAFT_PARTS=1 QWEN_NPU_IDS=1 \
+  QWEN_CPU_SPLIT=qkvz=0.58,qkv=0.50,gu=0.578,o=0.72,dn=0.45,head=0.60 QWEN_CPU_SPLIT_MTP=0.5 QWEN_CPU_SPLIT_HEAD_EARLY=1 \
+  QWEN_IDS_FOLD=1 QWEN_JIT_FAST=1 QWEN_HEAD_OVERLAP=1 QWEN_MTP_PROMPT=8 python3 bonsai2_generate.py "prompt"
+```
+
+| variable | what it does |
+| --- | --- |
+| `QWEN_IDS_FOLD=1` | with `QWEN_NPU_IDS=1`: the ids' embedding runs in the first layer block's job and the acceptance in the head's (two jobs fewer a pass); the ids are read through the host mapping |
+| `QWEN_JIT_FAST=1` | a captured JIT is replayed without tinygrad's per-call input preparation (0.45 of the 0.6 ms a 4-layer block's call took) |
+| `QWEN_HEAD_OVERLAP=1` | the verify head's job is submitted while the last layer block runs (one CPU schedule for both) |
+| `QWEN_CPU_SPLIT_HEAD_EARLY=1` | the head's parts 1.. reuse part 0's input on the CPU: the pool computes them back to back |
+| `QWEN_MTP_PROMPT=<rows>` | the drafter's pass over the prompt in chunks of that many rows, its head only on the last (a per-generation cost: 12 passes become 3 on a 24-token prompt) |
+
+The drafter's fp8 kernel on the CPU (`cpu_split.c` fmt 2) multiplies in fp16, 4.5e-4 relative rms against exact sums; it changes
+drafts only, never a token. These switches are not defaults: they were gated on short prompts in `bonsai2_generate.py` only, not in the servers or on long contexts. On the 27B the three generic ones measured +1 % on
+two prompts.
+
 The prompt goes through the verify path (`QWEN_PREFILL=chunked`: the one-pass prefill's DeltaNet kernel wants 48 value heads). Plain
 decoding on these sizes is `QWEN_DRAFT=none` (the verify path without drafts); `QWEN_SPEC=0` has no geometries for the chunked prefill.
+On the 2B the DeltaNet kernel splits its 16 heads over the 12 tasks only above 4 rows, and the split kernel keeps its update
+records in another layout (two parities); a pass reads pending records of its own kind, else they are flushed first. Before
+2026-11-17 the generator took every pass for split, so plain decoding (8-row passes) after a 2-3-row last prompt chunk read the
+records in the wrong layout: wrong from the first decoded token on 7 of the 10 EXPLORE prompts (the speculative path, all <= 4 rows,
+was right).
 
 ## Images: the vision tower (`vision/`)
 
@@ -425,6 +475,8 @@ chat path did not have:
   definitions with every turn, and the 9B prefills at ~19 tok/s: 14 minutes a turn from scratch. The server remembers which tokens
   the K / V caches hold and keeps snapshots of the recurrent state (the DeltaNet states and conv rings, ~0.1 GB each on the host) at a
   few positions: after the first message (the system turn), at the prompt's end and at the generation's end (`QWEN_PREFIX_SNAPS`, 6).
+  A snapshot first applies the deferred DeltaNet commit's pending updates (`flush`); before 2026-11-17 it dropped them, so a snapshot
+  and the rest of the prompt it was taken in lacked the last pass's updates (the cold path snapshots too, so it agreed with them).
   A new prompt resumes from the largest snapshot inside its common prefix with the cached tokens and prefills only the rest; the
   drafter's prompt pass starts there too. A turn that continues a conversation (the previous prompt, the answer, the tool results)
   prefills its new tokens only; a new conversation with the same system prompt starts after it. Images bypass the cache. Past
@@ -506,13 +558,23 @@ The ternary GEMMs are flat from 1 to 8 rows (the codes are expanded once a K-sli
 MB of codes at ~16 GB/s) and double at 12 rows, where the third row tile leaves the LSRAM-accumulator fast path (rt <= 2: the 32
 vector registers hold 8 accumulators a row tile beside the operands and the expand, so a third tile does not fit). What grew with the
 rows was the A producers: the Hadamard transform's unit was one 1024-block of K (2 for H 2048) running every row quad in turn, so the
-rows serialised on 2 of the 12 tasks. `had_rows` (qwen38_kernels.py, `QWEN_HAD_ROWS`, the default for the 512-block sizes) makes a
+rows serialised on 2 of the 12 tasks. `had_rows` (qwen38_kernels.py, `QWEN_HAD_ROWS`; the 9B's 4096 blocks, and the 512-block sizes with `QWEN_HAD_FAST512=0`) makes a
 unit a (row, block): the row by one DMA into LSRAM, the block transformed there in had_a32's exact order, drained by one DMA into the
 row's own range; the A layout is then the plain DMA packer's. "swiglu" keeps (row quad, block) units with the gate | up tiles gathered
 by DMA a group at a time. Bit-identical to had_a32 on the simulator in every mode (the gate `had_rows_sim.py`). Board, the 2B:
 batched decode 8 users 123 -> **101 ms a step (79 tok/s aggregate)**, one user 53 -> 44 ms (22.8 tok/s); speculative decode 24 / 29.5 /
 24.3 -> **28 / 35 / 30 tok/s**; the 4B's 21.4 -> 24.2 on code. The 27B's 1024-block producers (had_a32d / had_fast) stay faster than this
 path (7.3 vs 6.6 tok/s), so there it is opt-in.
+
+**The 512-block sizes on the 27B's producer** (`QWEN_HAD_FAST512`, the default, 2026-11-05): `had_fast` v2 generalised to a 512 block
+(pass C radix 4, stages 128 and 256; the 1 / sqrt(512) post in its conversion -- the 2B / 4B caches do not fold it into the scale
+tables; the output drain sized by the block). One launch a producer instead of had_rows + the plain packer, byte-identical to it on
+the simulator (24/24 cases, 2B and 4B widths, rows 1 / 4 / 8) and on the board (every mode at rows 1 / 4 / 8, both sizes;
+`had_bench.py` with `HAD_BENCH_FAST512=1 QWEN_AGM=0`). A call, ms (2B): rms 0.074 / 0.085 / 0.109 -> 0.039 / 0.044 / 0.056, plain
+0.059 / 0.069 / 0.087 -> 0.024 / 0.027 / 0.029, swiglu 0.099 / 0.165 / 0.271 -> 0.036 / 0.038 / 0.057 at rows 1 / 4 / 8. End to end
+(board, the same ids in every pair): the 2B's speculative decode 30.4 / 21.6 / 31.9 -> **34.1 / 24.4 / 35.2 tok/s** (code, story,
+reasoning prompts; +10-13 %), batched decode 37 -> 33 ms a step at 1 user, 48 -> 43 at 4, 71 -> 70 at 8 (something else binds
+there), prefill 3.2 -> 2.0 s for 4 x 17 tokens; the 4B's speculative decode on code 28.3 -> **32.1 tok/s**.
 
 **The batched DeltaNet kernel's data movement** (`mixers_bench.py`: gdn_tokb alone at 1 / 4 / 8 rows): the first form read the conv's ring
 rows and taps, the row's q / k / v / z tile segments and the gated-norm's z by plain DDR loads and wrote the ring by plain stores -- some

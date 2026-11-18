@@ -23,6 +23,8 @@ import qwen38_generate as QG, qwen38_ref as R, qwen38_kernels as QK      # noqa:
 import gdn_batch as GB, attn_batch as AB                                  # noqa: E402  (the batched one-token mixers: M rows a launch)
 BATCHK = os.environ.get("BATCH_KERNELS", "1") != "0"                       # 0: the mixers per user on the one-row kernels (scatter / gather)
 BLK = int(os.environ.get("BATCH_BLOCK", "4"))                              # layers a JIT graph / job (the runtime's layer blocks: their window slots), 1 = a layer a job
+BATCH_HOLD = os.environ.get("BATCH_HOLD", "0") == "1"                       # 1: a block's layer indices copied per layer (3 launches a layer) as before
+BATCH_HEAD_DEV = os.environ.get("BATCH_HEAD_DEV", "1") == "1"               # the head's token reduced on the device (head_reduce: one readback instead of four parts')
 from qwen38_generate import poke, dev, DEV                               # noqa: E402
 
 NT = 12
@@ -73,7 +75,7 @@ class Batch:
     self.posb = [dev(np.array([0], np.int32)) for u in range(N)]; self.aix0 = [dev(np.array([i, 0], np.int32)) for i in range(NA)]
     self.K1 = [QK.Kernels(2, 24, R.EPS, real=1) for _ in range(N)]          # the users' one-row kernel sets (their own row-0 buffers)
     self.x1 = [k.rows_buf("x_in", H) for k in self.K1]; self.O = K.rows_buf("o_gather", max(R.NV * R.DV, R.NH * R.HD))
-    self.ct_u = {}; self.jits = {}
+    self.ct_u = {}; self.jits = {}; self.blk_idx = {}
     self.gtab = [dev(np.array([u * NG + i for u in range(N)], np.int32)) for i in range(NG)]            # the users' state indices a layer
     self.ptab = dev(np.zeros(N, np.int32)); self.atab = [dev(np.zeros(4 * N, np.int32)) for i in range(NA)]   # positions; [layer, pos, cache index, rope row] a user, a layer
     self.ROPE = dev(OA.host_invalidate(M.ROPE).numpy().copy())              # the default rope table of its own: the model's gets a prompt's m-RoPE rows while a batch step runs
@@ -82,31 +84,39 @@ class Batch:
     if name not in self.ct_u: self.ct_u[name] = [k.buf(f"ct_{name}", n, dtypes.float32) for k in self.K1]
     return self.ct_u[name]
 
-  def gdn_b(self, par, sidx, gtab, ptab, *views):
-    """A DeltaNet layer on the N rows with the batched kernel: gtab (int32 [N]: the users' state indices), ptab [N] (their positions)."""
+  def gdn_b(self, par, sidx, gtab, ptab, *views, held=False, a_h=None, next_norm=None):
+    """A DeltaNet layer on the N rows with the batched kernel: gtab (int32 [N]: the users' state indices), ptab [N] (their positions).
+    `held`: the index tensors are persistent buffers of the step's own (a block's layer indices, the poked positions), read by the
+    kernels directly -- no copy launches (the JIT's inputs must be copied: `hold`). `a_h`: the input norm's A already built (by the
+    previous layer's closing residual, resid_had). `next_norm`: see Layers.mlp -> (rows, the next layer's A)."""
     M, L, K, N, H = self.M, self.L, self.L.K, self.N, R.H; X = self.X[par]; slot = dict(zip(M.GDN_LIN, views)); meta = self.meta_gdn
-    si = K.hold("b_sidx", sidx); gt = K.hold("b_gtab", gtab); pt = K.hold("b_ptab", ptab)
-    a_h = K.rms_a(X, (M.Win_g, si), H, "a_h"); ct = L.lin_cts(a_h, slot, meta, ("qkv", "z")); xoff, zoff = ct["qkv"][1], ct["z"][1]
-    src = QK.ct_goff(GB.gdn_tokb_src(R.NV, R.NK, R.DK, R.DV, self.C, R.CONV, H, K.nrb, R.EPS, N), K.nrb, (xoff, zoff), ("x", "z"))
+    hold = (lambda tag, t: t) if held else K.hold
+    si = hold("b_sidx", sidx); gt = hold("b_gtab", gtab); pt = hold("b_ptab", ptab)
+    if a_h is None: a_h = K.rms_a(X, (M.Win_g, si), H, "a_h")
+    ct = L.lin_cts(a_h, slot, meta, ("qkv", "z")); xoff, zoff = ct["qkv"][1], ct["z"][1]
+    src = QK.ct_goff((GB.gdn_tokb2_src if GB.TOKB2 else GB.gdn_tokb_src)(R.NV, R.NK, R.DK, R.DV, self.C, R.CONV, H, K.nrb, R.EPS, N), K.nrb, (xoff, zoff), ("x", "z"))
     O = K.rows_buf("o_gather", max(R.NV * R.DV, R.NH * R.HD))
-    K.call(f"gdn_tokb|{N}|{xoff}|{zoff}", src, O, self.Sall, self.Call, gt, pt, ct["qkv"][0], ct["z"][0], X, self.Wab, self.Adt, self.Cwt, self.Nw, K.desc("gdn_tokb_desc", lambda: GB.gdn_tokb_desc(R.DK, R.DV, H, QK.gdn_hpt(R.NV), self.C, R.CONV)))
+    K.call(f"gdn_tokb|{N}|{xoff}|{zoff}|{GB.GDN_KB}|{GB.TOKB2}", src, O, self.Sall, self.Call, gt, pt, ct["qkv"][0], ct["z"][0], X, self.Wab, self.Adt, self.Cwt, self.Nw, K.desc(f"gdn_tokb_desc|{GB.GDN_KB}", lambda: GB.gdn_tokb_desc(R.DK, R.DV, H, QK.gdn_hpt(R.NV), self.C, R.CONV)))
     a_o = K.rms_a(O, None, R.NV * R.DV, "a_o", norm=False)
-    x1 = K.resid(X, L.lin_ct(a_o, slot, meta, "o"), H, "x1")
-    return L.mlp(x1, slot, meta, (M.Wpost_g, si), f"xiov{1 - par}").realize()
+    x1, a_post = K.resid_had(X, L.lin_ct(a_o, slot, meta, "o"), H, "x1", (M.Wpost_g, si), "a_post")
+    return self._mlp_out(L.mlp(x1, slot, meta, (M.Wpost_g, si), f"xiov{1 - par}", a_post=a_post, next_norm=next_norm), next_norm)
+  def _mlp_out(self, r, next_norm): return r.realize() if next_norm is None else (r[0].realize(), r[1])
 
   def kv(self, kvb): return self.kvs.views[kvb - 1] if self.kvs else (self.Kall, self.Vall)
-  def att_b(self, par, kvb, aix0, atab, *views):
+  def att_b(self, par, kvb, aix0, atab, *views, held=False, a_h=None, next_norm=None):
     """An attention layer on the N rows with the batched kernel: atab (int32 [N][4]: the users' [layer, position, cache index, rope row]); kvb: the
-    cache's DMA base code (the layer's ASID, whose views the kernel gets; 0: the buffers). The JIT is keyed by it."""
+    cache's DMA base code (the layer's ASID, whose views the kernel gets; 0: the buffers). The JIT is keyed by it. held / a_h / next_norm: as gdn_b."""
     M, L, K, N, H = self.M, self.L, self.L.K, self.N, R.H; X = self.X[par]; slot = dict(zip(M.ATT_LIN, views)); meta = self.meta_att; Kall, Vall = self.kv(kvb)
-    a0 = K.hold("b_aix0", aix0); at = K.hold("b_atab", atab)
-    a_h = K.rms_a(X, (M.Win_a, a0), H, "a_h"); ct = L.lin_cts(a_h, slot, meta, ("q", "kv")); QR, KR = R.NH * 2 * R.HD, 2 * R.NKV * R.HD
+    hold = (lambda tag, t: t) if held else K.hold
+    a0 = hold("b_aix0", aix0); at = hold("b_atab", atab)
+    if a_h is None: a_h = K.rms_a(X, (M.Win_a, a0), H, "a_h")
+    ct = L.lin_cts(a_h, slot, meta, ("q", "kv")); QR, KR = R.NH * 2 * R.HD, 2 * R.NKV * R.HD
     q_rows = K.unpack(ct["q"][0], QR, "q_rows", goff=ct["q"][1]); kv_rows = K.unpack(ct["kv"][0], KR, "kv_rows", goff=ct["kv"][1])
     O = K.rows_buf("o_gather", max(R.NV * R.DV, R.NH * R.HD))
     K.call(f"attn_decb|{N}|{self.TMAX}|nidx|{kvb}|{M.kvh}", AB.attn_decb_src(R.NH, R.NKV, R.HD, self.TMAX, R.ROT, R.EPS, N, nidx=True, kvb=kvb, kvh=M.kvh), O, q_rows, kv_rows, self.QN, self.KN, self.ROPE, Kall, Vall, at, K.desc("attn_dec3_desc", lambda: __import__("attn_gqa").attn_dec3_desc(R.NH, R.NKV, R.HD)))
     a_o = K.rms_a(O, None, R.NH * R.HD, "a_o", norm=False)
-    x1 = K.resid(X, L.lin_ct(a_o, slot, meta, "o"), H, "x1")
-    return L.mlp(x1, slot, meta, (M.Wpost_a, a0), f"xiov{1 - par}").realize()
+    x1, a_post = K.resid_had(X, L.lin_ct(a_o, slot, meta, "o"), H, "x1", (M.Wpost_a, a0), "a_post")
+    return self._mlp_out(L.mlp(x1, slot, meta, (M.Wpost_a, a0), f"xiov{1 - par}", a_post=a_post, next_norm=next_norm), next_norm)
 
   def gdn(self, par, sidx, usidx, posb, *views):
     """A DeltaNet layer on the N rows: sidx (int32 [1]: the layer's index into the per-type stacks), usidx [N] (the users' indices into
@@ -145,13 +155,19 @@ class Batch:
     x1 = K.resid(X, L.lin_ct(a_o, slot, meta, "o"), H, "x1")
     return L.mlp(x1, slot, meta, (M.Wpost_a, a0), f"xiov{1 - par}").realize()
 
-  def blk(self, types, kvb, ptab, *args):
-    """BLK consecutive layers as one graph: the users' positions once (ptab), then the layers' index buffers and views concatenated
-    (gdn: sidx, gtab + M.GDN_LIN views; att: aix0, atab + M.ATT_LIN views), each layer on parity j % 2 (blocks start at even layers)."""
-    M = self.M; a = list(args); out = None
+  def blk(self, b, types, kvb, *views):
+    """BLK consecutive layers as one graph, block b: the layers' views concatenated (M.GDN_LIN's / M.ATT_LIN's order), each layer
+    on parity j % 2 (blocks start at even layers). The layers' index buffers (self.blk_idx[b]: the layer's stack index, the users'
+    state indices / [layer, position, cache index, rope row]) and the positions (self.ptab) are the step's persistent tensors, poked
+    between steps and read by the kernels directly: no copy launches (BATCH_HOLD=1: copied per layer as the JIT's inputs were, the
+    launch count of before). A layer's closing residual also builds the next layer's input-norm A (Kernels.resid_had) within the block."""
+    M = self.M; a = list(views); out = None; A = None; idx = self.blk_idx[b]
     for j, t in enumerate(types):
-      if t == "full": n = 2 + len(M.ATT_LIN); out = self.att_b(j % 2, kvb, *a[:n]); a = a[n:]
-      else: n = 2 + len(M.GDN_LIN); out = self.gdn_b(j % 2, a[0], a[1], ptab, *a[2:n]); a = a[n:]
+      nn = None
+      if j + 1 < len(types) and not BATCH_HOLD: nn = (M.Win_a if types[j + 1] == "full" else M.Win_g, idx[j + 1][0])
+      if t == "full": n = len(M.ATT_LIN); out = self.att_b(j % 2, kvb, *idx[j], *a[:n], held=not BATCH_HOLD, a_h=A, next_norm=nn)
+      else: n = len(M.GDN_LIN); out = self.gdn_b(j % 2, *idx[j], self.ptab, *a[:n], held=not BATCH_HOLD, a_h=A, next_norm=nn)
+      a = a[n:]; out, A = out if nn is not None else (out, None)
     return out
 
   def step(self, toks, pos, rpos=None):
@@ -170,23 +186,24 @@ class Batch:
       if prof: from tinygrad import Device; Device[DEV].synchronize(); tp.append(time.perf_counter())
       L.block_slots(BLK)
       for b in range(R.NL // BLK):
-        bp = b % 2; types = tuple(R.LAYER_TYPES[b * BLK + j] for j in range(BLK)); args = []; kvb = 0
+        bp = b % 2; types = tuple(R.LAYER_TYPES[b * BLK + j] for j in range(BLK)); args = []; idx = []; kvb = 0
         for j in range(BLK):
           l = b * BLK + j; views, meta = L.map_block(l, bp, j)
-          if types[j] == "full": i = M.aidx[l]; self.meta_att = meta; kvb = M._kvb(i); args += [self.aix0[i], self.atab[i], *[views[k] for k in M.ATT_LIN]]
-          else: i = M.gidx[l]; self.meta_gdn = meta; args += [M.sidx[i], self.gtab[i], *[views[k] for k in M.GDN_LIN]]
-        key = ("blk", bp, types, tuple(L.kind(b * BLK + j) for j in range(BLK)), kvb)
-        if key not in self.jits: self.jits[key] = TinyJit(functools.partial(self.blk, types, kvb))
+          if types[j] == "full": i = M.aidx[l]; self.meta_att = meta; kvb = M._kvb(i); idx.append((self.aix0[i], self.atab[i])); args += [views[k] for k in M.ATT_LIN]
+          else: i = M.gidx[l]; self.meta_gdn = meta; idx.append((M.sidx[i], self.gtab[i])); args += [views[k] for k in M.GDN_LIN]
+        self.blk_idx[b] = idx                                                # the block's own index tensors (fixed objects; poked, never replaced)
+        key = ("blk", b, types, tuple(L.kind(b * BLK + j) for j in range(BLK)), kvb)   # a JIT a block: its indices are captured, not inputs
+        if key not in self.jits: self.jits[key] = TinyJit(functools.partial(self.blk, b, types, kvb))
         jit = self.jits[key]
         if jit.cnt < 2:
-          with one_job(): jit(self.ptab, *args)
-        else: jit(self.ptab, *args)
+          with one_job(): jit(*args)
+        else: jit(*args)
         if prof:
           Device[DEV].synchronize(); tp.append(time.perf_counter())
           if b == 0 and jit.cnt >= 2 and not getattr(self, "_prof_once", False):
             import collections; self._prof_once = True; names = collections.Counter(getattr(getattr(ei, "prg", None), "name", type(ei).__name__)[:28] for ei in jit.jit_cache)
             print(f"      prof: a block of {BLK} layers ({types}) = {len(jit.jit_cache)} launches: {dict(names)}", flush=True)
-      ids, _ = M.head_top(self.X[R.NL % 2], L)
+      ids, _ = M.head_top(self.X[R.NL % 2], L, dev=BATCH_HEAD_DEV)
       if prof:
         Device[DEV].synchronize(); tp.append(time.perf_counter()); d = np.diff(tp) * 1e3
         print(f"      prof: host (embed + pokes) {d[0]:.1f} ms | blocks {' '.join(f'{v:.1f}' for v in d[1:-1])} ms | head {d[-1]:.1f} ms | total {(tp[-1] - tp[0]) * 1e3:.1f}", flush=True)
@@ -216,6 +233,7 @@ class Batch:
 
 
 def main():
+  QG.pin_cpus(); QG.hold_cpu_latency()   # as the servers do (bonsai2_batch_serve): unpinned, 8 users measured 71 ms a step against 60
   ap = argparse.ArgumentParser(); ap.add_argument("--users", type=int, default=4); ap.add_argument("--max-new", type=int, default=32); ap.add_argument("--tmax", type=int, default=512)
   ap.add_argument("--check", default=None, help="a bonsai2_generate --out npz: user 0's ids must equal its out_ids"); ap.add_argument("--pin-gb", type=float, default=12); a = ap.parse_args()
   os.environ.setdefault("QWEN_KV_USERS", str(a.users))                     # the caches in ASIDs: the model's hold every user

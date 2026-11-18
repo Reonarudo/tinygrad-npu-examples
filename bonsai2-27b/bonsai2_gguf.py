@@ -26,6 +26,7 @@ from gguf_read import GGUF                                                     #
 
 PTQ1_0, QK, BLOCK_BYTES = 143, 128, 28
 gguf_read.GGML[PTQ1_0] = ("PTQ1_0", QK, BLOCK_BYTES)                           # the type's block: 128 weights in 2 + 24 + 2 bytes
+gguf_read.GGML.setdefault(2, ("Q4_0", 32, 18))                                 # a requantised Q4_0 (bonsai2_pack_q8.py): fp16 d + 16 bytes of nibbles
 gguf_read.GGML[142] = ("PQ2_0", 128, 34)                                       # the MTP files' trunk (2-bit codes + fp16 d; not decoded here)
 
 _POW3 = np.array([1, 3, 9, 27, 81], np.uint32)

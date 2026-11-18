@@ -17,7 +17,8 @@ GDN_TOK = os.environ.get("QWEN_GDN_TOK", "3")      # the decode DeltaNet step: 3
 
 # Q8MODE (the Q8_0 models): 1 = gemm_gs(q8) -- a K-slice one 32-weight scale block, corrected and scaled per slice --; 2 = the
 # weights built in fp16 by the expand (gemm_gs q8=2: `ornith_pack.py --q8f`'s cache, marked by a file `q8f` in it), 32-step slices
-Q8MODE = 0 if not R.Q8 else 2 if os.path.exists(os.path.join(os.path.expanduser(os.environ.get("QWEN_NPU", "")), "q8f")) else 1
+Q8MODE = 0 if not R.Q8 else 2 if os.path.exists(os.path.join(os.path.expanduser(os.environ.get("QWEN_NPU", "")), "q8f")) else \
+         5 if os.path.exists(os.path.join(os.path.expanduser(os.environ.get("QWEN_NPU", "")), "q4m")) else 1   # q4m: a Q4_K cache (bonsai2_pack_q8.py on a Q4_K GGUF)
 DEV = "ZHOUYI"; KS, NS = (8 if Q8MODE == 1 else 32), 3     # k-steps a K-slice (E4M3: one 128 x 128 scale block; Q8_0: 32 or 128 weights)
 # SCALES (the E4M3 caches): the block-scale table's layout in the streams -- "dup" (each fp32 scale twice, 128 B a strip and
 # slice, the original `pack_b_group_bscale`) or "single" (once, 64 B: qwen38_pack.py --scales single / qwen38_repack_scales.py,
@@ -99,10 +100,22 @@ class Layers:
     self.n, self.cache, self.fp8 = n, cache, fp8
     # SCALES was read from QWEN_NPU at import; the cache opened here (qwen38_generate.py --cache, check scripts) must be the same
     # layout, or the kernels would read the other layout's codes as scales -- silently (nothing downstream checks it)
-    assert R.Q8 or _scales_marker(cache) == SCALES, f"{cache}: `scales` marker {_scales_marker(cache)!r} but SCALES={SCALES!r} (set QWEN_NPU to this cache)"
-    assert R.Q8 or os.path.exists(os.path.join(cache, "tern")) == (TERN and not fp8), f"{cache}: its `tern` marker disagrees with TERN={TERN} (set QWEN_NPU to this cache)"
+    assert R.Q8 or fp8 or _scales_marker(cache) == SCALES, f"{cache}: `scales` marker {_scales_marker(cache)!r} but SCALES={SCALES!r} (set QWEN_NPU to this cache)"
+    assert R.Q8 or fp8 or os.path.exists(os.path.join(cache, "tern")) == TERN, f"{cache}: its `tern` marker disagrees with TERN={TERN} (set QWEN_NPU to this cache)"
     assert fp8 or not TERN or _tscale_marker(cache) == TSCALE, f"{cache}: `tscale` marker {_tscale_marker(cache)!r} but TSCALE={TSCALE!r} (set QWEN_NPU to this cache)"
-    self.tern_kw = {} if fp8 else TERN_KW; self.had = R.HAD and not fp8
+    self.had = R.HAD and not fp8
+    # the GEMM's format per geometry: the trunk's (KS, Q8MODE, SCALES, TERN_KW), or a foreign drafter cache's own markers -- E4M3 (ks 32,
+    # its `scales` marker; the fp8 MTP layer), `q4m` (pack_mtp_q4m.py: the Q4_K kernel, q8 5, its table is "dup" to gemm_gs) or `tern`
+    # (pack_mtp_tern.py: the ternary stream, scales single, its `tscale`), whatever the trunk's. Unrotated either way (no signs for 10240).
+    if not fp8: self.gks, self.gq8, self.gsc, self.tern_kw = KS, Q8MODE, SCALES, TERN_KW
+    elif os.path.exists(os.path.join(cache, "q4m")): self.gks, self.gq8, self.gsc, self.tern_kw = 32, 5, "dup", {}
+    elif os.path.exists(os.path.join(cache, "q4t")):   # pack_mtp_q4t.py: 4-bit codes on the ternary fast path, its own fp16 table
+      assert _scales_marker(cache) == "single" and _tscale_marker(cache) == "f16", f"{cache}: a q4t cache holds the single fp16 table"
+      self.gks, self.gq8, self.gsc, self.tern_kw = 32, 0, "single", {"q4t": True, "tscale": "f16"}
+    elif os.path.exists(os.path.join(cache, "tern")):
+      ts = _tscale_marker(cache); assert _scales_marker(cache) == "single", f"{cache}: a ternary cache holds the single-layout table"
+      self.gks, self.gq8, self.gsc, self.tern_kw = 32, 0, "single", ({"tern": True, "tscale": "f16"} if ts == "f16" else {"tern": True})
+    else: self.gks, self.gq8, self.gsc, self.tern_kw = 32, 0, _scales_marker(cache), {}
     self.nrb = rup(rup(n, 12) // 12, 2); self.R = 12 * self.nrb
     self.slots = [{}, {}]                                                 # two slots of device buffers per linear name
     self._metas, self._inflight, self.pinned, self._small_dev, self.stage = {}, {}, {}, {}, {}
@@ -110,7 +123,7 @@ class Layers:
     self.K = Kernels(self.nrb, self.R, R.EPS, real=n)                              # the hand-written layout kernels (ks 32)
     self.K.small2 = os.environ.get("QWEN_SMALL2", "1") == "1"                      # QWEN_SMALL2's norm records / DMA top-3 (Kernels.s2)
     if self.had:                 # rotated linear inputs: the producers transform (Kernels.had), the norms' 1 + w carry the signs (_meta)
-      assert TERN, f"{cache}: QWEN_MODEL={R.MODEL} needs its ternary cache (a `tern` marker; set QWEN_NPU to it)"
+      assert TERN or R.Q8, f"{cache}: QWEN_MODEL={R.MODEL} needs its ternary cache (a `tern` marker; set QWEN_NPU to it), or QWEN_BONSAI_Q8=1 with a bonsai2_pack_q8 cache"
       self.signs, self.K.had_post = had_signs(cache); self.K.had = {w: dev(v) for w, v in self.signs.items()}
       self.K.had_b = min(R.HADB, HAD_B); self.K.had_g = R.HADB // self.K.had_b; assert self.K.had_g * self.K.had_b == R.HADB, R.HADB
     self.piece = self.nrb if self.nrb < 4 else 0     # rows mode (decode, the fp8 head): one piece; full row blocks ask gemm_plan (lin_ct)
@@ -145,6 +158,8 @@ class Layers:
           if k == subs[0]: fused[name] = tuple(int(v) for v in f["meta"])
           if k in subs: sub[k] = (name, goff[subs.index(k)]) + meta[k]
           else: fused[k] = meta[k]
+        if "gtail" in f.files:    # (cpu_split_pack.py --gtail) q's columns as [the heads' q | k|v | the heads' gates]: q's offset is the pair
+          sub["q"] = (name, (sub["q"][1], int(f["gtail"]))) + sub["q"][2:]   # (q, gates); Kernels.unpack interleaves them back
         meta = dict(fused, _sub=sub)
       self._metas[l] = (meta, small)
     return self._metas[l]
@@ -346,11 +361,31 @@ class Layers:
     """The GEMM of a prebuilt A layout: the raw fp32 C tiles [ngroups][nrb][3][192], in the persistent buffer `ct_<k>`."""
     N, npad, K = meta[k]; ng = npad // (16 * NS)
     out = self.K.buf(f"ct_{k}", ng * self.nrb * NS * 192, dtypes.float32)
+    sp = getattr(self, "cpu_split", None); split = sp is not None and k in sp.gn
+    if split:
+      assert sp.npad[k] == npad, (k, npad)
+      if not sp.shadow: ng = sp.gn[k]    # the CPU computes the groups past ng (cpu_split.py; shadow: the NPU all of them too)
     rows = 0 if full or not self.K.compact else self.n        # decode / short prompts: only the real rows (A in the compact layout)
     # the row piece from gemm_plan's board-fitted model: one piece of all the row blocks up to 28 (each B slice reused across
     # more rows) -- 3.5-23 % faster than half the row blocks at 4-24 blocks, and nrb = 6 no longer asks for an odd piece of 3
     piece = self.nrb if (rows or R.Q8) else GP.plan_piece(K, npad, self.nrb, ks=KS, ns=NS, b8=True, bscale=True, rows=rows)
-    return OA.gemm_gs(a, slot[k], ks=KS, ns=NS, nrb=self.nrb, nslices=K // (4 * KS), ngroups=ng, b8=True, bscale=True, q8=Q8MODE, scales=SCALES, piece=piece, rows=rows, out=out, **self.tern_kw).realize()
+    fold = self.K.req_folded.pop(id(a), None)                            # (Layers.req: the producer wrote the mirror and raised the REQ)
+    assert fold is None or (split and sp.handoff and sp.agm and fold is sp.mirror[k]), f"lin_ct {k}: an A produced for another hand-off"
+    if split and sp.handoff and fold is None: self.K.cpu_req_copy(a, sp.mirror[k]) if sp.agm else self.K.cpu_req()   # the split's hand-off: REQ once the A is in DDR, ACK (the CPU's columns written) before the C's consumer
+    ct = OA.gemm_gs(a, slot[k], ks=self.gks, ns=NS, nrb=self.nrb, nslices=K // (4 * self.gks), ngroups=ng, b8=True, bscale=True, q8=self.gq8, scales=self.gsc, piece=piece, rows=rows, out=out, **self.tern_kw).realize()
+    if split and sp.handoff: self.K.cpu_ack()
+    return ct
+  def req(self, k):
+    """The DDR mirror of split linear k when its hand-off would copy the A there (lin_ct's cpu_req_copy), for the A's producer to
+    write and raise the REQ itself (rms_a / swiglu_a req=, had_fast v2 "req": one 12-task launch fewer a split linear, -2.7 ms a 27B
+    verify pass). None: no split or no hand-off. Pass it only to the producer of the A that lin_ct(k) takes next."""
+    sp = getattr(self, "cpu_split", None)
+    if sp is not None and k in sp.gn and sp.handoff and sp.agm: return sp.mirror[k]
+    return None
+  def req_for(self, meta, names):
+    """req of the one GEMM lin_cts(names) runs (their fused parent), else None."""
+    sub = meta.get("_sub", {}); ps = {sub[n][0] if n in sub else n for n in names}
+    return self.req(next(iter(ps))) if len(ps) == 1 else None
   def lin_cts(self, a, slot, meta, names, full=False):
     """The GEMMs of the linears `names` on one A -> {name: (C tiles buffer, first group)}. Linears fused in the cache (meta "_sub":
     name -> (parent, group offset, N, npad, K)) run as their parent's one GEMM; each consumer reads its slice at the offset."""
@@ -365,6 +400,7 @@ class Layers:
   def lin(self, x, slot, meta, k, a=None):
     """Linear k on fp32 rows x -> fp32 [R, N] (tinygrad views; a part of a fused linear: its parent's GEMM, the columns from its group)."""
     parent, goff, N, npad, K = meta["_sub"][k] if k in meta.get("_sub", {}) else (k, 0) + meta[k]
+    assert isinstance(goff, int), f"Layers.lin: {k}'s columns are not one range (a --gtail cache)"
     if a is None:
       if x.shape[1] < K: x = x.pad(((0, 0), (0, K - x.shape[1])))
       a = self.A(x)
@@ -494,11 +530,15 @@ class Layers:
     if R.LAYER_TYPES[l] == "full": return self.attention_layer(x, l), None
     return self.gdn_layer(x, l, **kw)
 
-  def mlp(self, x, slot, meta, w1_post, out="x2"):
+  def mlp(self, x, slot, meta, w1_post, out="x2", a_post=None, next_norm=None):
     """x + down(silu(gate(h)) * up(h)), h = rmsnorm(x) * w1_post: three hand-written kernels around the two GEMMs; into the persistent `out`.
-    `w1_post`: the 1 + w vector, or (stack, idx) -- read on the device (no per-layer copy)."""
-    ct_gu = self.lin_ct(self.K.rms_a(x, w1_post if isinstance(w1_post, tuple) else self.K.hold("w_post", w1_post), R.H, "a_post"), slot, meta, "gu")
-    return self.K.resid(x, self.lin_ct(self.K.swiglu_a(ct_gu, R.INTER, "a_sw"), slot, meta, "dn"), R.H, out)
+    `w1_post`: the 1 + w vector, or (stack, idx) -- read on the device (no per-layer copy). `a_post`: h's A already built (the caller fused
+    it into x's residual, Kernels.resid_had). `next_norm` ((stack, idx) of the next layer's input norm): the closing residual also
+    builds that norm's A ("a_h") -> (out rows, A)."""
+    if a_post is None: a_post = self.K.rms_a(x, w1_post if isinstance(w1_post, tuple) else self.K.hold("w_post", w1_post), R.H, "a_post", req=self.req("gu"))
+    ct_dn = self.lin_ct(self.K.swiglu_a(self.lin_ct(a_post, slot, meta, "gu"), R.INTER, "a_sw", req=self.req("dn")), slot, meta, "dn")   # (a split linear's hand-off: in lin_ct)
+    if next_norm is None: return self.K.resid(x, ct_dn, R.H, out)
+    return self.K.resid_had(x, ct_dn, R.H, out, next_norm, "a_h")
 
 def main():
   ap = argparse.ArgumentParser(); ap.add_argument("--gate", type=int, default=3, help="layer to run on a random input vs the numpy reference")

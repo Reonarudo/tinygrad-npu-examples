@@ -178,8 +178,8 @@ def gqa_layout(NH, NKV, HD, TMAX, M, BT):
   return dict(KB0=KB0, KN=KN, KS=KS, REC=REC, AV=AV, QST=2 * BT)
 
 
-def attn_gqa_desc(NH, NKV, HD, TMAX, M, BT=None):
-  K = _K(); BT = K.ATT_BT if BT is None else BT; P, _ = K.attn_plan(NH, HD, TMAX); PW = HD + 16; QR = NH * 2 * HD
+def attn_gqa_desc(NH, NKV, HD, TMAX, M, BT=None, qc=False):
+  K = _K(); BT = K.ATT_BT if BT is None else BT; P, _ = K.attn_plan(NH, HD, TMAX); PW = HD + 16; QR = NH * (1 if qc else 2) * HD
   lay = gqa_layout(NH, NKV, HD, TMAX, M, BT)
   sl = [(BT * HD * 4, HD * 4, NKV * HD * 4, HD * 4), (HD * 4,)]
   sl += [(n * HD * 4, HD * 4, QR * 4, HD * 4) for n in range(1, lay["QST"] + 1)]           # q rows of one head (pitch QR)
@@ -188,19 +188,19 @@ def attn_gqa_desc(NH, NKV, HD, TMAX, M, BT=None):
   return K.V._desc_slots(*sl)
 
 
-def attn_gqa_src(NH, NKV, HD, TMAX, ROT, eps, M, tree=False, BT=None, NTE=None, name=None, nidx=False, kvb=0, kvh=False):
+def attn_gqa_src(NH, NKV, HD, TMAX, ROT, eps, M, tree=False, BT=None, NTE=None, name=None, nidx=False, kvb=0, kvh=False, qc=False):
   """See the module docstring. args: part, q_rows, kv_rows, qnw_all, knw_all, rope, Kall, Vall, idx (layer, pos), desc
   (attn_gqa_desc)[, tree]. NTE: the tasks that take attention records (default 12; the rest only write cache rows). `nidx`: idx has a
   third word: the cache index (KV slots: the user's cache in the slot), idx[0] staying the layer (the norm weights' row, as every
   other stacked kernel reads it). `kvb`: the DMA base code of the cache (kGlobal1..3: Kall / Vall live in that ASID, their pointers the
   offsets there; 0: the text as before). `kvh`: the caches are fp16 (half rows written through cvt.d, widened on load; the two
-  descriptor slots after the records)."""
+  descriptor slots after the records). `qc`: q_rows holds the heads' q alone ([M][NH HD], a --gtail cache's: no gate halves)."""
   K = _K(); BT = K.ATT_BT if BT is None else BT; NT = K.NT; NTE = NT if NTE is None else NTE
   KF = (lambda f, d, off, a: f"DMA_FILL({f}, {d}, {off}, {a})") if not kvb else (lambda f, d, off, a: f"DMA_FILLB({f}, {d}, {off}, {a}, {kvb})")
   ES = 2 if kvh else 4; CT = "__global half" if kvh else "__global float"                      # the cache's element size and pointer type
   KD = (lambda f, d, off, a: f"DMA_DRAIN({f}, {d}, {off}, {a})") if not kvb else (lambda f, d, off, a: f"DMA_DRAINB({f}, {d}, {off}, {a}, {kvb})")
   g = NH // NKV; P, CLC = K.attn_plan(NH, HD, TMAX); CL = K._attn_cl(TMAX, P); NCH = CL // 8; G = g * M
-  scale = 1.0 / HD ** 0.5; LOG2E = 1.4426950408889634; QR, KR = NH * 2 * HD, 2 * NKV * HD; PW = HD + 16
+  scale = 1.0 / HD ** 0.5; LOG2E = 1.4426950408889634; QH = HD if qc else 2 * HD; QR, KR = NH * QH, 2 * NKV * HD; PW = HD + 16
   assert 1 <= M <= 12 and HD % 64 == 0 and BT % 2 == 0 and CL % 8 == 0 and 1 <= NTE <= NT
   lay = gqa_layout(NH, NKV, HD, TMAX, M, BT); KB0, KN, KS, REC, AV, QST = (lay[k] for k in ("KB0", "KN", "KS", "REC", "AV", "QST"))
   QD, RD = 2, 2 + QST                                                         # desc slots: q runs (n rows: QD + n - 1), record drains (RD + n - 1)
@@ -297,7 +297,7 @@ __kernel void {kname}(__global float* restrict part, __global float* restrict q_
     for (int jj = 0; jj < R; ) {{
       int j = j0 + jj, h = kvh * {g} + j / {M}, r = j % {M}, nr = {M} - r;
       if (nr > R - jj) nr = R - jj; if (nr > {QST}) nr = {QST};
-      DMA_FILL(2, DESC(desc, {QD} - 1 + nr), {KB0}, (int)(q_rows + r * {QR} + h * {2 * HD})); DMA_WAIT(2);
+      DMA_FILL(2, DESC(desc, {QD} - 1 + nr), {KB0}, (int)(q_rows + r * {QR} + h * {QH})); DMA_WAIT(2);
       for (int ii = 0; ii < nr; ii++) {{
         norm_rope(LSF({KN}), LSF({KB0}) + ii * {HD}, qnw, rope + {RP("r + ii")} * {2 * ROT});
         {QT}* qd = QB + ((jj + ii) >> 3) * {QS} + ((jj + ii) & 7) * {16 if kvh else 8};
@@ -375,30 +375,62 @@ __kernel void {kname}(__global float* restrict part, __global float* restrict q_
 }}"""
 
 
-def attn_comb2_desc(NH, HD, TMAX, M):
+def _gate_plan(NH, HD, goff, nrb):
+  """attn_comb2_src(gc)'s gate reads from the C tiles: head h's gates are the HD / 16 strips (16 columns) from s0 = 3 goff + h HD / 16;
+  row quad 0 of a strip is 256 B and the strips of row block 0 sit at a uniform 768 B in "virtual strip" units v(s) = 3 nrb (s / 3) +
+  s % 3 (gdn_onormd's z reads). -> per head (first virtual strip, count, s0 % 3)."""
+  vs = lambda s: 3 * nrb * (s // 3) + s % 3; n = HD // 16
+  return [(vs(3 * goff + h * n), vs(3 * goff + h * n + n - 1) - vs(3 * goff + h * n) + 1, (3 * goff + h * n) % 3) for h in range(NH)]
+
+def attn_comb2_desc(NH, HD, TMAX, M, gc=None):
   K = _K(); P, _ = K.attn_plan(NH, HD, TMAX); PW = HD + 16; QR, OR = NH * 2 * HD, NH * HD
+  gs = [(c * 256, 256, 768, 256) for c in sorted({c for _, c, _ in _gate_plan(NH, HD, *gc)})] if gc else []   # (gc: one slot a distinct strip count, after the 3 M)
   return K.V._desc_slots(*([(n * P * PW * 4,) for n in range(1, M + 1)] + [(n * HD * 4, HD * 4, QR * 4, HD * 4) for n in range(1, M + 1)]
-                           + [(n * HD * 4, HD * 4, OR * 4, HD * 4) for n in range(1, M + 1)]))
+                           + [(n * HD * 4, HD * 4, OR * 4, HD * 4) for n in range(1, M + 1)] + gs))
 
 
-def attn_comb2_src(NH, HD, TMAX, M, name="attn_comb"):
+def attn_comb2_src(NH, HD, TMAX, M, name="attn_comb", gc=None):
   """attn_comb with every row by DMA: a unit = (head h, a run of rows): its rows' P slice records (contiguous), their gates (pitch
   QR) in by two requests, attn_comb's arithmetic per (row, head), the outputs drained by one 2-D request (pitch OR). The units
-  (NH x ceil(M / RU) of them) fill the 12 tasks. args: o_rows, part, q_rows, desc (attn_comb2_desc)."""
+  (NH x ceil(M / RU) of them) fill the 12 tasks. args: o_rows, part, q_rows, desc (attn_comb2_desc).
+  `gc` = (goff, nrb), M <= 4: the gates read from the fused GEMM's C tiles (a --gtail cache: the heads' gates from group goff), the
+  head's strips (row quad 0) by one request (_gate_plan), the same values in the same expression (the same o_rows); the third
+  argument is then the C tiles."""
   K = _K(); NT = K.NT; P, _ = K.attn_plan(NH, HD, TMAX); PW = HD + 16; LOG2E = 1.4426950408889634; QR, OR = NH * 2 * HD, NH * HD
+  plan = _gate_plan(NH, HD, *gc) if gc else None; counts = sorted({c for _, c, _ in plan}) if gc else []
+  GS = max(counts) * 256 if gc else 0                                        # (gc: the strips, all M rows, whatever the unit's run)
+  assert not gc or (M <= 4 and HD % 16 == 0), "attn_comb2(gc): <= 4 rows (row quad 0)"
   RU = M
   while RU > 1 and NH * -(-M // RU) < NT: RU -= 1                           # rows a unit: the most that still give >= NT units
-  while RU * (P * PW + 2 * HD) * 4 > 32768 - 64: RU -= 1
+  while RU * (P * PW + (HD if gc else 2 * HD)) * 4 + GS > 32768 - 64: RU -= 1
   NU = -(-M // RU); RU = -(-M // NU)                                         # equal runs (8 rows: 4 + 4, not 7 + 1)
-  NU = -(-M // RU); GT = RU * P * PW * 4; OB = GT + RU * HD * 4
-  return K.V.FULL_H + K.EXP + f"""
+  NU = -(-M // RU); GT = RU * P * PW * 4; OB = GT + (GS if gc else RU * HD * 4)
+  if gc:
+    tabs = (f"  const int V0[{NH}] = {{{', '.join(str(v) for v, _, _ in plan)}}}, SL[{NH}] = {{{', '.join(str(3 * M + counts.index(c)) for _, c, _ in plan)}}}, "
+            f"SB[{NH}] = {{{', '.join(str(b) for _, _, b in plan)}}};\n")
+    gfill = f"DMA_FILL(1, DESC(desc, SL[h]), {GT}, (int)(q_rows + V0[h] * 192));"
+    gloop = f"""for (int t = 0; t < {HD // 16}; t++) {{
+        int tt = SB[h] + t; __global float* gs = gt0 + ({3 * gc[1]} * (tt / 3) + tt % 3 - SB[h]) * 64 + (r0 + rr) * 4;
+        for (int e = 0; e < 2; e++) {{
+          int j = 16 * t + 8 * e; float8 o = BC(0.0f); for (int c = 0; c < {P}; c++) o += BC(w[c]) * *(__global float8*)(pp + c * {PW} + j);
+          *(__global float8*)(ob + j) = o * inv * VRCP(BC(1.0f) + exp2_d4(BC({-LOG2E!r}f) * F8(*(__global float4*)(gs + 32 * e), *(__global float4*)(gs + 32 * e + 16))));
+        }}
+      }}"""
+  else:
+    tabs = ""
+    gfill = f"DMA_FILL(1, DESC(desc, {M} - 1 + nr), {GT}, (int)(q_rows + r0 * {QR} + h * {2 * HD} + {HD}));"
+    gloop = f"""for (int j = 0; j < {HD}; j += 8) {{
+        float8 o = BC(0.0f); for (int c = 0; c < {P}; c++) o += BC(w[c]) * *(__global float8*)(pp + c * {PW} + j);
+        *(__global float8*)(ob + j) = o * inv * VRCP(BC(1.0f) + exp2_d4(BC({-LOG2E!r}f) * *(__global float8*)(gt + j)));
+      }}"""
+  return K.V.FULL_H + K.EXP + (K.TILE if gc else "") + f"""
 __kernel void {name}(__global float* restrict o_rows, __global float* restrict part, __global float* restrict q_rows, __global int* restrict desc, const int core_id) {{
-  __global float* pp0 = LSF(0); __global float* gt0 = LSF({GT}); __global float* ob0 = LSF({OB});
+{tabs}  __global float* pp0 = LSF(0); __global float* gt0 = LSF({GT}); __global float* ob0 = LSF({OB});
   for (int uu = core_id; uu < {NH * NU}; uu += {NT}) {{
     int h = uu / {NU}, r0 = (uu % {NU}) * {RU}, nr = {M} - r0 < {RU} ? {M} - r0 : {RU};
     DMA_WAIT(2);
     DMA_FILL(0, DESC(desc, nr - 1), 0, (int)(part + (h * {M} + r0) * {P * PW}));
-    DMA_FILL(1, DESC(desc, {M} - 1 + nr), {GT}, (int)(q_rows + r0 * {QR} + h * {2 * HD} + {HD}));
+    {gfill}
     DMA_WAIT(0); DMA_WAIT(1);
     for (int rr = 0; rr < nr; rr++) {{
       __global float* pp = pp0 + rr * {P * PW}; __global float* gt = gt0 + rr * {HD}; __global float* ob = ob0 + rr * {HD};
@@ -406,10 +438,7 @@ __kernel void {name}(__global float* restrict o_rows, __global float* restrict p
       float w[{P}], l = 0.0f;
       for (int c = 0; c < {P}; c++) {{ w[c] = pp[c * {PW} + {HD} + 1] > 0.0f ? exp2_d4(BC((pp[c * {PW} + {HD}] - m) * {LOG2E!r}f))[0] : 0.0f; l += w[c] * pp[c * {PW} + {HD} + 1]; }}
       float8 inv = BC(1.0f / l);
-      for (int j = 0; j < {HD}; j += 8) {{
-        float8 o = BC(0.0f); for (int c = 0; c < {P}; c++) o += BC(w[c]) * *(__global float8*)(pp + c * {PW} + j);
-        *(__global float8*)(ob + j) = o * inv * VRCP(BC(1.0f) + exp2_d4(BC({-LOG2E!r}f) * *(__global float8*)(gt + j)));
-      }}
+      {gloop}
     }}
     DMA_DRAIN(2, DESC(desc, {2 * M} - 1 + nr), {OB}, (int)(o_rows + r0 * {OR} + h * {HD}));
   }}

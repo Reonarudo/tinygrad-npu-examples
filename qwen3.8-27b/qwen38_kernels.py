@@ -857,6 +857,23 @@ __kernel void rows32(__global float* restrict out, __global float* restrict ct, 
   }}
 }}""", nrb, goff)
 
+def rows32i_src(NH, HD, nrb, real, goffs):
+  """rows32 for a --gtail cache's q (cpu_split_pack.gtail: the heads' q at group goffs[0], their gates at goffs[1]): out fp32
+  [rows, NH 2 HD] = the original q layout, head h's q then its gate, the same copies as rows32's (plain loads; any rows)."""
+  c = NH * HD; assert c % 4 == 0 and HD % 4 == 0; nq = c // 4; rbr, iqr = _real(real, nrb); P = max(1, min(nq // 4, NT // rbr)); chunk = -(-nq // P); chunk += (-chunk) % 4
+  return V.FULL_H + TILE + f"""
+__kernel void rows32i(__global float* restrict out, __global float* restrict ct, const int core_id) {{
+  for (int u = core_id; u < {2 * rbr * P}; u += {NT}) {{
+    int g = u / {rbr * P}, v = u % {rbr * P}; int rb = v / {P}, part = v % {P}; int q1 = (part + 1) * {chunk} < {nq} ? (part + 1) * {chunk} : {nq};
+    __global float* cg = ct + (g ? {goffs[1] * nrb * 3 * 192} : {goffs[0] * nrb * 3 * 192});
+    for (int i = 0; i < {iqr}; i++) for (int q = part * {chunk}; q < q1; q++) {{
+      int col = 4 * q; __global float* t = cg + ((col / 48 * {nrb} + rb) * 3 + (col % 48) / 16) * 192 + (i * 4 + (col % 16) / 4) * 16;
+      __global float* orow = out + (rb * 12 + 4 * i) * {2 * c} + (col / {HD}) * {2 * HD} + g * {HD} + col % {HD};
+      for (int r = 0; r < 4; r++) *(__global float4*)(orow + r * {2 * c}) = *(__global float4*)(t + 4 * r);
+    }}
+  }}
+}}"""
+
 def head_top_src(nc, nrb, m, top3=False):
   """Top-1 of a head part's logits, from its GEMM's C tiles (groups of 48 columns, the first nc valid; rows 0..m-1 of row block 0):
   out fp32 [NT][m][4] = each task's (max, its column, sum of exp(logit - max), 0) over its share of the columns, the first column
@@ -909,19 +926,25 @@ def head_top3_row_src(nc, nrb, row):
     src = src.replace(x, y)
   return src
 
-def embed_tern_desc(K):
-  """slot 0: one HAD_B block of a PTQ1_0 row (8 blocks of 28 bytes); 1: the block's signs / an output block (HAD_B fp32); 2: the ids (64 B)."""
-  return V._desc_slots((HAD_B // 128 * 28,), (HAD_B * 4,), (64,))
+def embed_tern_desc(K, hb=HAD_B):
+  """slot 0: one hb block of a PTQ1_0 row (8 blocks of 28 bytes); 1: the block's signs / an output block (HAD_B fp32); 2: the ids (64 B)."""
+  return V._desc_slots((hb // 128 * 28,), (hb * 4,), (64,))
 
-def embed_tern_src(m, K, vocab, pitch, post=1.0 / 32):
+def embed_tern_src(m, K, vocab, pitch, post=None, hb=HAD_B):
   """The token embedding on the device (a PrismML PTQ1_0 table stored latent, z = Hb (s * e)): out fp32 rows r < m (pitch `pitch`
   floats) = s * (Hb z) of row ids[r] of `tab` (the GGUF tensor's bytes, K / 128 blocks of 28 a row: qs[24] five trits a byte, qh[2]
   four, d fp16 at byte 26; bonsai2_gguf's element order). A unit = (row, HAD_B block): its 8 PTQ1_0 blocks arrive by DMA, are
   decoded to t * d in LSRAM, transformed as had_a32d does (h8x2, then the radix-4 stages), scaled by `post` (1 / sqrt(HAD_B)) and
   the signs, and leave by one DMA (one task writes every byte of its 4 KiB). The ids are read by DMA (head_reduce / accept wrote
   them on other cores). Ids outside [0, vocab) are clamped. args: out, ids (int32, >= 16), tab (uint8), s (fp32 [K]), desc."""
-  assert K % HAD_B == 0 and 1 <= m <= 16; nb = K // HAD_B; RB = K // 128 * 28; BB = HAD_B // 128 * 28
-  L0, S0, Q0, I0 = 0, HAD_B * 4, 2 * HAD_B * 4, 2 * HAD_B * 4 + 256
+  # hb: the model's Hadamard block (R.HADB: the 27B's 1024, the 2B / 4B's 512); the transform is h8x2 (8), radix-4 stages while
+  # they fit (32, 128, 512, ...), then one radix-2 stage when log2(hb) is even (1024, 4096) -- the 1024 source is unchanged
+  post = (1.0 / 32 if hb == 1024 else hb ** -0.5) if post is None else post
+  assert hb in (512, 1024) and K % hb == 0 and 1 <= m <= 16, (hb, K, m); nb = K // hb; RB = K // 128 * 28; BB = hb // 128 * 28
+  L0, S0, Q0, I0 = 0, hb * 4, 2 * hb * 4, 2 * hb * 4 + 256
+  h4 = 8
+  while 4 * h4 <= hb: h4 *= 4                                              # (the size after the radix-4 stages)
+  R2 = h4 < hb
   src = had_a32_src("plain", HAD_B, 1, 1e-6, real=4, compact=True)
   pre = src[:src.index("__kernel void had_a32(")] + H8X2 + r"""
 static inline float h2f(int h) {                     /* fp16 bits -> float (no fp16 loads here: cl_khr_fp16 is off) */
@@ -938,27 +961,27 @@ __kernel void embed_tern(__global float* restrict out, __global int* restrict id
   __global int* I = (__global int*)LSF({I0}); __global float* L = LSF({L0}); __global float* S = LSF({S0}); __global unsigned char* Q = (__global unsigned char*)LSF({Q0});
   for (int u = core_id; u < {m * nb}; u += {NT}) {{
     int r = u / {nb}, b = u % {nb}; int id = I[r]; id = id < 0 ? 0 : id >= {vocab} ? {vocab - 1} : id;
-    DMA_FILL(0, DESC(desc, 0), {Q0}, (int)(tab + id * {RB} + b * {BB})); DMA_FILL(1, DESC(desc, 1), {S0}, (int)(s + b * {HAD_B}));
+    DMA_FILL(0, DESC(desc, 0), {Q0}, (int)(tab + id * {RB} + b * {BB})); DMA_FILL(1, DESC(desc, 1), {S0}, (int)(s + b * {hb}));
     DMA_WAIT(0); DMA_WAIT(1);
-    for (int k = 0; k < {HAD_B // 128}; k++) {{
+    for (int k = 0; k < {hb // 128}; k++) {{
       __global unsigned char* q = Q + k * 28; __global float* Lb = L + k * 128;
       float d = h2f(q[26] | (q[27] << 8));
       for (int j = 0; j < 16; j++) {{ int v = q[j]; for (int n = 0; n < 5; n++) {{ Lb[n * 16 + j] = (float)((((v & 255) * 3) >> 8) - 1) * d; v *= 3; }} }}
       for (int j = 0; j < 8; j++) {{ int v = q[16 + j]; for (int n = 0; n < 5; n++) {{ Lb[80 + n * 8 + j] = (float)((((v & 255) * 3) >> 8) - 1) * d; v *= 3; }} }}
       for (int j = 0; j < 2; j++) {{ int v = q[24 + j]; for (int n = 0; n < 4; n++) {{ Lb[120 + n * 2 + j] = (float)((((v & 255) * 3) >> 8) - 1) * d; v *= 3; }} }}
     }}
-    for (int k = 0; k < {HAD_B}; k += 16) h8x2((__global float8*)(L + k));
-    for (int h = 8; h < {HAD_B // 2}; h *= 4) for (int j0 = 0; j0 < {HAD_B}; j0 += 4 * h) for (int k = j0; k < j0 + h; k += 8) {{
+    for (int k = 0; k < {hb}; k += 16) h8x2((__global float8*)(L + k));
+    for (int h = 8; h < {h4}; h *= 4) for (int j0 = 0; j0 < {hb}; j0 += 4 * h) for (int k = j0; k < j0 + h; k += 8) {{
       float8 a = *(__global float8*)(L + k), bb = *(__global float8*)(L + k + h), cc = *(__global float8*)(L + k + 2 * h), dd = *(__global float8*)(L + k + 3 * h);
       float8 s0 = a + bb, s1 = a - bb, s2 = cc + dd, s3 = cc - dd;
       *(__global float8*)(L + k) = s0 + s2; *(__global float8*)(L + k + h) = s1 + s3; *(__global float8*)(L + k + 2 * h) = s0 - s2; *(__global float8*)(L + k + 3 * h) = s1 - s3;
     }}
-    for (int k = 0; k < {HAD_B // 2}; k += 8) {{
-      float8 a = *(__global float8*)(L + k), bb = *(__global float8*)(L + k + {HAD_B // 2});
-      *(__global float8*)(L + k) = a + bb; *(__global float8*)(L + k + {HAD_B // 2}) = a - bb;
-    }}
-    for (int k = 0; k < {HAD_B}; k += 8) *(__global float8*)(L + k) = *(__global float8*)(L + k) * BC({post!r}f) * *(__global float8*)(S + k);
-    DMA_DRAIN(3, DESC(desc, 1), {L0}, (int)(out + r * {pitch} + b * {HAD_B})); DMA_WAIT(3);
+{"""    for (int k = 0; k < %d; k += 8) {
+      float8 a = *(__global float8*)(L + k), bb = *(__global float8*)(L + k + %d);
+      *(__global float8*)(L + k) = a + bb; *(__global float8*)(L + k + %d) = a - bb;
+    }
+""" % (hb // 2, hb // 2, hb // 2) if R2 else ""}    for (int k = 0; k < {hb}; k += 8) *(__global float8*)(L + k) = *(__global float8*)(L + k) * BC({post!r}f) * *(__global float8*)(S + k);
+    DMA_DRAIN(3, DESC(desc, 1), {L0}, (int)(out + r * {pitch} + b * {hb})); DMA_WAIT(3);
   }}
   }}
   DMA_WAIT_ALL();
@@ -1253,6 +1276,8 @@ def gemv32_src(rows, k, n, nt=NT, norm=False, eps=1e-6, stacked=False):
   weight is folded into w). `stacked`: w is a stack [L, n, k] and a 4th argument idx (int32 [1]) picks the layer."""
   JC, KB = 8, 512
   assert k % KB == 0 and n % JC == 0 and JC * KB * 4 <= 32768; P = n // JC
+  if rows > RC_GEMV:        # acc[rows][JC] + ss[rows] live on the task's 8 KiB stack (launch.STACK_BYTES): past ~240 rows they overflow
+    return _gemv32_chunked(rows, k, n, nt, norm, eps, stacked)  # it (the 2B's one-pass prefill at 512 rows: an SMMU fault) -- rows in chunks
   ss_decl = f" float ss[{rows}]; for (int m = 0; m < {rows}; m++) ss[m] = 0.0f;" if norm else ""
   ss_acc = " sq += xv * xv;" if norm else ""; ss_sum = " ss[m] += hsum8(sq);" if norm else ""
   inv_mul = f" * (1.0f / __builtin_sqrtf(ss[m] * {1.0 / k!r}f + {eps!r}f))" if norm else ""
@@ -1280,6 +1305,43 @@ __kernel void gemv32(__global float* restrict out, __global float* restrict x, _
       }}
     }}
     for (int m = 0; m < {rows}; m++) for (int j = 0; j < {JC}; j++) out[m * {n} + u * {JC} + j] = acc[m][j]{inv_mul};
+  }}
+}}"""
+
+RC_GEMV = 64
+
+def _gemv32_chunked(rows, k, n, nt, norm, eps, stacked):
+  """gemv32_src past RC_GEMV rows: units (a JC-column group x a chunk of RC_GEMV rows) over the tasks, each as gemv32's unit (the
+  weight block restaged in LSRAM per chunk: n x k x 4 B a chunk, 0.25 MB on the 2B's a|b). The same arithmetic per row."""
+  JC, KB, RC = 8, 512, RC_GEMV; P = n // JC; NCH = -(-rows // RC)
+  ss_decl = f" float ss[{RC}]; for (int m = 0; m < {RC}; m++) ss[m] = 0.0f;" if norm else ""
+  ss_acc = " sq += xv * xv;" if norm else ""; ss_sum = " ss[m] += hsum8(sq);" if norm else ""
+  inv_mul = f" * (1.0f / __builtin_sqrtf(ss[m] * {1.0 / k!r}f + {eps!r}f))" if norm else ""
+  sig_idx = ", __global int* restrict idx" if stacked else ""; w_sel = f"  w += idx[0] * {n * k};\n" if stacked else ""
+  return V.FULL_H + f"""
+__kernel void gemv32(__global float* restrict out, __global float* restrict x, __global float* restrict w{sig_idx}, const int core_id) {{
+{w_sel}  for (int uc = core_id; uc < {P * NCH}; uc += {nt}) {{
+    int u = uc % {P}, m0 = (uc / {P}) * {RC}, mr = {rows} - m0 < {RC} ? {rows} - m0 : {RC};
+    float acc[{RC}][{JC}];{ss_decl}
+    for (int m = 0; m < {RC}; m++) for (int j = 0; j < {JC}; j++) acc[m][j] = 0.0f;
+    for (int kb = 0; kb < {k}; kb += {KB}) {{
+      __global float* WB = LSF(0);
+      for (int j = 0; j < {JC}; j++) for (int i = 0; i < {KB}; i += 8) *(__global float8*)(WB + j * {KB} + i) = *(__global float8*)(w + (u * {JC} + j) * {k} + kb + i);
+      for (int m = 0; m < mr; m++) {{
+        __global float* xr = x + (m0 + m) * {k} + kb;
+        float8 a0 = BC(0.0f), a1 = BC(0.0f), a2 = BC(0.0f), a3 = BC(0.0f), a4 = BC(0.0f), a5 = BC(0.0f), a6 = BC(0.0f), a7 = BC(0.0f), sq = BC(0.0f);
+        for (int i = 0; i < {KB}; i += 8) {{
+          float8 xv = *(__global float8*)(xr + i);{ss_acc}
+          a0 += xv * *(__global float8*)(WB + 0 * {KB} + i); a1 += xv * *(__global float8*)(WB + 1 * {KB} + i);
+          a2 += xv * *(__global float8*)(WB + 2 * {KB} + i); a3 += xv * *(__global float8*)(WB + 3 * {KB} + i);
+          a4 += xv * *(__global float8*)(WB + 4 * {KB} + i); a5 += xv * *(__global float8*)(WB + 5 * {KB} + i);
+          a6 += xv * *(__global float8*)(WB + 6 * {KB} + i); a7 += xv * *(__global float8*)(WB + 7 * {KB} + i);
+        }}
+        acc[m][0] += hsum8(a0); acc[m][1] += hsum8(a1); acc[m][2] += hsum8(a2); acc[m][3] += hsum8(a3);
+        acc[m][4] += hsum8(a4); acc[m][5] += hsum8(a5); acc[m][6] += hsum8(a6); acc[m][7] += hsum8(a7);{ss_sum}
+      }}
+    }}
+    for (int m = 0; m < mr; m++) for (int j = 0; j < {JC}; j++) out[(m0 + m) * {n} + u * {JC} + j] = acc[m][j]{inv_mul};
   }}
 }}"""
 
@@ -1515,16 +1577,22 @@ def gdn_lsr_src(NV, DK, DV, n, W=16, diag=None):
   (their q / k / v stay in its cache); blocks are double-buffered (fill flags 0 / 1, drain flags 2 / 3).
   args: o [n, NV, DV], Sall [L, NV, DK, DV] (in / out: the layer at idx[0]), idx (int32 [1]), q, k [n, NV, DK], v [n, NV, DV],
   beta, decay [n, NV], desc (slot 0: a block: DK rows of W floats, DDR pitch DV floats)."""
-  assert NV % NT == 0 and DV % W == 0 and W == 16 and 2 * DK * W * 4 <= 32768 and diag in (None, "dma", "compute")
+  assert DV % W == 0 and W == 16 and 2 * DK * W * 4 <= 32768 and diag in (None, "dma", "compute")
   HPT, NB, BLK = NV // NT, DV // W, DK * W * 4
+  # NV % NT == 0 (the 27B's 48 value heads): a task owns HPT whole heads; otherwise (the 2B's 16) the
+  # NV x NB blocks split into NT contiguous runs of floor / ceil(NV NB / NT) -- a block's columns are independent, so a head may
+  # straddle two tasks (both read its q / k / beta / decay)
+  units = (f"int u0 = core_id * {HPT * NB}, nu = {HPT * NB};                  /* this task's units: heads [core_id * HPT, +HPT) x NB blocks */"
+           if NV % NT == 0 else f"int u0 = (core_id * {NV * NB}) / {NT}, nu = ((core_id + 1) * {NV * NB}) / {NT} - u0;   /* this task's units (head u / NB, block u % NB) */")
+  fill0 = "" if NV % NT == 0 else "if (nu > 0) "
   src = V.FULL_H + f"""
 __kernel void gdn_lsr(__global float* restrict o, __global float* restrict Sall, __global int* restrict idx, __global float* restrict q,
                       __global float* restrict k, __global float* restrict v, __global float* restrict beta, __global float* restrict decay,
                       __global int* restrict desc, const int core_id) {{
   __global float* S = Sall + idx[0] * {NV * DK * DV};
-  int u0 = core_id * {HPT * NB}, nu = {HPT * NB};                  /* this task's units: heads [core_id * HPT, +HPT) x NB blocks */
+  {units}
   #define UBASE(u) (S + ((u) / {NB}) * {DK * DV} + ((u) % {NB}) * {W})
-  DMA_FILL(0, DESC(desc, 0), 0, (int)UBASE(u0));
+  {fill0}DMA_FILL(0, DESC(desc, 0), 0, (int)UBASE(u0));
   for (int e = 0; e < nu; e++) {{
     int u = u0 + e, p = e & 1, h = u / {NB}, j0 = (u % {NB}) * {W};
     if (e + 1 < nu) {{                                               /* the next block into the other buffer, once its drain is done */
@@ -2503,16 +2571,35 @@ def gdn_fast():
   v = os.environ.get("QWEN_GDN_FAST", "asm").strip(); assert v in ("asm", "c", "off"), f"QWEN_GDN_FAST={v!r}: asm | c | off"
   return v
 
-def gdn_fast_cfg(M, MS):
+def gdn_split_plan(NV, nt=NT):
+  """gdn_fast_src(split): NV % NT != 0 (the 2B's 16 heads over 12 tasks). Task t owns head t whole (8 blocks) and one third of
+  head NT + t // 3 (blocks [0, 3), [3, 6), [6, 8)): the per-head preparation of a split head is done by its three tasks (on TECs
+  that were idle), its gated output norm by gdn_onorm after the kernel. -> [(h_own, split head, b0, b1, part)] a task."""
+  assert NV == 16 and nt == 12, (NV, nt)
+  parts = [(0, 3), (3, 6), (6, 8)]
+  return [(t, nt + t // 3, parts[t % 3][0], parts[t % 3][1], t % 3) for t in range(nt)]
+
+def gdn_split():
+  """QWEN_GDN_SPLIT (default 1): the split kernel for NV % NT != 0 (gdn_split_plan); 0: the kernel on NV // HPT tasks, the rest idle."""
+  return os.environ.get("QWEN_GDN_SPLIT", "1") == "1"
+
+def gdn_split_for(NV, M, rows):
+  """The chain kernel's split plan for a pass of M rows (gdn_split_plan) or None: the 2B's 16 heads at the prompt chunks' > 4 rows
+  only (at <= 4 rows gdn_onorm's launch costs what the split saves: board, 2026-11-07). The split kernel keeps its update records
+  in two parities ([NG][NV][2][MS]), the unsplit one in one ([NG][NV][MS]): a pass's records are read by a pass or a gdn_flush of
+  the same kind (the generator's pend_split)."""
+  return gdn_split_plan(NV) if rows and NV % NT != 0 and M > 4 and gdn_split() else None
+
+def gdn_fast_cfg(M, MS, ob=False, nodb=False):
   """gdn_fast_src's LSRAM plan for M new tokens and MS pending-update slots -> dict(DB, VG, offsets): DB 1 = two state buffers
   (the next block's fill under this block's sweeps), 0 = one; VG = v column groups (1: every token's v row resident for the whole
   head; 2: half a row, the halves loaded per group of NB / 2 blocks -- the new tokens' v rows parked in a DDR scratch). The first
   of (DB 1 VG 1), (1, 2), (0, 1), (0, 2) that fits 32 KiB - 64 (rows of 512 B: k (MS + M), q (M), v (MS + M) / VG, o (M); the
   per-token beta / decay pairs at 64 B a token)."""
   T = MS + M
-  for DB, VG in ((1, 1), (1, 2), (0, 1), (0, 2)):
+  for DB, VG in ((((0, 1), (0, 2), (0, 4)) if nodb else ((1, 1), (1, 2), (1, 4), (0, 1), (0, 2), (0, 4))) if ob else ((1, 1), (1, 2), (0, 1), (0, 2))):
     o = {"KA": (1 + DB) * 8192}; o["QA"] = o["KA"] + T * 512; o["VA"] = o["QA"] + M * 512; o["OA"] = o["VA"] + T * 512 // VG
-    o["BD"] = o["OA"] + M * 512; o["END"] = o["BD"] + T * 64
+    o["BD"] = o["OA"] + (M * 64 if ob else M * 512); o["END"] = o["BD"] + T * 64   # ob (split): the o rows hold the current block's 16 columns
     if o["END"] <= 32768 - 64 and (VG == 1 or MS >= M): return dict(DB=DB, VG=VG, **o)
   raise AssertionError(f"gdn_fast_src: M {M} MS {MS} does not fit LSRAM")
 
@@ -2520,7 +2607,7 @@ def gdn_fast_kbd(M, HPT, KB=128, H=5120):
   """gdn_fast_src's a|b DMA chunk (columns): 2 KB when both double-buffered chunks fit LSRAM (half the requests of KB), else KB."""
   return 2 * KB if 2 * (M + 2 * HPT) * 2 * KB * 4 <= 32768 - 64 and H % (2 * KB) == 0 else KB
 
-def gdn_fast_desc(DK, DV, H, HPT, M, MS, C, CONV=4, KB=128, W=16, NV=48, a_out=False):
+def gdn_fast_desc(DK, DV, H, HPT, M, MS, C, CONV=4, KB=128, W=16, NV=48, a_out=False, split=False, raw=False):
   """gdn_fast_src's DMA slots: 0 a state block; 1 a chunk of the M input rows; 2 a chunk of a task's a|b rows (chunks of
   gdn_fast_kbd columns); 3 the CONV rows of a
   128-channel segment (taps or ring); 4 the M raw rows of a segment; 5 / 6 / 7 the MS pending slots' k / v / beta-decay rows in
@@ -2529,12 +2616,13 @@ def gdn_fast_desc(DK, DV, H, HPT, M, MS, C, CONV=4, KB=128, W=16, NV=48, a_out=F
   pending / M new slots whole (one request each, when they fit the staging buffer); 16 a head's M output rows out (DDR pitch NV DV); 17 / 18 a 128-channel segment's C tiles, row quad 0 (14 / 17 virtual
   strips of 768 B, the first 256 B of each: gdn_fast_src's CTD); a_out: 19 a head's block of o_proj's compact A out (contiguous,
   DV / 128 x 32 k-quads x RT row tiles x 16 halves)."""
-  G = GD_SLOT * 4; KBD = gdn_fast_kbd(M, HPT, KB, H)
+  G = GD_SLOT * 4; KBD = gdn_fast_kbd(M, HPT, KB, H); VWB = DV // gdn_fast_cfg(M, MS, ob=True)["VG"] * 4 if split or raw else 256   # a v row's resident bytes (VG 2's 256 B; the split's VG)
   sl = [(DK * W * 4, W * 4, DV * 4, W * 4), (M * KBD * 4, KBD * 4, H * 4, KBD * 4), (2 * HPT * KBD * 4, KBD * 4, H * 4, KBD * 4),
         (CONV * DK * 4, DK * 4, ring_pitch(C) * 4, DK * 4), (M * DK * 4, DK * 4, ring_pitch(C) * 4, DK * 4),
         (MS * 512, 512, G, 512), (MS * 512, 512, G, 512), (MS * 64, 64, G, 64), (M * 512, 512, G, 512), (M * 512, 512, G, 512), (M * 64, 64, G, 64),
-        (M * 512,), (MS * 256, 256, G, 256), (M * 256, 256, 512, 256), (MS * G,), (M * G,), (M * DV * 4, DV * 4, NV * DV * 4, DV * 4), (14 * 256, 256, 768, 256), (17 * 256, 256, 768, 256)]
+        (M * 512,), (MS * VWB, VWB, G, VWB), (M * VWB, VWB, 512, VWB), (MS * G,), (M * G,), (M * DV * 4, DV * 4, NV * DV * 4, DV * 4), (14 * 256, 256, 768, 256), (17 * 256, 256, 768, 256)]
   if a_out: sl.append((DV // 128 * 512 * -(-M // 4) * 2,))
+  if split or raw: sl += [(KBD * 4,), (M * 3 * W * 4, 3 * W * 4, NV * DV * 4, DK * 4), (M * 2 * W * 4, 2 * W * 4, NV * DV * 4, DK * 4), (M * 64, 64, NV * DV * 4, 64)]   # 19 an a|b row; 20 / 21 (unused now); 22 a block's o columns
   return V._desc_slots(*sl)
 
 def gdn_fast_scratch(M):
@@ -2691,7 +2779,7 @@ def _gf_a_out(src, DV, M, cf):
     src = src.replace(x, y)
   return src
 
-def gdn_fast_src(NV, NK, DK, DV, C, CONV, H, nrb, eps, M, NG, MS, W=16, KB=128, sweeps="asm", diag=(), tree=False, a_out=False):
+def gdn_fast_src(NV, NK, DK, DV, C, CONV, H, nrb, eps, M, NG, MS, W=16, KB=128, sweeps="asm", diag=(), tree=False, a_out=False, split=None, raw=False):
   """The DeltaNet verify kernel with the commit deferred (gdn_defer_src's contract), restructured around FUSED SWEEPS: a state
   block (DK x W fp32, in LSRAM) takes a token's update and the next token's decay + k.S in ONE pass over its rows, so T tokens
   cost T + 1 passes instead of 2 T, and the previous pass's ap = accp[0] accepted updates and the M new tokens run as one chain:
@@ -2724,6 +2812,16 @@ def gdn_fast_src(NV, NK, DK, DV, C, CONV, H, nrb, eps, M, NG, MS, W=16, KB=128, 
   """
   if a_out: return _gf_a_out(gdn_fast_src(NV, NK, DK, DV, C, CONV, H, nrb, eps, M, NG, MS, W, KB, sweeps, diag, tree), DV, M, gdn_fast_cfg(M, MS))
   D = set(diag); PH = "phases" in D
+  # `split` (gdn_split_plan; NV % NT != 0, the chain kernel): every task runs two SEGMENTS -- its own whole head and a part of a
+  # split head -- instead of HPT whole heads. The split head's preparation (conv, norms, the a|b gates) is repeated by its
+  # parts; its update records are written by part 0 (k, beta / decay) and the last part (v), read by all; the records are
+  # double-buffered by the pass parity accp[1] (read parity, written 1 - parity: no order between the parts); its output rows
+  # go out RAW per part's columns, normed by gdn_onorm afterwards. `banks` is then [NG][NV][2][MS] slots (+ the scratch).
+  SP = split is not None; assert not SP or (not tree and not a_out and NV % NT != 0 and len(split) == NT)
+  # `raw` (the chain kernel, HPT whole heads a task): every head's output rows RAW, a block's columns at a time (the split's OB
+  # path without its task plan), normed by gdn_onorm afterwards -- so the gate z is read after the kernel (the CPU split's z
+  # columns computed under the recurrence: QWEN_CPU_SPLIT_ZDEFER)
+  assert not raw or (not SP and not tree and not a_out)
   # tree (the leaf tree, QWEN_SPEC_TREE=leaf): the kernel `gdn_tokl` (gdn_tokl_src's contract and arguments) -- see the docstring
   TR = bool(tree); DPX = (lambda e: f"dpt[{e}]") if TR else (lambda e: e); DPA = ", dpa" if TR else ""
   QKT = lambda k, q: "" if not TR else (f"        for (int t = 0; t < {M}; t++) {{ float8 qk8 = BC(0.0f); for (int i = 0; i < {DK}; i += 8) qk8 += *(__global float8*)({k} + i) * "
@@ -2745,15 +2843,19 @@ def gdn_fast_src(NV, NK, DK, DV, C, CONV, H, nrb, eps, M, NG, MS, W=16, KB=128, 
   T0 = lambda v="t_": f" int {v} = CYC();" if PH else ""
   REP = NV // NK; QO, KO, VO = 0, NK * DK, 2 * NK * DK; CP = ring_pitch(C); assert VO + NV * DV == C and DK == DV == 128 and W == 16
   HPT, NB, BLK = gdn_hpt(NV), DV // W, DK * W * 4; NTU = -(-NV // HPT); LH = NV - (NTU - 1) * HPT
+  if SP: assert HPT == 2; NTU = NT                                       # (the a|b stack keeps its [NV // HPT][2 HPT][H] layout: rows fetched a head)
   assert H % KB == 0 and 2 <= M <= 8 and M <= MS <= GF_MS
   assert all(d & (d - 1) == 0 or d == 3 for d in (NB, REP, CONV))           # (IDIV / IMOD)
-  cf = gdn_fast_cfg(M, MS); DB, VG = cf["DB"], cf["VG"]; KA0, QA0, VA0, OA0, BD0 = cf["KA"], cf["QA"], cf["VA"], cf["OA"], cf["BD"]
+  OB = SP or raw                                                           # the o rows a block at a time (drained per block; gdn_onorm norms every head): two state buffers fit at M 8
+  SDG = set(os.environ.get("GDN_SPLIT_DIAG", "").split(",")) if SP else set()   # (diagnosis, the simulator: nodb / nowait / nodrain)
+  cf = gdn_fast_cfg(M, MS, ob=OB, nodb="nodb" in SDG); DB, VG = cf["DB"], cf["VG"]; KA0, QA0, VA0, OA0, BD0 = cf["KA"], cf["QA"], cf["VA"], cf["OA"], cf["BD"]
   VW = DV // VG; NBG = NB // VG                                             # v row floats resident; blocks a column group
-  SZ, SL = NV * DK * DV, MS * GD_SLOT
+  assert not raw or VG == 1, ("raw: VG 1 only", M, MS)
+  SZ, SL = NV * DK * DV, MS * GD_SLOT; NSL = (2 if SP else 1) * SL          # a head's slot bytes in `banks` (SP: two parities)
   KBD = gdn_fast_kbd(M, HPT, KB, H); NSB = KBD // KB                      # a|b: DMA chunks of KBD columns, the sums in KB-column sub-chunks (as before)
   XSZ, WSZ, NCH = M * KBD * 4, 2 * HPT * KBD * 4, H // KBD; XB, WB0 = 0, 2 * M * KBD * 4
   assert WB0 + 2 * WSZ <= 32768 - 64
-  SEG = CONV * DK * 4; AREA = 2 * SEG; assert 2 * AREA <= BLK and M * 512 <= cf["BD"] - OA0
+  SEG = CONV * DK * 4; AREA = 2 * SEG; assert 2 * AREA <= BLK and (M * 64 if OB else M * 512) <= cf["BD"] - OA0
   wacc = "".join(f" a{r} += xv * *(__global float8*)(WB + {r * KBD} + i);" for r in range(2 * HPT))
   X = lambda r: f"R{r}" if r < CONV - 1 else f"(Rw + {(r - CONV + 1) * DK})"
   # the C tiles' rows by 32-byte loads: 8 channels x a row quad are two 4 x 4 tiles, 128 contiguous bytes (LD8R's two 16-byte loads a
@@ -2816,7 +2918,7 @@ static inline __attribute__((always_inline)) void conv_cpl(__global float* restr
   # CTD (asm, two state buffers, whole v rows, M <= 4): the C tiles' row quad 0 of a 128-channel segment by ONE DMA -- the 8 strips
   # read as uniformly spaced "virtual strips" (both row blocks' strips, 768 B apart: the other block's come along) into the current
   # state buffer, free during a head's start (its block-0 fill is issued after the start) and at the head's end (z)
-  CTD = ASM and DB and VG == 1 and M <= 4
+  CTD = ASM and DB and VG == 1 and M <= 4 and (not OB or (raw and REP > 1 and os.environ.get("QWEN_GDN_RAW_CTD", "1") == "1"))   # (raw: the raw rows past the plan, RAW0)
   SWEEPS = "".join(gdn_asm.sweep_c(k, M, MS) for k in ("K0p", "K0n", "P", "PB", "N1", "N", "NL") + (("NB", "N1B", "LF", "LFD") if TR else ())) if ASM else gdn_sweeps_c(DK, W, tree=TR)
   if "nosweep" in D: SWEEPS += "".join(f"#define {n}(...) ((void)0)\n" for n in ("sa_K0p", "sa_K0n", "sa_P", "sa_PB", "sa_N1", "sa_N", "sa_NL", "sw_k0", "sw_p", "sw_n", "sw_nl"))
   KQN0, KP0 = KA0, KA0 + M * 1024                                          # asm: [4-row group][new token] (k | q), [8-row group][pending slot] k
@@ -2857,7 +2959,12 @@ static inline __attribute__((always_inline)) void conv_cpl(__global float* restr
 """)
   if TR: CHAIN = _gf_tree_chain(ASM, M, MS, f"{T0('td_')} if (p == 0) {{ DMA_DRAIN(2, DESC(desc, 0), 0, (int)UBASE(u)); DMA_WAIT(2); }} else {{ DMA_DRAIN(3, DESC(desc, 0), {BLK}, (int)UBASE(u)); DMA_WAIT(3); }}{T(4, 'td_')}")
   STG = "(1 - p) * %d" % BLK if DB else "0"                                 # the prep's staging: the idle state buffer (DB) / the one buffer
-  VNEW = f"LSF({VA0 + MS * VW * 4})" if VG == 1 else f"LSF({VA0})"          # where the v segment's conv lands (VG 2: a temp, then the scratch)
+  VNEW = f"LSF({VA0 + MS * VW * 4})" if VG == 1 else f"LSF({KA0 if OB else VA0})"   # where the v segment's conv lands (VG 2: a temp, then the scratch; OB: the KQN area, free then)
+  VTMP = KA0 if OB else VA0
+  RAW0 = KA0 + M * 512 if OB else OA0                                      # the conv's M raw rows (OB: the KQN area's second half, free until the KQN write; else the o rows)
+  if OB and REP > 1:   # a head with h % REP != 0 skips the KQN write and reads its key head's (the head before): the KQN area is NOT free
+    RAW0 = cf["END"]; assert RAW0 + M * 512 <= 32768 - 64, ("OB: no room for the raw rows past the plan", M, MS)   # -- past the plan instead
+  assert not OB or (ASM and MS >= M and (not CTD or RAW0 >= cf["END"])), (OB, ASM, MS, M)
   PREP_C = f"""    if (jb == 0) {{                                                    /* head start: the pending updates' inputs in, q / k / v of the M new tokens */
       int fa = 1 - p, fb = 2 + p, fc = 3 - p, sb = {STG}, qk = h == h0 || {IMOD("h", REP)} == 0, ns = qk ? 3 : 1;
       DMA_WAIT(fa); DMA_WAIT(fb); DMA_WAIT(fc);
@@ -2880,7 +2987,7 @@ static inline __attribute__((always_inline)) void conv_cpl(__global float* restr
       DMA_WAIT(fc);                                                   /* (the raw rows' last drain: the o rows are free from here) */
       /* this pass's update inputs of head h out ({"v rows to the scratch; the slots' v at the head's end" if VG == 2 else "k, v, beta / decay"}) */
       DMA_DRAIN(fa, DESC(desc, 8), {KA0 + MS * 512}, (int)sl); DMA_DRAIN(fc, DESC(desc, 10), {BD0 + MS * 64}, (int)(sl + 256));
-      {"DMA_DRAIN(fb, DESC(desc, 9), %d, (int)(sl + 128));" % (VA0 + MS * 512) if VG == 1 else "DMA_DRAIN(fb, DESC(desc, 11), %d, (int)(banks + %d + core_id * %d));" % (VA0, NG * NV * SL, M * 128)}
+      {"DMA_DRAIN(fb, DESC(desc, 9), %d, (int)(sl + 128));" % (VA0 + MS * 512) if VG == 1 else "DMA_DRAIN(fb, DESC(desc, 11), %d, (int)(banks + %d + core_id * %d));" % (VTMP, NG * NV * NSL, M * 128)}
       DMA_WAIT(fa); DMA_WAIT(fb); DMA_WAIT(fc);
     }}
 """
@@ -2894,16 +3001,16 @@ static inline __attribute__((always_inline)) void conv_cpl(__global float* restr
       DMA_FILL(fa, DESC(desc, 3), sb, (int)(cwt + on)); DMA_FILL(fb, DESC(desc, 3), sb + {SEG}, (int)(Cr + on));{" CTS(p, p * %d, x, on);   /* CTD: the segment's C tiles into this block's (not yet filled) buffer */" % BLK if CTD else ""}
       for (int s = 0; s < ns; s++) {{                                 /* segments: v, then (qk) q into the KP rows, k into the staging's free area */
         int a = sb + (s & 1) * {AREA}, off = on;
-       {T0("t9_")} DMA_WAIT(fa); DMA_WAIT(fb); DMA_WAIT(fc);{" DMA_WAIT(p);" if CTD else ""}{T(9, "t9_")}{chr(10) + "        conv_cpl(LSF(p * %d), LSF(%d), off); if (s == ns - 1) DMA_FILL(p, DESC(desc, 0), p * %d, (int)UBASE(u));   /* the buffer is free: the head's block 0 */" % (BLK, OA0, BLK) if CTD else ""}
+       {T0("t9_")} DMA_WAIT(fa); DMA_WAIT(fb); DMA_WAIT(fc);{" DMA_WAIT(p);" if CTD else ""}{T(9, "t9_")}{chr(10) + "        conv_cpl(LSF(p * %d), LSF(%d), off); if (s == ns - 1) DMA_FILL(p, DESC(desc, 0), p * %d, (int)UBASE(u));   /* the buffer is free: the head's block 0 */" % (BLK, RAW0, BLK) if CTD else ""}
         if (s + 1 < ns) {{
           int an = sb + ((s + 1) & 1) * {AREA}; on = s == 0 ? {QO} + j * {DK} : {KO} + j * {DK};
           DMA_FILL(fa, DESC(desc, 3), an, (int)(cwt + on)); DMA_FILL(fb, DESC(desc, 3), an + {SEG}, (int)(Cr + on));{" CTS(p, p * %d, x, on);" % BLK if CTD else ""}
         }}{f"{chr(10)}       {T0('tq_')} DMA_WAIT(fa); DMA_WAIT(fb); DMA_WAIT(fc);{T(9, 'tq_')}   /* diag dmaquiet: no DMA in flight under the conv */" if "dmaquiet" in D else ""}
-       {T0("ta_")} {"" if "noconv" in D else (" __asm__ volatile(\"\" ::: \"memory\"); " if "conv2" in D else "").join([("conv_cm(LSF(a), LSF(%d), pos, s == 0 ? %s : s == 1 ? LSF(%d) : LSF(sb + %d)%s%s);" % (OA0, VNEW, KP0, AREA, DPA, ", cs_" if PH else "")) if CTD else ("conv_seg(x, LSF(a), LSF(%d), pos, off, s == 0 ? %s : s == 1 ? LSF(%d) : LSF(sb + %d)%s%s);" % (OA0, VNEW, KP0, AREA, DPA, ", cs_" if PH else ""))] * (2 if "conv2" in D else 1))}
+       {T0("ta_")} {"" if "noconv" in D else (" __asm__ volatile(\"\" ::: \"memory\"); " if "conv2" in D else "").join([("conv_cm(LSF(a), LSF(%d), pos, s == 0 ? %s : s == 1 ? LSF(%d) : LSF(sb + %d)%s%s);" % (RAW0, VNEW, KP0, AREA, DPA, ", cs_" if PH else "")) if CTD else ("conv_seg(x, LSF(a), LSF(%d), pos, off, s == 0 ? %s : s == 1 ? LSF(%d) : LSF(sb + %d)%s%s);" % (RAW0, VNEW, KP0, AREA, DPA, ", cs_" if PH else ""))] * (2 if "conv2" in D else 1))}
 {T(10, "ta_")}
-        if (s == 0 || {IMOD("h", REP)} == 0) DMA_DRAIN(fc, DESC(desc, 4), {OA0}, (int)(raw + off));
-      }}
-     {T0("tb_")}
+        if (s == 0 || {IMOD("h", REP)} == 0) DMA_DRAIN(fc, DESC(desc, 4), {RAW0}, (int)(raw + off));
+{"        if (s == 0) { DMA_WAIT(p); DMA_DRAIN(p, DESC(desc, 11), %d, (int)(banks + %d + core_id * %d)); }   /* OB: the new v rows to the scratch now (VNEW is the KQN area) */" % (VTMP, NG * NV * NSL, M * 128) + chr(10) if OB and VG != 1 else ""}      }}
+{("      DMA_WAIT(fc);                                                   /* raw, VG 1: the raw rows' last drain, before the KQN write (no v drain) */" if raw and VG == 1 else "      DMA_WAIT(fc); DMA_WAIT(p);                                      /* OB: the raw rows' last drain and the v drain, before the KQN write */") + chr(10) if OB else ""}     {T0("tb_")}
       if ({"0" if "noconv" in D else "qk"}) {{                                                        /* q / k normed as gdn_tokm_src's (one loop, literal scales), then KQN */
         __global float* qt = LSF({KP0}); __global float* kt = LSF(sb + {AREA});
         NOUNROLL for (int t = 0; t < {M}; t++) {{ l2n(qt + t * {DK}, {1.0 / DK ** 0.5!r}f); l2n(kt + t * {DK}, 1.0f); }}
@@ -2937,17 +3044,42 @@ static inline __attribute__((always_inline)) void conv_cpl(__global float* restr
       DMA_WAIT(fc);                                                   /* (the raw rows' last drain: the o rows are free from here) */
       for (int t = 0; t < {M}; t++) for (int c = 0; c < {DK // 8}; c++) {{   /* the new k rows back out of KQN, for the slots */
         __global float* v0 = KQ(t) + 2 * c * {M * 8};
-        *(__global float8*)(OR(t) + 8 * c) = __builtin_shufflevector(*(__global float8*)v0, *(__global float8*)(v0 + {M * 8}), 0, 1, 2, 3, 8, 9, 10, 11);
+        *(__global float8*)({"LSF(sb + %d) + t * %d" % (MS * 512, DK) if OB else "OR(t)"} + 8 * c) = __builtin_shufflevector(*(__global float8*)v0, *(__global float8*)(v0 + {M * 8}), 0, 1, 2, 3, 8, 9, 10, 11);
       }}
       DMA_WAIT(fa);
       for (int u = 0; u < {MS}; u++) for (int g = 0; g < {DK // 8}; g++)   /* the pending k rows -> KP [8-row group][slot] */
         *(__global float8*)(KPV(u) + g * {MS * 8}) = *(__global float8*)(LSF(sb) + {"pth[u]" if TR else "u"} * {DK} + 8 * g);
       /* this pass's update inputs of head h out ({"v rows to the scratch; the slots' v at the head's end" if VG == 2 else "k, v, beta / decay"}) */
-      DMA_DRAIN(fa, DESC(desc, 8), {OA0}, (int)sl); DMA_DRAIN(fc, DESC(desc, 10), {BD0 + MS * 64}, (int)(sl + 256));
-      {"DMA_DRAIN(fb, DESC(desc, 9), %d, (int)(sl + 128));" % (VA0 + MS * 512) if VG == 1 else "DMA_DRAIN(fb, DESC(desc, 11), %d, (int)(banks + %d + core_id * %d));" % (VA0, NG * NV * SL, M * 128)}
+      DMA_DRAIN(fa, DESC(desc, 8), {"sb + %d" % (MS * 512) if OB else OA0}, (int)sl); DMA_DRAIN(fc, DESC(desc, 10), {BD0 + MS * 64}, (int)(sl + 256));
+      {"DMA_DRAIN(fb, DESC(desc, 9), %d, (int)(sl + 128));" % (VA0 + MS * 512) if VG == 1 else "" if OB else "DMA_DRAIN(fb, DESC(desc, 11), %d, (int)(banks + %d + core_id * %d));" % (VTMP, NG * NV * NSL, M * 128)}
 """}      DMA_WAIT(fa); DMA_WAIT(fb); DMA_WAIT(fc);{T(12, "tc2_")}
     }}
 """
+  if SP:                                                                   # the task's two segments: (head, first block, blocks after the last, part)
+    SPLIT_TABLES = ("  const int T_H[%d][2] = {%s}; const int T_B0[%d] = {%s}, T_B1[%d] = {%s}, T_P[%d] = {%s};\n"
+                    "  const int SEGH[2] = {T_H[core_id][0], T_H[core_id][1]}; const int B0s = T_B0[core_id], B1s = T_B1[core_id], part = T_P[core_id];\n"
+                    % (NT, ", ".join("{%d, %d}" % (a, b) for a, b, _, _, _ in split), NT, ", ".join(str(b0) for _, _, b0, _, _ in split), NT, ", ".join(str(b1) for _, _, _, b1, _ in split), NT, ", ".join(str(pt) for *_, pt in split)))
+    def WFILL(flag, ls, off):                                              # the four a | b rows (a_own, a_split, b_own, b_split) of chunk `off`, one request each
+      rows = [("SEGH[0]", 0), ("SEGH[1]", 1), ("SEGH[0]", 2), ("SEGH[1]", 3)]
+      return " ".join("DMA_FILL(%s, DESC(desc, 19), %s + %d, (int)(wab + L * %d + (%s / %d) * %d + (%s %% %d) * %d + %s * %d + %s));"
+                      % (flag, ls, r * KBD * 4, (NV // HPT) * 2 * HPT * H, h, HPT, 2 * HPT * H, h, HPT, H, r // 2, HPT * H, off) for h, r in rows)
+  else:
+    SPLIT_TABLES = ""
+    WFILL = lambda flag, ls, off: "DMA_FILL(%s, DESC(desc, 2), %s, (int)%s);" % (flag, ls, "wt" if off == "0" else "(wt + %s)" % off)
+  def SPREP(t):
+    """The head start under `split`: at the segment's first block; the record fills from slr, the drains to slw, the k / beta-decay
+    drains (desc 8, 10, 15) and the raw rows (desc 4) by part 0 only (`wr`), the v drain (desc 9) by the last part (`wv`)."""
+    if not SP: return t
+    out = []
+    for ln in t.split("\n"):
+      ln = ln.replace("if (jb == 0) {", "if (jb == jb0) {").replace("h - h0", "SG")
+      if "DMA_FILL(" in ln and "sl" in ln: ln = ln.replace("(int)sl)", "(int)slr)").replace("(int)(sl ", "(int)(slr ")
+      if "DMA_DRAIN(" in ln and "sl" in ln:
+        ln = ln.replace("(int)sl)", "(int)slw)").replace("(int)(sl ", "(int)(slw ")
+        ln = ln.replace("DMA_DRAIN(", "if (wv) DMA_DRAIN(" if "DESC(desc, 9)" in ln else "if (wr) DMA_DRAIN(")
+      if "DMA_DRAIN(fc, DESC(desc, 4)" in ln: ln = ln.replace("DMA_DRAIN(fc, DESC(desc, 4)", "if (wr) DMA_DRAIN(fc, DESC(desc, 4)")
+      out.append(ln)
+    return "\n".join(out)
   src = V.FULL_H + TILE + EXP + f"""
 #define CTX(c) ((int)((unsigned)(c) >> 4))                                /* (c a channel >= 0) */
 #define CTG(c) ((int)(((unsigned)CTX(c) * 43691u) >> 17))                  /* c / 48 = (c >> 4) / 3, exact for c >> 4 < 2^15 */
@@ -2980,16 +3112,16 @@ static inline __attribute__((always_inline)) float softplus1(float t) {{
 {TREE0}{"  int ph0 = 0, ph1 = 0, ph2 = 0, ph3 = 0, ph4 = 0, ph5 = 0, ph6 = 0, ph7 = 0, ph8 = 0, ph9 = 0, ph10 = 0, ph11 = 0, ph12 = 0; int cs_[3] = {0, 0, 0}; int tk0 = CYC();" + chr(10) if PH else ""}
   cwt += L * {CONV * CP}; nw += L * {DV}; adt += L * {2 * NV}; int h0 = core_id * {HPT}, nh = core_id == {NTU - 1} ? {LH} : {HPT};
   __global float* raw = rawm + L * {M * CP};
-  /* ---- a | b of the task's heads for the M rows (gdn_tokm_src's, unchanged) */
-  __global float* wt = wab + L * {NTU * 2 * HPT * H} + core_id * {2 * HPT * H};
+{SPLIT_TABLES}  /* ---- a | b of the task's heads for the M rows (gdn_tokm_src's, unchanged) */
+  __global float* wt = wab + L * {(NV // HPT if SP else NTU) * 2 * HPT * H} + core_id * {2 * HPT * H};
   float acc[{M}][{2 * HPT}], sq[{M}];
   for (int r = 0; r < {M}; r++) {{ sq[r] = 0.0f; for (int q = 0; q < {2 * HPT}; q++) acc[r][q] = 0.0f; }}
-  {"" if "noab" in D else "DMA_FILL(2, DESC(desc, 1), %d, (int)xin); DMA_FILL(0, DESC(desc, 2), %d, (int)wt);" % (XB, WB0)}
+  {"" if "noab" in D else "DMA_FILL(2, DESC(desc, 1), %d, (int)xin); %s" % (XB, WFILL("0", str(WB0), "0"))}
   for (int c = 0; c < {0 if "noab" in D else NCH}; c++) {{
     int p = c & 1;
     if (c + 1 < {NCH}) {{
-      if (p == 0) {{ DMA_FILL(3, DESC(desc, 1), {XB + XSZ}, (int)(xin + (c + 1) * {KBD})); DMA_FILL(1, DESC(desc, 2), {WB0 + WSZ}, (int)(wt + (c + 1) * {KBD})); }}
-      else        {{ DMA_FILL(2, DESC(desc, 1), {XB}, (int)(xin + (c + 1) * {KBD})); DMA_FILL(0, DESC(desc, 2), {WB0}, (int)(wt + (c + 1) * {KBD})); }}
+      if (p == 0) {{ DMA_FILL(3, DESC(desc, 1), {XB + XSZ}, (int)(xin + (c + 1) * {KBD})); {WFILL("1", str(WB0 + WSZ), "(c + 1) * %d" % KBD)} }}
+      else        {{ DMA_FILL(2, DESC(desc, 1), {XB}, (int)(xin + (c + 1) * {KBD})); {WFILL("0", str(WB0), "(c + 1) * %d" % KBD)} }}
     }}
     if (p == 0) {{ DMA_WAIT(0); DMA_WAIT(2); }} else {{ DMA_WAIT(1); DMA_WAIT(3); }}
     for (int cc = 0; cc < {NSB}; cc++)                                /* the KB-column sub-chunks, in order */
@@ -3006,44 +3138,44 @@ static inline __attribute__((always_inline)) float softplus1(float t) {{
     float inv = 1.0f / __builtin_sqrtf(sq[r] * {1.0 / H!r}f + {eps!r}f);
     for (int q = 0; q < nh; q++) {{
       bb[r][q] = 1.0f / (1.0f + ex1(-acc[r][{HPT} + q] * inv));
-      dd[r][q] = ex1(adt[h0 + q] * softplus1(acc[r][q] * inv + adt[{NV} + h0 + q]));
+      dd[r][q] = ex1(adt[{"SEGH[q]" if SP else "h0 + q"}] * softplus1(acc[r][q] * inv + adt[{NV} + {"SEGH[q]" if SP else "h0 + q"}]));
     }}
   }}
 {"  ph0 += CYC() - tk0;                                               /* phase 0: the a|b rows */" + chr(10) if PH else ""}  /* ---- the delta rule. LSRAM: state buffer(s) | k rows [MS pending | M new] | q rows [M] | v rows [MS | M] ({VW} floats) | o rows [M] | beta, decay [MS | M] (16 floats a token) */
   #define KR(t) (LSF({KA0}) + (t) * {DK})
   #define QR(t) (LSF({QA0}) + (t) * {DK})
   #define VR(t) (LSF({VA0}) + (t) * {VW})
-  #define OR(t) (LSF({OA0}) + (t) * {DK})
+  #define OR(t) (LSF({OA0}) + (t) * {DK}{" - j0 + (t) * (16 - %d)" % DK if OB else ""})
   #define BDR(t) (LSF({BD0}) + (t) * 16)
   #define KQ(t) (LSF({KQN0}) + (t) * 8)
   #define KPV(u) (LSF({KP0}) + (u) * 8)
-{"  #define PV(t) " + ("(t)" if ASM and MERGE else "pth[t]") + "                                            /* tree: pending update t's record (the previous path's t-th row) */" + chr(10) if TR else ""}  int u0 = core_id * {HPT * NB}, nu = nh * {NB};
+{"  #define PV(t) " + ("(t)" if ASM and MERGE else "pth[t]") + "                                            /* tree: pending update t's record (the previous path's t-th row) */" + chr(10) if TR else ""}  {"int ap_par = accp[1], SG = 0, e = 0, nu = 0;" if SP else f"int u0 = core_id * {HPT * NB}, nu = nh * {NB};"}
   #define UBASE(u) (S + {IDIV("(u)", NB)} * {DK * DV} + {IMOD("(u)", NB)} * {W})
   #define ZR(c, t) ({{ int zs_ = ((int)((unsigned)(h * {DV} + (c)) >> 4)), zv_ = 6 * {IDIV("zs_", 3)} + (zs_ - 3 * {IDIV("zs_", 3)}), z0s_ = ((int)((unsigned)(h * {DV}) >> 4)), z0_ = 6 * {IDIV("z0s_", 3)} + (z0s_ - 3 * {IDIV("z0s_", 3)}); __global float* zp_ = LSF(p * {BLK}) + (zv_ - z0_) * 64 + (((c) >> 3) & 1) * 32 + 4 * (t); F8(*(__global float4*)zp_, *(__global float4*)(zp_ + 16)); }})
   #define CTS(flag, ls, base, c) {{ int s0_ = ((int)((unsigned)(c) >> 4)), g0_ = {IDIV("s0_", 3)}, r0_ = s0_ - 3 * g0_; DMA_FILL(flag, DESC(desc, r0_ == 2 ? 18 : 17), ls, (int)((base) + (6 * g0_ + r0_) * 192)); }}
-  {"DMA_FILL(0, DESC(desc, 0), 0, (int)UBASE(u0));" if DB and not CTD else ""}
-  for (int e = 0; e < nu; e++) {{
+  {("DMA_FILL(0, DESC(desc, 0), 0, (int)UBASE(SEGH[0] * %d));" % NB if SP else "DMA_FILL(0, DESC(desc, 0), 0, (int)UBASE(u0));") if DB and not CTD else ""}
+  {"for (SG = 0; SG < 2; SG++) for (int jb = SG ? B0s : 0, jbe = SG ? B1s : %d; jb < jbe; jb++, e++) {" % NB if SP else "for (int e = 0; e < nu; e++) {"}
     NOHWL(e);                                                         /* (no hardware loop around the sweeps' own) */
-    int u = u0 + e, p = {"e & 1" if DB else "0"}, h = {IDIV("u", NB)}, jb = {IMOD("u", NB)}, j0 = jb * {W}, j = {IDIV("h", REP)};
-    __global float* sl = banks + (L * {NV} + h) * {SL};                 /* head h's update slots */
-{"    int tp_ = jb == 0 ? CYC() : 0;" + chr(10) if PH else ""}{PREP_ASM if ASM else PREP_C}{"    if (jb == 0) ph1 += CYC() - tp_;                                 /* phase 1: the heads' starts */" + chr(10) if PH else ""}{"" if VG == 1 else f'''    if ({IMOD("jb", NBG)} == 0) {{                                              /* VG 2: column group jb / {NBG}'s halves of the v rows */
+    {"int h = SEGH[SG], u = h * %d + jb, p = %s, j0 = jb * %d, j = %s, jb0 = SG ? B0s : 0, jbl = (SG ? B1s : %d) - 1, wr = SG == 0 || part == 0, wv = SG == 0 || jbl == %d;" % (NB, "e & 1" if DB else "0", W, IDIV("h", REP), NB, NB - 1) if SP else f'int u = u0 + e, p = {"e & 1" if DB else "0"}, h = {IDIV("u", NB)}, jb = {IMOD("u", NB)}, j0 = jb * {W}, j = {IDIV("h", REP)};'}
+    {"__global float* slr = banks + ((L * %d + h) * 2 + ap_par) * %d, * slw = banks + ((L * %d + h) * 2 + 1 - ap_par) * %d;   /* the records: read at the pass parity, written at the other */" % (NV, SL, NV, SL) if SP else f"__global float* sl = banks + (L * {NV} + h) * {SL};                 /* head h's update slots */"}
+{"    int tp_ = jb == 0 ? CYC() : 0;" + chr(10) if PH else ""}{SPREP(PREP_ASM if ASM else PREP_C)}{"    if (jb == 0) ph1 += CYC() - tp_;                                 /* phase 1: the heads' starts */" + chr(10) if PH else ""}{"" if VG == 1 else f'''    if ({IMOD("jb", NBG)} == 0{" || jb == jb0" if SP else ""}) {{                                              /* VG 2: column group jb / {NBG}'s halves of the v rows */
       int g = {IDIV("jb", NBG)}, fa = 1 - p, fb = 2 + p;
       DMA_WAIT(fa); DMA_WAIT(fb);
-      DMA_FILL(fa, DESC(desc, 12), {VA0}, (int)(sl + 128 + g * {VW})); DMA_FILL(fb, DESC(desc, 13), {VA0 + MS * VW * 4}, (int)(banks + {NG * NV * SL} + core_id * {M * 128} + g * {VW}));
+      DMA_FILL(fa, DESC(desc, 12), {VA0}, (int)({"slr" if SP else "sl"} + 128 + g * {VW})); DMA_FILL(fb, DESC(desc, 13), {VA0 + MS * VW * 4}, (int)(banks + {NG * NV * NSL} + core_id * {M * 128} + g * {VW}));
       DMA_WAIT(fa); DMA_WAIT(fb);
     }}
-'''}    {f'''    if (e + 1 < nu{" && %s != 0" % IMOD("u + 1", NB) if CTD else ""}) {{
-      if (p == 0) {{ DMA_WAIT(3); DMA_FILL(1, DESC(desc, 0), {BLK}, (int)UBASE(u + 1)); }}
-      else        {{ DMA_WAIT(2); DMA_FILL(0, DESC(desc, 0), 0, (int)UBASE(u + 1)); }}
+'''}    {f'''    if ({"(jb < jbl || SG == 0)" if SP else "e + 1 < nu"}{" && %s != 0" % IMOD("u + 1", NB) if CTD else ""}) {{{chr(10) + "      int un = jb < jbl ? u + 1 : SEGH[1] * %d + B0s;" % NB if SP else ""}
+      if (p == 0) {{ DMA_WAIT(3); DMA_FILL(1, DESC(desc, 0), {BLK}, (int)UBASE({"un" if SP else "u + 1"})); }}
+      else        {{ DMA_WAIT(2); DMA_FILL(0, DESC(desc, 0), 0, (int)UBASE({"un" if SP else "u + 1"})); }}
     }}
     {T0("tw_")} if (p == 0) DMA_WAIT(0); else DMA_WAIT(1);{T(2, "tw_")}''' if DB else T0("tw_") + " DMA_WAIT(2); DMA_FILL(0, DESC(desc, 0), 0, (int)UBASE(u)); DMA_WAIT(0);" + T(2, "tw_")}
-    __global float* B = LSF(p * {BLK});
+    __global float* B = LSF(p * {BLK});{" DMA_WAIT(3 - p);   /* (OB: the previous block's o columns drained before OR is rewritten) */" if OB and "nowait" not in SDG else ""}
     int jv = {IMOD("j0", VW)};                                                 /* the block's columns within the resident v rows */
     float8 kv[2], o[2];
     #define DL(t, i) ((*(__global float8*)(VR(t) + jv + 8 * (i)) - kv[i]) * BC(BDR(t)[0]))
 {T0("tc_")}
 {CHAIN}{T(3, "tc_") + chr(10) if PH else ""}    #undef DL
-    if (jb == {NB - 1}) {{                                          /* the M tokens' o = rmsnorm(o) * nw * silu(z) -> rows 0..M-1 (fp32) */
+{"    DMA_DRAIN(2 + p, DESC(desc, 22), %d, (int)(out + h * %d + j0));                 /* OB: this block's 16 columns of the M raw o rows out (flag 2 + p, waited before the next block of this parity) */" % (OA0, DV) + chr(10) if OB and "nodrain" not in SDG else ""}{"    if (SG == 1) { if (jb == jbl) { %s } } else" % ("" if VG == 1 else " if (wv) { int fa = 1 - p; DMA_WAIT(fa); DMA_FILL(fa, DESC(desc, 11), p * %d, (int)(banks + %d + core_id * %d)); DMA_WAIT(fa); DMA_DRAIN(fa, DESC(desc, 9), p * %d, (int)(slw + 128)); DMA_WAIT(fa); }" % (BLK, NG * NV * NSL, M * 128, BLK)) + chr(10) if SP else ""}{"    if (jb == jbl) { int fa = 1 - p; DMA_WAIT(fa); DMA_FILL(fa, DESC(desc, 11), p * %d, (int)(banks + %d + core_id * %d)); DMA_WAIT(fa); DMA_DRAIN(fa, DESC(desc, 9), p * %d, (int)(slw + 128)); DMA_WAIT(fa); }   /* OB: the own head's new v rows from the scratch to the slots */" % (BLK, NG * NV * NSL, M * 128, BLK) + chr(10) if OB and VG != 1 else ""}    if ({"0" if OB else "jb == %d" % (NB - 1)}) {{                                          /* the M tokens' o = rmsnorm(o) * nw * silu(z) -> rows 0..M-1 (fp32) */
      {T0("to_")}
       float invt[{M}];
       for (int t = 0; t < {M}; t++) {{
@@ -3067,8 +3199,8 @@ static inline __attribute__((always_inline)) float softplus1(float t) {{
       {{ int fo = 3 - p; DMA_WAIT(fo); DMA_DRAIN(fo, DESC(desc, 16), {VA0}, (int)(out + h * {DV})); }}{T(5, "to_")}   /* the M rows (staged in the head's dead v rows) by one request; waited by the next head's start */
 {"" if VG == 1 else f'''      {{                                                              /* VG 2: the new v rows from the scratch to the slots (through the done block's buffer) */
         int fa = 1 - p;
-        DMA_WAIT(fa); DMA_FILL(fa, DESC(desc, 11), p * {BLK}, (int)(banks + {NG * NV * SL} + core_id * {M * 128})); DMA_WAIT(fa);
-        DMA_DRAIN(fa, DESC(desc, 9), p * {BLK}, (int)(sl + 128)); DMA_WAIT(fa);
+        DMA_WAIT(fa); DMA_FILL(fa, DESC(desc, 11), p * {BLK}, (int)(banks + {NG * NV * NSL} + core_id * {M * 128})); DMA_WAIT(fa);
+        {"if (wv) " if SP else ""}DMA_DRAIN(fa, DESC(desc, 9), p * {BLK}, (int)({"slw" if SP else "sl"} + 128)); DMA_WAIT(fa);
       }}
 '''}    }}
   }}
@@ -3085,7 +3217,7 @@ def gdn_flush_desc(DK, DV, MS, W=16):
   """gdn_flush_src: 0 a state block (as gdn_lsr_desc); 1 a head's MS update slots (contiguous)."""
   return V._desc_slots((DK * W * 4, W * 4, DV * 4, W * 4), (MS * GD_SLOT * 4,))
 
-def gdn_flush_src(NV, DK, DV, NG, MS, W=16, tree=False):
+def gdn_flush_src(NV, DK, DV, NG, MS, W=16, tree=False, split=False):
   """The deferred commit's pending updates applied to every DeltaNet layer's state NOW (gdn_fast_src / gdn_defer_src leave the
   last verify pass's accepted updates in `banks` for the next verify pass to apply): what a plain decode step (gdn_tok3, which
   reads Sall) needs after a deferred verify pass -- the Q8_0 models prefill through the verify path. Per (layer, head, state block):
@@ -3103,7 +3235,7 @@ __kernel void gdn_flush(__global float* restrict Sall, __global float* restrict 
   for (int u = core_id; u < {NBLK}; u += {NT}) {{
     int L = u / {NV * NB}, h = (u / {NB}) % {NV}, jb = u % {NB}, j0 = jb * {W};
     __global float* blk = Sall + (L * {NV} + h) * {DK * DV} + j0;
-    DMA_FILL(0, DESC(desc, 0), 0, (int)blk); DMA_FILL(1, DESC(desc, 1), {BLK}, (int)(banks + (L * {NV} + h) * {SL})); DMA_WAIT(0); DMA_WAIT(1);
+    DMA_FILL(0, DESC(desc, 0), 0, (int)blk); DMA_FILL(1, DESC(desc, 1), {BLK}, (int)(banks + {"((L * %d + h) * 2 + accp[1])" % NV if split else "(L * %d + h)" % NV} * {SL})); DMA_WAIT(0); DMA_WAIT(1);
     for (int t = 0; t < ap; t++) {{
       int r = {"accp[4 + t]" if tree else "t"};
       __global float* ks = PV + r * {GD_SLOT};
@@ -3122,6 +3254,70 @@ __kernel void gdn_flush(__global float* restrict Sall, __global float* restrict 
     }}
     DMA_DRAIN(2, DESC(desc, 0), 0, (int)blk); DMA_WAIT(2);
   }}
+}}"""
+
+def gdn_onorm_src(NV, DV, M, nrb, eps, heads, NG):
+  """gdn_fast_src(split)'s split heads' output rows, normed in place: for token t and head h in `heads`, row t's columns
+  h DV .. h DV + DV of `out` (raw o, the parts' columns) -> o * (1 / sqrt(mean(o^2) + eps)) * nw * silu(z) -- gdn_fast's expression
+  in its order (the sum of squares as a float8 over the columns, hsum8, 1 / sqrtf), so the rows equal the unsplit kernel's bit for
+  bit. z: the z C tiles (xoff = zoff groups in), nw: the per-layer stack at idx. A unit = (token, head); 12 tasks."""
+  CT = f"""
+#define CTX(c) ((int)((unsigned)(c) >> 4))
+#define CTG(c) ((int)(((unsigned)CTX(c) * 43691u) >> 17))
+#define CTA(c) ((CTG(c) * {nrb * 3} + (CTX(c) - 3 * CTG(c))) * 192 + ((int)((unsigned)(c) >> 2) & 3) * 16)
+#define LD8R(ct, c, r) F8(*(__global float4*)((ct) + CTA(c) + ((int)((unsigned)(r) >> 2)) * 64 + 4 * ((r) & 3)), *(__global float4*)((ct) + CTA(c) + ((int)((unsigned)(r) >> 2)) * 64 + 16 + 4 * ((r) & 3)))
+#define NOUNROLL _Pragma("clang loop unroll(disable)")
+"""
+  hl = ", ".join(str(h) for h in heads); NU = M * len(heads)
+  return V.FULL_H + TILE + EXP + CT + f"""
+__kernel void gdn_onorm(__global float* restrict out, __global float* restrict z, __global int* restrict idx, __global float* restrict nw, const int core_id) {{
+  const int HS[{len(heads)}] = {{{hl}}}; int L = idx[0]; nw += L * {DV};
+  for (int u = core_id; u < {NU}; u += {NT}) {{
+    int t = u / {len(heads)}, h = HS[u % {len(heads)}]; __global float* orow = out + t * {NV * DV} + h * {DV};
+    float8 ss = BC(0.0f); NOUNROLL for (int c = 0; c < {DV}; c += 8) {{ float8 ov = *(__global float8*)(orow + c); ss += ov * ov; }}
+    float invt = 1.0f / __builtin_sqrtf(hsum8(ss) * {1.0 / DV!r}f + {eps!r}f);
+    NOUNROLL for (int c = 0; c < {DV}; c += 8) *(__global float8*)(orow + c) = *(__global float8*)(orow + c) * BC(invt) * *(__global float8*)(nw + c) * sw(LD8R(z, h * {DV} + c, t), BC(1.0f));
+  }}
+}}"""
+
+def _onormd_plan(NV, DV, nrb, HPT):
+  """gdn_onormd's z reads: task t's HPT heads are columns c0 = t HPT DV .. + HPT DV of the z tiles; row quad 0 of a 16-column strip is
+  256 B, and the strips of row block 0 sit at a uniform 768 B in "virtual strip" units v(s) = 3 nrb (s / 3) + s % 3 (the other row
+  blocks' strips between them come along). -> per task (first virtual strip, count); the counts take one of three values (s0 % 3)."""
+  vs = lambda s: 3 * nrb * (s // 3) + s % 3; n = HPT * DV // 16
+  return [(vs(t * n), vs(t * n + n - 1) - vs(t * n) + 1) for t in range(NV // HPT)]
+def gdn_onormd_desc(NV, DV, M, nrb, HPT):
+  """gdn_onormd_src's DMA slots: 0 the task's M rows of HPT heads (DDR pitch NV DV); 1 + k the z strips of a task whose count is the
+  k-th distinct one (exact: no strip read past the task's last -- z is the tail of the fused qkv|z tiles)."""
+  counts = sorted({c for _, c in _onormd_plan(NV, DV, nrb, HPT)})
+  return V._desc_slots((M * HPT * DV * 4, HPT * DV * 4, NV * DV * 4, HPT * DV * 4), *[(c * 256, 256, 768, 256) for c in counts])
+def gdn_onormd_src(NV, DV, M, nrb, eps, HPT):
+  """gdn_onorm_src for every head at <= 4 rows, the rows and the z tiles staged by DMA (gdn_onorm's loads from DDR cost ~0.1 ms a
+  layer): task t's HPT heads, M rows in by one request, their z strips (row quad 0) by another, normed in LSRAM with gdn_onorm's
+  expression in its order (the same bits), out by one request. args: out (in / out), z (the z tiles), idx, nw, desc (gdn_onormd_desc)."""
+  assert M <= 4 and NV % HPT == 0 and NV // HPT <= NT and DV % 16 == 0
+  plan = _onormd_plan(NV, DV, nrb, HPT); counts = sorted({c for _, c in plan}); OZ = M * HPT * DV * 4
+  assert OZ + max(counts) * 256 <= 32768 - 64, ("gdn_onormd: LSRAM", OZ, max(counts))
+  V0 = ", ".join(str(v) for v, _ in plan); SL = ", ".join(str(1 + counts.index(c)) for _, c in plan)
+  return V.FULL_H + TILE + EXP + f"""
+#define NOUNROLL _Pragma("clang loop unroll(disable)")
+__kernel void gdn_onorm(__global float* restrict out, __global float* restrict z, __global int* restrict idx, __global float* restrict nw, __global int* restrict desc, const int core_id) {{
+  if (core_id >= {NV // HPT}) return;
+  const int TV0[{len(plan)}] = {{{V0}}}, TSL[{len(plan)}] = {{{SL}}};
+  int L = idx[0], h0 = core_id * {HPT}, v0 = TV0[core_id]; nw += L * {DV};
+  DMA_FILL(0, DESC(desc, 0), 0, (int)(out + h0 * {DV}));
+  DMA_FILL(1, DESC(desc, TSL[core_id]), {OZ}, (int)(z + v0 * 192));
+  DMA_WAIT(0); DMA_WAIT(1);
+  for (int hh = 0; hh < {HPT}; hh++) for (int t = 0; t < {M}; t++) {{
+    __global float* orow = LSF(0) + t * {HPT * DV} + hh * {DV}; int cb = (h0 + hh) * {DV};
+    float8 ss = BC(0.0f); NOUNROLL for (int c = 0; c < {DV}; c += 8) {{ float8 ov = *(__global float8*)(orow + c); ss += ov * ov; }}
+    float invt = 1.0f / __builtin_sqrtf(hsum8(ss) * {1.0 / DV!r}f + {eps!r}f);
+    NOUNROLL for (int c = 0; c < {DV}; c += 8) {{
+      int st = (cb + c) >> 4, v = {3 * nrb} * (st / 3) + st % 3; __global float* zp = LSF({OZ}) + (v - v0) * 64 + ((c >> 3) & 1) * 32 + 4 * t;
+      *(__global float8*)(orow + c) = *(__global float8*)(orow + c) * BC(invt) * *(__global float8*)(nw + c) * sw(F8(*(__global float4*)zp, *(__global float4*)(zp + 16)), BC(1.0f));
+    }}
+  }}
+  DMA_DRAIN(0, DESC(desc, 0), 0, (int)(out + h0 * {DV})); DMA_WAIT(0);
 }}"""
 
 def gdn_commit_desc(CH=8192): return V._desc_slots((CH,))
@@ -3717,11 +3913,55 @@ __kernel void attn_pcomb(__global float* restrict o_rows, __global float* restri
   }}
 }}"""
 
+# ---- the NPU + CPU column split's hand-off (bonsai2-27b/cpu_split.c): two one-word kernels around a split GEMM. The words live in
+# DDR and are moved by DMA only (the d-cache neither invalidates nor writes back in time).
+def cpu_flag_desc(): return V._desc_slots((64,))
+def cpu_req_src():
+  """REQ = 1: the GEMM's A is in DDR, the CPU half may start. args: out (the REQ word's 64-byte line), desc."""
+  return V.FULL_H + """
+__kernel void cpu_req(__global int* restrict out, __global int* restrict desc, const int core_id) {
+  if (core_id == 0) { __global volatile int* w = (__global volatile int*)LSF(0); w[0] = 1; DMA_DRAIN(0, DESC(desc, 0), 0, (int)out); }
+  DMA_WAIT_ALL();
+}"""
+def _req_copy_split(nbytes):
+  """cpu_req_copy's split of an A of nbytes over the NT tasks: (chunk, tail) -- tasks 0..NT-2 a 64-byte multiple `chunk`, the last
+  the rest -- so every task makes one fill and one drain (a 40 KB A in 8 KiB chunks busied 5 of the 12 tasks)."""
+  chunk = -(-nbytes // (NT * 64)) * 64; tail = nbytes - (NT - 1) * chunk
+  assert 0 < tail <= chunk and chunk <= 16384, (nbytes, chunk, tail); return chunk, tail
+def cpu_req_copy_desc(nbytes): c, t = _req_copy_split(nbytes); return V._desc_slots((c,), (t,), (64,))
+def cpu_req_copy_src(nbytes):
+  """The split's REQ with the A copied out first: the GEMM's A stays where its producer wrote it (GM staging, off the DDR port --
+  12.8 ms a pass cheaper than keeping it in DDR); each task copies its share of it (_req_copy_split: one fill, one drain, through
+  LSRAM) to the DDR mirror the CPU reads, then sets its own REQ line (REQ[16 t] = 1): the CPU starts once all NT lines read 1.
+  args: out (REQ, NT 64-byte lines), mirror (DDR), a (the A), desc (cpu_req_copy_desc(nbytes))."""
+  chunk, tail = _req_copy_split(nbytes)
+  return V.FULL_H + f"""
+__kernel void cpu_req_copy(__global int* restrict out, __global char* restrict mirror, __global char* restrict a, __global int* restrict desc, const int core_id) {{
+  int d = core_id == {NT - 1} ? 1 : 0;
+  DMA_FILL(0, DESC(desc, d), 0, (int)(a + core_id * {chunk})); DMA_WAIT(0);
+  DMA_DRAIN(0, DESC(desc, d), 0, (int)(mirror + core_id * {chunk})); DMA_WAIT_ALL();
+  __global volatile int* w = (__global volatile int*)LSF(16384); w[0] = 1; DMA_DRAIN(2, DESC(desc, 2), 16384, (int)(out + core_id * 16));
+  DMA_WAIT_ALL();
+}}"""
+def cpu_ack_src(maxp=1 << 22):
+  """Wait for ACK == 1 (the CPU half's columns are in the C tiles), then clear it. Bounded: `maxp` polls (~0.4 us each), after which
+  the chain goes on with whatever the tiles hold (the host sees the orchestrator's status). args: out (the ACK word's line), desc."""
+  return V.FULL_H + f"""
+__kernel void cpu_ack(__global int* restrict out, __global int* restrict desc, const int core_id) {{
+  if (core_id == 0) {{
+    __global volatile int* w = (__global volatile int*)LSF(0); int v = 0;
+    for (int n = 0; n < {maxp} && v != 1; n++) {{ DMA_FILL(0, DESC(desc, 0), 0, (int)out); DMA_WAIT(0); v = w[0]; }}
+    w[0] = 0; DMA_DRAIN(0, DESC(desc, 0), 0, (int)out);
+  }}
+  DMA_WAIT_ALL();
+}}"""
+
 class Kernels:
   """The kernels for one row geometry (nrb row blocks), registered once per (kind, shape). Every output is a persistent,
   preallocated device buffer selected by `tag`, so a tag must not be reused while its value is still needed. A hand-written kernel must not read a JIT input buffer directly (`hold` copies it)."""
   def __init__(self, nrb, rows, eps, real=None):
     self.nrb, self.rows, self.eps, self.reg, self.bufs = nrb, rows, eps, {}, {}
+    self.req_folded = {}  # id(A) -> the mirror its producer wrote and raised the REQ for (rms_a / swiglu_a req=; Layers.lin_ct)
     self.real = rows if real is None else real        # rows holding data; the kernels skip the padding rows
     self.compact = self.real <= 12 and real is not None   # the GEMM's rows mode: A in the compact layout (row block 0's used tiles)
     self.rt = -(-self.real // 4) if self.compact else 3
@@ -3738,6 +3978,7 @@ class Kernels:
     self.ext = set()       # tags handed to callers by rows_buf: written outside the kernels too (pokes, the embedding, row moves)
     self.writers = {}      # tag -> the kernel kinds that wrote it (in program order, at capture)
     self.last_out = {}     # tag -> id of resid's latest returned view
+    self.no_gm = set()     # A tags kept in DDR (the NPU + CPU split: the host reads them)
   def s2(self, k="QWEN_SMALL2"):
     """The QWEN_SMALL2 kernel family `k` on this geometry (rows mode): QWEN_SMALL2=0 none; QWEN_RQ=0 / QWEN_RMS2=0 / QWEN_T3D=0 one off."""
     return self.small2 and self.compact and os.environ.get("QWEN_SMALL2", "1") == "1" and os.environ.get(k, "1") == "1"
@@ -3750,8 +3991,8 @@ class Kernels:
     t = self._tag(x)
     if t is None or self.writers.get(t) != {"rq"} or f"rec|{t}" not in self.bufs: return None
     return f"rec|{t}", t in self.ext
-  def key(self, name, src):
-    if name not in self.reg: self.reg[name] = OA.register_csrc(name.split("|")[0], src, ntasks=NT)
+  def key(self, name, src, ntasks=NT):
+    if name not in self.reg: self.reg[name] = OA.register_csrc(name.split("|")[0], src, ntasks=ntasks)
     return self.reg[name]
   # QWEN_AGM: a rows-mode GEMM's A operand (the tags "a_*": every one written by its producer right before the GEMMs that read
   # it) goes to the backend's A staging buffer in GM (OA.gemm_a_gm: one region every geometry shares; the GEMM's A requests then read
@@ -3761,7 +4002,7 @@ class Kernels:
   # text in DDR too: not instruction-fetch contention), so a rotated-input (ternary) geometry at rt 2 keeps A in DDR (QWEN_AGM=all: GM)
   def a_gm(self, tag, dt):
     v = os.environ.get("QWEN_AGM", "1")
-    return tag.startswith("a_") and self.compact and dt == dtypes.uint16 and (v == "all" or (v == "1" and not (self.had is not None and self.rt == 2)))
+    return tag.startswith("a_") and tag not in self.no_gm and self.compact and dt == dtypes.uint16 and (v == "all" or (v == "1" and not (self.had is not None and self.rt == 2)))
   def buf(self, tag, n, dt):
     if tag not in self.bufs:
       g = OA.gemm_a_gm(n, dt, DEV) if self.a_gm(tag, dt) and hasattr(OA, "gemm_a_gm") else None
@@ -3783,9 +4024,10 @@ class Kernels:
   def desc(self, dk, mk):
     if dk not in self.bufs: self.bufs[dk] = Tensor(mk(), device=DEV).realize()
     return self.bufs[dk]
-  def rms_a(self, x, w1, c, tag, norm=True):
+  def rms_a(self, x, w1, c, tag, norm=True, req=None):
     """x fp32 [R, c] (w1 = 1 + weight fp32 [c], or (stack [L * c], idx) -- the layer's row picked on the device) -> the A layout
-    halves (uint16 [nsl * nrb * 32 * 48])."""
+    halves (uint16 [nsl * nrb * 32 * 48]). `req` (a CPU split linear's DDR mirror, Layers.req): the producer, if it is had_fast v2,
+    also writes the A to the mirror and raises the split's REQ (cpu_req_copy's work, folded); else the A as without it."""
     st = isinstance(w1, tuple)
     if self.had is not None:                     # rotated inputs: had_a32 (norm: w1 carries the signs; plain: the signs of width c)
       assert norm or c in self.had, f"rms_a(norm=False) of width {c}: no rotated linear takes it (no signs)"
@@ -3793,17 +4035,20 @@ class Kernels:
       rs = self._rec_src(x) if norm and st and self.s2("QWEN_RQ") and self.had_dma() and self.had_fast() else None
       if rs is not None:                         # QWEN_SMALL2: the norms from the residual's record (had_fast v2 "rec", guarded)
         import had_fast as HF
-        op = self.HAD_FAST_OPTS + ("rec",)
-        k = self.key(f"had_a32d|fast|rec|{mode}|{c}|{self.real}|{self.had_post}", HF.had_fast_src(mode, c, self.nrb, self.eps, self.real, stacked=True, post=self.had_post, opts=op))
-        d = self.desc(f"had_a32d_desc|fast|rec|{mode}|{c}", lambda: HF.had_fast_desc(mode, c, self.nrb, self.real, opts=op))
-        return self.run(k, tag, self.a_size(c), dtypes.uint16, x, *ws, self.bufs[rs[0]], d)
-      if self.compact and os.environ.get("QWEN_HAD_ROWS", "1" if (self.had_b != HAD_B or self.had_g > 1) else "0") == "1":   # had_rows on every task, then the plain packer (default on for the 512 block, which had no DMA / fast producer)
+        op = self.HAD_FAST_OPTS + ("rec",); rq = req is not None and "v2" in op
+        hb = None if self.had_b == HAD_B else self.had_b
+        k = self.key(f"had_a32d|fast|rec|{mode}|{c}|{self.real}|{self.had_post}{self._hbk()}{'|req' if rq else ''}", HF.had_fast_src(mode, c, self.nrb, self.eps, self.real, stacked=True, post=self.had_post, opts=op + (("req",) if rq else ()), hb=hb))
+        d = self.desc(f"had_a32d_desc|fast|rec|{mode}|{c}{self._hbk()}", lambda: HF.had_fast_desc(mode, c, self.nrb, self.real, opts=op, hb=hb))
+        return self._req_done(self.run(k, tag, self.a_size(c), dtypes.uint16, x, *ws, self.bufs[rs[0]], d, *self._req_args(req if rq else None)), req if rq else None)
+      if self.compact and os.environ.get("QWEN_HAD_ROWS", "1" if ((self.had_b != HAD_B and not self.fast512()) or self.had_g > 1) else "0") == "1":   # had_rows on every task, then the plain packer (default on for the 512 block, which had no DMA / fast producer)
         k = self.key(f"had_rows|{mode}|{c}|{self.real}|{st}|{self.had_post}|{self.had_g}|{self.had_b}", had_rows_src(mode, c, self.nrb, self.eps, self.real, stacked=st and norm, post=self.had_post, g=self.had_g, hb=self.had_b))
         rows = self.run(k, f"hadrows|{c}", self.rows * c, dtypes.float32, x, *ws, self.desc(f"had_rows_desc|{c}|{self.had_b}", lambda: had_rows_desc(c, self.had_b))).reshape(self.rows, c)
         saved = self.had; self.had = None
         try: return self.rms_a(rows, None, c, tag, norm=False)
         finally: self.had = saved
-      if self.had_dma(): return self.run(self.had_d(mode, c, st and norm), tag, self.a_size(c), dtypes.uint16, x, *ws, self.had_desc(mode, c))
+      if self.had_dma():
+        rq = req if self.had_fast() and "v2" in self.HAD_FAST_OPTS else None
+        return self._req_done(self.run(self.had_d(mode, c, st and norm, req=rq is not None), tag, self.a_size(c), dtypes.uint16, x, *ws, self.had_desc(mode, c), *self._req_args(rq)), rq)
       k = self.key(f"had_a32|{mode}|{c}|{self.real}|{self.compact}|{st}|{self.had_post}|{self.had_g}|{self.had_b}", had_a32_src(mode, c, self.nrb, self.eps, real=self.real, compact=self.compact, stacked=st and norm, post=self.had_post, g=self.had_g, hb=self.had_b))
       return self.run(k, tag, self.a_size(c), dtypes.uint16, x, *ws)
     # rows mode with the norm: the rows through LSRAM by DMA (rms_a32d: -0.26 ms a call at 4 rows, bit-identical; never implicated
@@ -3833,30 +4078,44 @@ class Kernels:
     return self.run(k, tag, self.a_size(c), dtypes.uint16, x, *(w1 if st else (w1 if norm else x,)))
   # rows mode: had_a32d (every operand by DMA, lane-extract butterflies; at 4 rows rms 0.58 -> 0.075 ms a call, plain 0.29 -> 0.039,
   # swiglu 0.65 -> 0.106 on the board; the same bits as had_a32 on the simulator). QWEN_HAD_DMA=0: had_a32
-  def had_dma(self): return self.compact and os.environ.get("QWEN_HAD_DMA", "1") == "1" and self.had_g == 1 and self.had_b == HAD_B
+  def had_dma(self): return self.compact and os.environ.get("QWEN_HAD_DMA", "1") == "1" and self.had_g == 1 and (self.had_b == HAD_B or self.fast512())
+  # QWEN_HAD_FAST512 (default 1): Bonsai 2 2B / 4B's 512 blocks on had_fast v2 (hb = 512, the post 1 / sqrt(512) in its conversion)
+  # instead of had_rows + the plain packer. Byte-identical to had_a32(hb=512) on the simulator (2B and 4B widths, rows 1 / 4 / 8)
+  # and to had_rows on the board; 2-5x faster a call. 0: had_rows
+  def fast512(self): return self.had_b == 512 and self.had_fast() and os.environ.get("QWEN_HAD_FAST512", "1") == "1"
+  def _hbk(self): return "" if self.had_b == HAD_B else f"|hb{self.had_b}"      # the kernel / descriptor keys: unchanged at HAD_B
   # QWEN_HAD_FAST (default 1): had_fast.py's kernel (compact asm loops for the instruction fetch, no row re-fetch in rms's sums,
   # swiglu's sub-tiles by exact bytes; 4 rows on the board: rms 75 -> 46 us a call, plain 38 -> 25, swiglu 111 -> 78) with the
   # same bits as had_a32d (simulator and board gates). 0: had_a32d. "v2": the same
   # kernel with less executed text (rms 46 -> 41 us, plain 25 -> 22, swiglu 76 -> 69 at 4 rows); QWEN_HAD_V2=0: the "asm"+"swasm" one
   HAD_FAST_OPTS = ("v2",) if os.environ.get("QWEN_HAD_V2", "1") == "1" else ("asm", "swasm")
   def had_fast(self): return os.environ.get("QWEN_HAD_FAST", "1") == "1"
-  def had_d(self, mode, c, st):
+  def had_d(self, mode, c, st, req=False):
     if self.had_fast():
       import had_fast as HF
-      return self.key(f"had_a32d|fast|{mode}|{c}|{self.real}|{st}|{self.had_post}", HF.had_fast_src(mode, c, self.nrb, self.eps, self.real, stacked=st, post=self.had_post, opts=self.HAD_FAST_OPTS))
+      hb = None if self.had_b == HAD_B else self.had_b
+      return self.key(f"had_a32d|fast|{mode}|{c}|{self.real}|{st}|{self.had_post}{self._hbk()}{'|req' if req else ''}", HF.had_fast_src(mode, c, self.nrb, self.eps, self.real, stacked=st, post=self.had_post, opts=self.HAD_FAST_OPTS + (("req",) if req else ()), hb=hb))
+    assert not req, "req: had_fast v2 only"
     return self.key(f"had_a32d|{mode}|{c}|{self.real}|{st}|{self.had_post}", had_a32d_src(mode, c, self.nrb, self.eps, self.real, stacked=st, post=self.had_post))
   def had_desc(self, mode, c):
-    fast = self.had_fast(); dk = f"had_a32d_desc|{'fast|' if fast else ''}{mode}|{c}"
+    fast = self.had_fast(); dk = f"had_a32d_desc|{'fast|' if fast else ''}{mode}|{c}{self._hbk()}"
     if dk not in self.bufs:
       if fast:
         import had_fast as HF
-        self.bufs[dk] = Tensor(HF.had_fast_desc(mode, c, self.nrb, self.real, opts=self.HAD_FAST_OPTS), device=DEV).realize()
+        self.bufs[dk] = Tensor(HF.had_fast_desc(mode, c, self.nrb, self.real, opts=self.HAD_FAST_OPTS, hb=None if self.had_b == HAD_B else self.had_b), device=DEV).realize()
       else: self.bufs[dk] = Tensor(had_a32d_desc(mode, c, self.nrb, self.real), device=DEV).realize()
     return self.bufs[dk]
   def a_size(self, c):
     """halves of an A layout of K = c: compact (row block 0's rt tiles) in rows mode, else all row blocks' three tiles."""
     return (c // 128) * 32 * 16 * self.rt if self.compact else (c // 128) * self.nrb * 32 * 48
-  def swiglu_a(self, ct, m_, tag, act="silu"):
+  def _req_args(self, req):
+    """had_fast v2 "req"'s extra arguments: the DDR mirror, the REQ lines and their descriptor (cpu_req_copy's)."""
+    return () if req is None else (req, self.buf("cpu_req_w", 16 * NT, dtypes.int32), self.desc("cpu_flag_desc", cpu_flag_desc))
+  def _req_done(self, a, req):
+    """Record that `a` was produced with the REQ folded into `req` (Layers.lin_ct then skips cpu_req_copy for it)."""
+    if req is not None: self.req_folded[id(a)] = req
+    return a
+  def swiglu_a(self, ct, m_, tag, act="silu", req=None):
     """The down projection's A from the gate|up tiles: fp16(silu(g) u), or `act="gelu"` fp16(gelu_tanh(g) u) (Gemma 4: geglu_a32[d])."""
     if act != "silu":
       assert self.had is None, "GeGLU on a rotated-input model"
@@ -3866,14 +4125,16 @@ class Kernels:
         return self.run(self.key(f"{ACTS[act][1]}_a32d|{m_}|{self.real}", swiglu_a32d_src(m_, self.nrb, self.real, act)), tag, self.a_size(m_), dtypes.uint16, ct, self.bufs[dk])
       k = self.key(f"{ACTS[act][1]}_a32|{m_}|{self.real}|{self.compact}", swiglu_a32_src(m_, self.nrb, real=self.real, compact=self.compact, act=act))
       return self.run(k, tag, self.a_size(m_), dtypes.uint16, ct)
-    if self.had is not None and self.compact and os.environ.get("QWEN_HAD_ROWS", "1" if (self.had_b != HAD_B or self.had_g > 1) else "0") == "1":   # had_rows (swiglu from the tiles), then the plain packer
+    if self.had is not None and self.compact and os.environ.get("QWEN_HAD_ROWS", "1" if ((self.had_b != HAD_B and not self.fast512()) or self.had_g > 1) else "0") == "1":   # had_rows (swiglu from the tiles), then the plain packer
       k = self.key(f"had_rows|swiglu|{m_}|{self.real}|{self.had_post}|{self.had_g}|{self.had_b}", had_rows_src("swiglu", m_, self.nrb, self.eps, self.real, post=self.had_post, g=self.had_g, hb=self.had_b))
       ex = (self.desc("had_rows_sw_desc", had_rows_sw_desc),) if m_ % 48 == 0 else ()   # the DMA gather (else the plain tile loads: the 27B's 17408)
       rows = self.run(k, f"hadrows|{m_}", self.rows * m_, dtypes.float32, ct, *ex).reshape(self.rows, m_)
       saved = self.had; self.had = None
       try: return self.rms_a(rows, None, m_, tag, norm=False)
       finally: self.had = saved
-    if self.had is not None and self.had_dma(): return self.run(self.had_d("swiglu", m_, False), tag, self.a_size(m_), dtypes.uint16, ct, self.had_desc("swiglu", m_))
+    if self.had is not None and self.had_dma():
+      rq = req if self.had_fast() and "v2" in self.HAD_FAST_OPTS else None
+      return self._req_done(self.run(self.had_d("swiglu", m_, False, req=rq is not None), tag, self.a_size(m_), dtypes.uint16, ct, self.had_desc("swiglu", m_), *self._req_args(rq)), rq)
     if self.had is not None:                     # rotated inputs: the down projection's signs are in the up rows' scales
       k = self.key(f"had_a32|swiglu|{m_}|{self.real}|{self.compact}|{self.had_post}|{self.had_g}|{self.had_b}", had_a32_src("swiglu", m_, self.nrb, self.eps, real=self.real, compact=self.compact, post=self.had_post, g=self.had_g, hb=self.had_b))
       return self.run(k, tag, self.a_size(m_), dtypes.uint16, ct)
@@ -3907,8 +4168,30 @@ class Kernels:
       return self.run(k, tag, self.rows * c, dtypes.float32, x, ct, self.rd_desc(c)).reshape(self.rows, c)
     k = self.key(f"resid32|{c}|{self.real}", resid32_src(c, self.nrb, real=self.real))
     return self.run(k, tag, self.rows * c, dtypes.float32, x, ct).reshape(self.rows, c)
+  # resid32q and the RMSNorm's had_a32d that reads its row and record (the post norm after the o projection's residual,
+  # the next layer's input norm after the down projection's) as ONE launch (resid_had.py: every task runs the residual, keeps its
+  # own 512-block resident, transforms it) at one row on the rotated-input models with the fast had; the same bits (checked on the
+  # vendor simulator). QWEN_FUSE_RH=0: the two launches
+  def resid_had(self, x, ct, c, tag, w1, a_tag):
+    """out = x + C (resid32q's rows and record into `tag`) and the A of rmsnorm(out) * w1 (w1 = (stack [L, c], idx)) -> (rows, A)."""
+    if (self.had is not None and self.real == 1 and self.compact and isinstance(w1, tuple) and c % 16 == 0 and self.had_b == 512 and c % 512 == 0
+        and self.s2("QWEN_RQ") and self.had_dma() and self.had_fast() and "v2" in self.HAD_FAST_OPTS and os.environ.get("QWEN_FUSE_RH", "1") == "1"):
+      import resid_had as RH
+      k = self.key(f"resid_had|{c}|{self.had_post}|{self.had_b}", RH.resid_had_src(c, self.nrb, self.eps, post=self.had_post, hb=self.had_b))
+      rows = self.buf(tag, self.rows * c, dtypes.float32); rec = self.buf(f"rec|{tag}", REC_N, dtypes.float32)
+      d = self.desc(f"resid_had_desc|{c}|{self.had_b}", lambda: RH.resid_had_desc(c, self.nrb, self.had_b))
+      A = self.run(k, a_tag, self.a_size(c), dtypes.uint16, rows, x, ct, rec, *w1, d)
+      self.writers.setdefault(tag, set()).add("rq"); out = rows.reshape(self.rows, c)
+      self.tag_of.pop(self.last_out.get(tag), None); self.tag_of[id(out)] = (tag, out); self.last_out[tag] = id(out)
+      return out, A
+    out = self.resid(x, ct, c, tag); return out, self.rms_a(out, w1, c, a_tag)
   def unpack(self, ct, c, tag, goff=0):
-    """The C tiles -> fp32 rows [rows, c]; `goff`: the linear's tiles start at group goff of `ct` (a fused GEMM's slice)."""
+    """The C tiles -> fp32 rows [rows, c]; `goff`: the linear's tiles start at group goff of `ct` (a fused GEMM's slice); a pair: a
+    --gtail cache's q (the heads' q, their gates: Layers._meta), the rows interleaved back to [head: q | gate] (rows32i_src)."""
+    if isinstance(goff, tuple):
+      from qwen38_ref import NH, HD; assert c == NH * 2 * HD, (c, NH, HD)
+      k = self.key(f"rows32i|{c}|{self.real}|{goff}", rows32i_src(NH, HD, self.nrb, self.real, goff))
+      return self.run(k, tag, self.rows * c, dtypes.float32, ct).reshape(self.rows, c)
     if self.small_dma():
       k = self.key(f"rows32d|{c}|{self.real}|{goff}", rows32d_src(c, self.nrb, self.real, False, goff))
       return self.run(k, tag, self.rows * c, dtypes.float32, ct, self.rd_desc(c)).reshape(self.rows, c)
@@ -3940,9 +4223,20 @@ class Kernels:
       return self.run(self.key(f"head_top3rd|{nc}|{row}", head_top3d_src(nc, self.nrb, 1, row=row)), tag, NT * 8, dtypes.float32, ct, d)
     k = self.key(f"head_top3r|{nc}|{row}", head_top3_row_src(nc, self.nrb, row))
     return self.run(k, tag, NT * 8, dtypes.float32, ct)
-  def call(self, name, src, out, *ins):
+  def cpu_req(self):
+    """The split's REQ word set (cpu_req_src); `cpu_ack`: its ACK word awaited and cleared."""
+    return self.call("cpu_req", cpu_req_src(), self.buf("cpu_req_w", 16 * NT, dtypes.int32), self.desc("cpu_flag_desc", cpu_flag_desc))
+  def cpu_req_copy(self, a, mirror):
+    """REQ after copying the A `a` (GM staging or DDR) to the DDR `mirror` (cpu_req_copy_src): NT REQ lines."""
+    nb = mirror.shape[0] * mirror.dtype.itemsize
+    return self.call(f"cpu_req_copy|{nb}", cpu_req_copy_src(nb), self.buf("cpu_req_w", 16 * NT, dtypes.int32), mirror, a, self.desc(f"cpu_req_copy_desc{nb}", lambda: cpu_req_copy_desc(nb)))
+  def cpu_ack(self):
+    # one task: only task 0 polls and clears the word, and a chained 12-task launch costs the job ~11.8 us of device time, a 1-task
+    # one ~3.8 (board: -1.7 ms a 27B verify pass)
+    return self.call("cpu_ack|t1", cpu_ack_src(), self.buf("cpu_ack_w", 16, dtypes.int32), self.desc("cpu_flag_desc", cpu_flag_desc), ntasks=1)
+  def call(self, name, src, out, *ins, ntasks=NT):
     """A registered csrc kernel into an existing buffer `out` (persistent, realised), returned."""
-    OA.csrc_call(self.key(name, src), out, *ins).realize(); return out
+    OA.csrc_call(self.key(name, src, ntasks), out, *ins).realize(); return out
   def head_reduce(self, c0s, tag="ids_head"):
     """The head's ids and probabilities on the device (head_reduce_src) from the parts' partials top_head0.. -> int32 [16 ceil(2 m / 16)]."""
     m = self.real; dk = f"head_reduce_desc{m}"
@@ -3992,22 +4286,32 @@ class Kernels:
     if "gdn_lsr_desc" not in self.bufs: self.bufs["gdn_lsr_desc"] = Tensor(gdn_lsr_desc(DK, DV), device=DEV).realize()
     o = self.buf(f"gdn_lsr_o{n}", n * NV * DV, dtypes.float32)
     OA.csrc_call(kk, o, Sall, idx, q, k, v, beta, decay, self.bufs["gdn_lsr_desc"]).realize(); return o.reshape(n, NV, DV)
-  def gdn_tokm(self, Sall, Call, idx, posb, qkv_ct, z_ct, xin, wab, adt, cwt, nw, banks, rawm, NV, NK, DK, DV, C, CONV, H, NG, xoff=0, zoff=0, rows=False, defer=None):
+  def gdn_tokm(self, Sall, Call, idx, posb, qkv_ct, z_ct, xin, wab, adt, cwt, nw, banks, rawm, NV, NK, DK, DV, C, CONV, H, NG, xoff=0, zoff=0, rows=False, defer=None, raw=False, pre_onorm=None):
     """gdn_tok3 for the `real` rows as consecutive tokens (the verify pass) -> `a_o` rows 0..real-1; the per-token state banks and
     the raw rows for gdn_commit. M > GDN_WAVE: the tokens in waves (gdn_tokm_waves_src, its DMA-staged preparation always).
     `xoff` / `zoff`: the qkv / z tiles start at those groups of their buffers (the fused qkv|z GEMM: one buffer, z at zoff).
-    `rows`: the outputs as fp32 rows in the persistent `o_rows` instead (a rotated-input model; gdn_tokm_src(rows_out=True))."""
+    `rows`: the outputs as fp32 rows in the persistent `o_rows` instead (a rotated-input model; gdn_tokm_src(rows_out=True)).
+    `raw` (rows, the deferred commit, NV % NT == 0): gdn_fast_src(raw) then gdn_onorm over every head (the gate z read after the
+    recurrence); `pre_onorm()` runs in between (the CPU split's ACK of its z columns)."""
     M = self.real; assert self.compact and 1 <= M <= 12
     diag = tuple(x for x in os.environ.get("GDN_TOKM_DIAG", "").split(",") if x)   # timing diagnostics (gdn_tokm_src)
     prep = gdn_prep()                                                              # "dma" (default) / "dma-lsarr": gdn_tokm_src's DMA-staged preparation; "fast" / "cached"
     if defer is not None and gdn_fast() != "off":   # (MS, accb): the deferred commit, fused sweeps (gdn_fast_src), M <= 8
       assert not diag                                # (not rows: o_proj's compact A straight from the kernel, gdn_fast_src(a_out))
       MS, accb = defer; sw = gdn_fast(); fd = tuple(x for x in os.environ.get("GDN_FAST_DIAG", "").split(",") if x)   # timing diagnostics
-      kk = self.key(f"gdn_tokm|{M}|fast{MS}|{sw}|{fd}|{xoff}|{zoff}{'' if rows else '|a'}", ct_goff(gdn_fast_src(NV, NK, DK, DV, C, CONV, H, self.nrb, self.eps, M, NG, MS, sweeps=sw, diag=fd, a_out=not rows), self.nrb, (xoff, zoff), ("x", "z")))
-      dk = f"gdn_fast_desc{M}|{MS}{'' if rows else '|a'}"
-      if dk not in self.bufs: self.bufs[dk] = Tensor(gdn_fast_desc(DK, DV, H, gdn_hpt(NV), M, MS, C, CONV, NV=NV, a_out=not rows), device=DEV).realize()
+      sp = gdn_split_for(NV, M, rows)                                # the 2B: 16 heads over 12 tasks at the prompt chunks' 8 rows (-22 % a task)
+      # raw rows: whole heads a task (the 27B's 48 heads; the 2B's 16 at <= 4 rows, 2 a task on 8 tasks -- gdn_onormd's plan), or the
+      # split plan, whose rows are raw anyway: either way gdn_onorm reads the gate z after the kernel, so pre_onorm runs between
+      raw = raw and rows and sp is None and NV % gdn_hpt(NV) == 0 and (NV % NT == 0 or M <= 4)
+      assert pre_onorm is None or raw or sp, "gdn_tokm: pre_onorm (the CPU split's z ACK) needs the raw rows or the split plan"
+      kk = self.key(f"gdn_tokm|{M}|fast{MS}|{sw}|{fd}|{xoff}|{zoff}{'' if rows else '|a'}{'|split' if sp else ''}{'|raw' if raw else ''}", ct_goff(gdn_fast_src(NV, NK, DK, DV, C, CONV, H, self.nrb, self.eps, M, NG, MS, sweeps=sw, diag=fd, a_out=not rows, split=sp, raw=raw), self.nrb, (xoff, zoff), ("x", "z")))
+      dk = f"gdn_fast_desc{M}|{MS}{'' if rows else '|a'}{'|split' if sp else ''}{'|raw' if raw else ''}"
+      if dk not in self.bufs: self.bufs[dk] = Tensor(gdn_fast_desc(DK, DV, H, gdn_hpt(NV), M, MS, C, CONV, NV=NV, a_out=not rows, split=bool(sp), raw=raw), device=DEV).realize()
       if not rows: return self.run(kk, "a_o", self.a_size(NV * DV), dtypes.uint16, Sall, Call, idx, posb, qkv_ct, z_ct, xin, wab, adt, cwt, nw, self.bufs[dk], banks, rawm, accb)
-      return self.run(kk, "o_rows", self.rows * NV * DV, dtypes.float32, Sall, Call, idx, posb, qkv_ct, z_ct, xin, wab, adt, cwt, nw, self.bufs[dk], banks, rawm, accb).reshape(self.rows, NV * DV)
+      o = self.run(kk, "o_rows", self.rows * NV * DV, dtypes.float32, Sall, Call, idx, posb, qkv_ct, z_ct, xin, wab, adt, cwt, nw, self.bufs[dk], banks, rawm, accb)
+      if (raw or sp) and pre_onorm is not None: o = o.realize(); pre_onorm()   # (the kernel realized first: else the ACK's wait runs before it)
+      if sp or raw: o = self.gdn_onorm(o, z_ct, idx, nw, NV, DV, M, NG, list(range(NV)), zoff)   # (OB: every head's rows raw)
+      return o.reshape(self.rows, NV * DV)
     if defer is not None:    # (MS, accb): the commit deferred to the next verify pass (gdn_defer_src; QWEN_GDN_FAST=off)
       assert rows and prep == "dma" and not diag
       MS, accb = defer
@@ -4023,6 +4327,16 @@ class Kernels:
     if rows:                 # fp32 rows into the persistent o_rows (rows 0..M-1), for had_a32's o_proj A (gdn_tokm_src(rows_out=True))
       return self.run(kk, "o_rows", self.rows * NV * DV, dtypes.float32, Sall, Call, idx, posb, qkv_ct, z_ct, xin, wab, adt, cwt, nw, self.bufs[dk], banks, rawm).reshape(self.rows, NV * DV)
     return self.run(kk, "a_o", self.a_size(NV * DV), dtypes.uint16, Sall, Call, idx, posb, qkv_ct, z_ct, xin, wab, adt, cwt, nw, self.bufs[dk], banks, rawm)
+  def gdn_onorm(self, o, z_ct, idx, nw, NV, DV, M, NG, heads, zoff=0):
+    """gdn_fast_src(split)'s raw output rows of the split heads normed in place (gdn_onorm_src) -> the same o_rows buffer.
+    Every head at <= 4 rows, NV % NT == 0 (gdn_fast_src(raw)): gdn_onormd_src, the rows and z by DMA (QWEN_ONORM_DMA=0: the loads)."""
+    hpt = gdn_hpt(NV)
+    if list(heads) == list(range(NV)) and M <= 4 and NV % hpt == 0 and NV // hpt <= NT and os.environ.get("QWEN_ONORM_DMA", "1") == "1":
+      kk = self.key(f"gdn_onormd|{M}|{zoff}", ct_goff(gdn_onormd_src(NV, DV, M, self.nrb, self.eps, hpt), self.nrb, (zoff,), ("z",)))
+      d = self.desc(f"gdn_onormd_desc|{M}", lambda: gdn_onormd_desc(NV, DV, M, self.nrb, hpt))
+      OA.csrc_call(kk, o, z_ct, idx, nw, d).realize(); return o
+    kk = self.key(f"gdn_onorm|{M}|{zoff}|{','.join(map(str, heads))}", ct_goff(gdn_onorm_src(NV, DV, M, self.nrb, self.eps, heads, NG), self.nrb, (zoff,), ("z",)))
+    OA.csrc_call(kk, o, z_ct, idx, nw).realize(); return o
   def gdn_commit(self, Sall, banks, Call, rawm, accb, posb, NV, DK, DV, C, CONV, M, NG, ring_only=False):
     """Every DeltaNet layer to the state after the accepted tokens (`accb` [1] = a) and their raw rows into the rings."""
     kk = self.key(f"gdn_commit|{M}{'|ring' if ring_only else ''}", gdn_commit_src(NV, DK, DV, C, CONV, M, NG, ring_only=ring_only))
@@ -4056,10 +4370,10 @@ class Kernels:
     dk = f"gdn_tokm_desc{M}defer{MS}"
     if dk not in self.bufs: self.bufs[dk] = Tensor(np.concatenate([gdn_tokm_desc(DK, DV, H, gdn_hpt(NV), M, C=C, CONV=CONV), gdn_defer_desc(M, MS)]), device=DEV).realize()
     return self.run(kk, "o_rows", self.rows * NV * DV, dtypes.float32, Sall, Call, idx, posb, qkv_ct, z_ct, xin, wab, adt, cwt, nw, self.bufs[dk], banks, rawm, pathb, treeb).reshape(self.rows, NV * DV)
-  def gdn_flush(self, Sall, banks, accp, NV, DK, DV, NG, MS, tree=False):
+  def gdn_flush(self, Sall, banks, accp, NV, DK, DV, NG, MS, tree=False, split=False):
     """The deferred commit's pending updates (`accp`: accb, or the leaf tree's pathb) applied to every layer's state now
     (gdn_flush_src: before a plain decode step); the caller clears the pending count."""
-    kk = self.key(f"gdn_flush|{MS}{'|tree' if tree else ''}", gdn_flush_src(NV, DK, DV, NG, MS, tree=tree))
+    kk = self.key(f"gdn_flush|{MS}{'|tree' if tree else ''}{'|split' if split else ''}", gdn_flush_src(NV, DK, DV, NG, MS, tree=tree, split=split))
     dk = f"gdn_flush_desc{MS}"
     if dk not in self.bufs: self.bufs[dk] = Tensor(gdn_flush_desc(DK, DV, MS), device=DEV).realize()
     OA.csrc_call(kk, Sall, banks, accp, self.bufs[dk]).realize()
@@ -4083,11 +4397,18 @@ class Kernels:
     part = self.run(kp, "attn_part", NH * M * P * (HD + 16), dtypes.float32, q_rows, kv_rows, qnw, knw, rope, Kall, Vall, idx, self.bufs["attn_part_desc"], treeb)
     kc = self.key(f"attn_comb|{TMAX}|{M}", attn_comb_src(NH, HD, M, TMAX))
     return self.run(kc, "o_rows", self.rows * NH * HD, dtypes.float32, part, q_rows).reshape(self.rows, NH * HD)
-  def attn_decm(self, q_rows, kv_rows, qnw, knw, rope, Kall, Vall, idx, NH, NKV, HD, TMAX, ROT, nidx=False, kvb=0, kvh=False):
+  def attn_gt_ok(self):
+    """attn_decm's gate-tail path (q compact, the gates read from the C tiles: attn_gqa_src(qc), attn_comb2_src(gc)) applies: the
+    split attention on the kv-head kernels, <= 4 rows."""
+    return os.environ.get("QWEN_ATTN", "split") == "split" and attn_gqa_on() and self.compact and self.real <= 4
+  def attn_decm(self, q_rows, kv_rows, qnw, knw, rope, Kall, Vall, idx, NH, NKV, HD, TMAX, ROT, nidx=False, kvb=0, kvh=False, gate=None, pre_comb=None):
     """attn_dec2 for the `real` rows at positions pos .. pos + real - 1 -> the persistent o_rows: attn_part + attn_comb (the cache
-    streamed through LSRAM by (head, position slice) units); QWEN_ATTN=decm: the one-kernel attn_decm_src. `nidx`: attn_gqa_src's."""
+    streamed through LSRAM by (head, position slice) units); QWEN_ATTN=decm: the one-kernel attn_decm_src. `nidx`: attn_gqa_src's.
+    `gate` (a --gtail cache: attn_gt_ok): (the fused C tiles, the gates' first group) -- q_rows holds the heads' q alone [rows, NH HD]
+    and attn_comb reads the gates from the tiles; `pre_comb`: called between attn_part and attn_comb (the CPU split's gate ACK)."""
     if os.environ.get("QWEN_ATTN", "split") == "split" and attn_gqa_on():
-      return self._attn_gqa(q_rows, kv_rows, qnw, knw, rope, Kall, Vall, idx, None, NH, NKV, HD, TMAX, ROT, nidx=nidx, kvb=kvb, kvh=kvh)
+      return self._attn_gqa(q_rows, kv_rows, qnw, knw, rope, Kall, Vall, idx, None, NH, NKV, HD, TMAX, ROT, nidx=nidx, kvb=kvb, kvh=kvh, gate=gate, pre_comb=pre_comb)
+    assert gate is None and pre_comb is None, "the gate-tail path: the kv-head kernels (QWEN_ATTN=split, QWEN_ATTN_GQA=1)"
     assert not nidx and not kvb and not kvh, "the norm index word is attn_gqa's (QWEN_ATTN_GQA=1)"
     if os.environ.get("QWEN_ATTN", "split") == "split":
       M = self.real; P = attn_parts(NH, HD, TMAX)
@@ -4098,18 +4419,21 @@ class Kernels:
       return self.run(kc, "o_rows", self.rows * NH * HD, dtypes.float32, part, q_rows).reshape(self.rows, NH * HD)
     kk = self.key(f"attn_decm|{TMAX}|{self.real}", attn_decm_src(NH, NKV, HD, TMAX, ROT, self.eps, self.real))
     return self.run(kk, "o_rows", self.rows * NH * HD, dtypes.float32, q_rows, kv_rows, qnw, knw, rope, Kall, Vall, idx).reshape(self.rows, NH * HD)
-  def _attn_gqa(self, q_rows, kv_rows, qnw, knw, rope, Kall, Vall, idx, treeb, NH, NKV, HD, TMAX, ROT, nidx=False, kvb=0, kvh=False):
+  def _attn_gqa(self, q_rows, kv_rows, qnw, knw, rope, Kall, Vall, idx, treeb, NH, NKV, HD, TMAX, ROT, nidx=False, kvb=0, kvh=False, gate=None, pre_comb=None):
     """attn_part / attn_partt + attn_comb as the kv-head kernels (attn_gqa.py): the same records, the same o_rows, byte for byte
-    (checked on the vendor simulator). `treeb` None: the chain rule; else the tree table."""
+    (checked on the vendor simulator). `treeb` None: the chain rule; else the tree table. `gate`, `pre_comb`: attn_decm's."""
     import attn_gqa as AG
-    M = self.real; P, _ = attn_plan(NH, HD, TMAX); tree = treeb is not None; nte = attn_gqa_nte(M, NH, NKV, HD, TMAX)
-    dk, ck = f"attn_gqa_desc{M}", f"attn_comb2_desc{M}"
-    if dk not in self.bufs: self.bufs[dk] = Tensor(AG.attn_gqa_desc(NH, NKV, HD, TMAX, M), device=DEV).realize()
-    if ck not in self.bufs: self.bufs[ck] = Tensor(AG.attn_comb2_desc(NH, HD, TMAX, M), device=DEV).realize()
-    kp = self.key(f"{'attn_partt' if tree else 'attn_part'}|gqa|{TMAX}|{M}|{nte}|{nidx}|{kvb}|{kvh}", AG.attn_gqa_src(NH, NKV, HD, TMAX, ROT, self.eps, M, tree=tree, NTE=nte, nidx=nidx, kvb=kvb, kvh=kvh))
+    M = self.real; P, _ = attn_plan(NH, HD, TMAX); tree = treeb is not None; nte = attn_gqa_nte(M, NH, NKV, HD, TMAX); qc = gate is not None
+    assert not (qc and tree) and (not qc or self.attn_gt_ok()), "the gate-tail path: the chain rule, <= 4 rows"
+    gc = (gate[1], self.nrb) if qc else None
+    dk, ck = f"attn_gqa_desc{M}{'|qc' if qc else ''}", f"attn_comb2_desc{M}{f'|gc{gc}' if qc else ''}"
+    if dk not in self.bufs: self.bufs[dk] = Tensor(AG.attn_gqa_desc(NH, NKV, HD, TMAX, M, qc=qc), device=DEV).realize()
+    if ck not in self.bufs: self.bufs[ck] = Tensor(AG.attn_comb2_desc(NH, HD, TMAX, M, gc=gc), device=DEV).realize()
+    kp = self.key(f"{'attn_partt' if tree else 'attn_part'}|gqa|{TMAX}|{M}|{nte}|{nidx}|{kvb}|{kvh}{'|qc' if qc else ''}", AG.attn_gqa_src(NH, NKV, HD, TMAX, ROT, self.eps, M, tree=tree, NTE=nte, nidx=nidx, kvb=kvb, kvh=kvh, qc=qc))
     part = self.run(kp, "attn_part", NH * M * P * (HD + 16), dtypes.float32, q_rows, kv_rows, qnw, knw, rope, Kall, Vall, idx, self.bufs[dk], *([treeb] if tree else []))
-    kc = self.key(f"attn_comb|dma|{TMAX}|{M}", AG.attn_comb2_src(NH, HD, TMAX, M))
-    return self.run(kc, "o_rows", self.rows * NH * HD, dtypes.float32, part, q_rows, self.bufs[ck]).reshape(self.rows, NH * HD)
+    if pre_comb is not None: pre_comb()
+    kc = self.key(f"attn_comb|dma|{TMAX}|{M}{f'|gc{gc}' if qc else ''}", AG.attn_comb2_src(NH, HD, TMAX, M, gc=gc))
+    return self.run(kc, "o_rows", self.rows * NH * HD, dtypes.float32, part, gate[0] if qc else q_rows, self.bufs[ck]).reshape(self.rows, NH * HD)
   def attn_prefill(self, q_rows, kv_rows, qnw, knw, rope, Kall, Vall, idx, NH, NKV, HD, TMAX, ROT):
     """The prefill's causal attention over its `real` rows at positions 0..real-1, every row moved by DMA (attn_pkv: k / v into
     the cache of layer idx[0]; attn_ppart: the slice records; attn_pcomb: o with the gate) -> the persistent o_rows [rows, NH HD]

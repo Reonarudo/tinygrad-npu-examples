@@ -19,8 +19,25 @@ from zy import OA                                                        # noqa:
 import qwen38_ref as R                                                   # noqa: E402
 from qwen38_kernels import ATT_BT, ring_pitch                            # noqa: E402
 import qwen38_kernels as QK                                              # noqa: E402
-from qwen38_npu import Layers, dev, poke, DEV, read_into, memmove_threads, GDN_TOK, KS, Q8MODE, SCALES, TERN_KW, slot_map_nodrain   # noqa: E402
+from qwen38_npu import Layers, dev, poke, sync, DEV, read_into, memmove_threads, GDN_TOK, KS, Q8MODE, SCALES, TERN_KW, slot_map_nodrain   # noqa: E402
 from qwen38_tokenize import Tok, chat_text, EOS                         # noqa: E402
+
+# QWEN_JIT_FAST=1 (default 0): a captured TinyJit replayed without tinygrad's _prepare_jit_inputs -- it rewrites every input
+# tensor's graph on each call (~0.45 of the 0.6 ms a 4-layer block's call takes on the O6N: ~20 inputs), though the inputs are the
+# same realised buffers every pass. jcall looks each input's buffer up once (by its UOp, kept alive here) and calls the captured
+# JIT itself; the first replay still goes through TinyJit (its check of the inputs against the capture), and a JIT with bound
+# variables always does.
+JIT_FAST = os.environ.get("QWEN_JIT_FAST", "0") == "1"; _JBUF = {}
+def jcall(jit, *args):
+  cap = jit.captured
+  if not JIT_FAST or cap is None or jit.cnt < 3 or any(x[1] for x in cap.expected_input_info): return jit(*args)
+  ib = []
+  for t in args:
+    u = t.uop
+    if (b := _JBUF.get(u)) is None:
+      b = u.base.realized; assert b is not None and u.base is u, "jcall: a realised buffer tensor"; _JBUF[u] = b
+    ib.append(b)
+  jit.cnt += 1; return cap(ib, {})
 
 def one_job():
   """A context for the TinyJit call that captures: its kernels in one graph (JIT_BATCH_SIZE=0) and one chain (the zhouyi backend's
@@ -91,6 +108,8 @@ def rope_tables(pos0, Rr):
 #   csrc  the attention by attn_pkv / attn_ppart / attn_pcomb (Kernels.attn_prefill): every row by DMA, no generated kernel; the
 #         k / v rows go into the cache from the kernel (prefill's cache copy is skipped)
 ATT_PRE = os.environ.get("QWEN_ATTN_PREFILL", "csrc") or "none"
+HEAD_OVERLAP = os.environ.get("QWEN_HEAD_OVERLAP", "0") == "1"           # the verify head's job submitted under the last block (one CPU split schedule for both)
+IDS_FOLD = os.environ.get("QWEN_IDS_FOLD", "0") == "1"                   # QWEN_NPU_IDS' two small jobs a verify pass folded: the embedding into block 0's job, the acceptance into the head's
 NPU_IDS = os.environ.get("QWEN_NPU_IDS", "0") == "1"                     # the token ids chosen, embedded and accepted on the NPU (head_reduce, ...)
 # The decode loop's jobs and host work:
 #   QWEN_RING_COMMIT (1): the deferred commit's copies by ring_commit (one kernel for every geometry, the same bytes as gdn_commit_tree(defer) /
@@ -101,6 +120,9 @@ NPU_IDS = os.environ.get("QWEN_NPU_IDS", "0") == "1"                     # the t
 #   QWEN_MTPIN (dma):     the device's MTP input rows by mtpin_d_src (12 tasks, DMA) | task (mtpin_src, one task a row); the same bits
 RING_COMMIT = os.environ.get("QWEN_RING_COMMIT", "1") == "1"
 COMMIT_FOLD = os.environ.get("QWEN_COMMIT_FOLD", "1") == "1"
+# the prompt's chunks (prefill_chunks): each chunk's commit run by the next chunk's first layer-block job (_verify_blocks), not as a
+# job of its own between them -- the chunk boundary's device idle was ~2.4 ms + the commit's job ~1.2 ms on the 2B's 8-row chunks
+PREFILL_FOLD = os.environ.get("QWEN_PREFILL_FOLD", "1") == "1"
 STREAM_LATE = os.environ.get("QWEN_STREAM_LATE", "1") == "1"          # the verify pass's streamed layers: Layers.after_submit (no sync in load)
 DRAFT_JOB = os.environ.get("QWEN_DRAFT_JOB", "1") == "1"
 MTPIN_DMA = os.environ.get("QWEN_MTPIN", "dma") == "dma"
@@ -205,6 +227,12 @@ class Model:
     # QWEN_DUMP_HIDDEN=path: the last layer's output (before the final norm) at every position, saved with the ids (the MTP
     # head's input, from which its draft acceptance can be measured)
     self.dump = [] if os.environ.get("QWEN_DUMP_HIDDEN") else None
+    # QWEN_DUMP_GDN=l1,l2: those DeltaNet layers' inputs at every committed position -- the residual row x the layer reads (its a | b,
+    # q / k / v come from it) and its raw conv row (q | k | v before the conv, as gdn_tokm leaves it for the ring commit): enough to
+    # re-run the layer's recurrence off the board (the ReaDy arm of the drafter plan). Layers at block starts only (the input of block
+    # b + 1's first layer is in xiov0 after block b's job); l == NL is a check (that row is the last layer's output, v_hidden).
+    self.gdump_layers = [int(v) for v in os.environ.get("QWEN_DUMP_GDN", "").split(",") if v]
+    self.gdump = {l: [] for l in self.gdump_layers}; self._gd_x, self._gd_raw = {}, {}
     self.pre = Layers(n_prompt, cache); self.dec = Layers(1, cache); self.dec.slots = self.pre.slots; self.dec._inflight = self.pre._inflight
     self.GDN_LIN = Layers.files(self.pre._meta(R.LAYER_TYPES.index("linear"))[0]); self.ATT_LIN = Layers.files(self.pre._meta(R.LAYER_TYPES.index("full"))[0])
     if os.environ.get("QWEN_DEBUG"): print(f"   linears: DeltaNet {self.GDN_LIN}, attention {self.ATT_LIN}", flush=True)
@@ -333,11 +361,24 @@ class Model:
     fast = QK.gdn_fast() != "off"
     self.defer = (R.HAD or fast or self.leaf) and (not self.tree or self.leaf) and M <= (QK.GF_MS if fast else 5 if self.leaf else 4) and os.environ.get("QWEN_GDN_DEFER", "1") == "1"
     self.pend = False                                                     # (defer: a verify pass's accepted updates not yet in Sall; step() flushes them)
+    self.gdn_raw = os.environ.get("QWEN_GDN_RAW", "0") == "1"             # the chain verify's gdn kernel writes raw rows, gdn_onorm gates them after (gdn_fast_src(raw))
     assert self.defer or not self.leaf, f"QWEN_SPEC_TREE=leaf: the deferred DeltaNet commit (QWEN_GDN_DEFER=1), QWEN_SPEC <= {QK.GF_MS if fast else 5}"
-    if self.defer: self.banks = K.buf("gdn_kvb", self.NGDN * R.NV * M * QK.GD_SLOT + (QK.gdn_fast_scratch(M) if fast else 0), dtypes.float32)
+    # the 2B's 16 heads over 12 tasks (gdn_split_plan) at > 4 rows only (QK.gdn_split_for): those passes keep their records in two
+    # parities, the <= 4-row passes in one. A pass reads the pending records of a pass of its own kind; else they are flushed first
+    # (verify: `pend_split`; the plain path's 8-row passes after a 2-3-row last prompt chunk read the other layout before 2026-11-17)
+    self.gsplit = fast and not self.tree and R.NV % QK.NT != 0 and QK.gdn_split() and R.HAD and M > 4
+    NPAR = 2 if self.gsplit else 1
+    if self.defer: self.banks = K.buf("gdn_kvb", self.NGDN * R.NV * NPAR * M * QK.GD_SLOT + (QK.gdn_fast_scratch(M) if fast else 0), dtypes.float32)
     else: self.banks = K.buf("gdn_banks", (M - 1) * self.NGDN * SZ, dtypes.float32)      # the state after tokens 0..M-2, every DeltaNet layer
+    # QWEN_SPEC > 4 (the 8-row prompt chunks beside the <= 4-row decode passes): the decode geometries keep the 4-slot deferred commit
+    # (gdn_fast_cfg at MS 8 pushes the 4-row kernel to half v rows, VG 2: ~1-2 % of decode) in a bank buffer of their own; a pass whose
+    # pending updates sit in the other buffer flushes them first (verify / flush: `pend_ms`). Chain mode, the fused kernel only.
+    self.ms_split = self.defer and fast and not self.tree and M > 4 and os.environ.get("QWEN_MS_SPLIT", "1") == "1"
+    self.banks4 = K.buf("gdn_kvb4", self.NGDN * R.NV * 4 * QK.GD_SLOT + QK.gdn_fast_scratch(4), dtypes.float32) if self.ms_split else None   # (<= 4 rows: never split)
+    self.rec_par = 0                                                      # (gsplit) the parity the next pass reads its pending records at
+    self.pend_ms, self.pend_split = M, False                                # the pending records' slots a head, and their layout (_gsp)
     self.rawm = K.buf("gdn_raw", self.NGDN * M * self.CP, dtypes.float32)             # the M raw conv rows, every DeltaNet layer: [NG][M][CP]
-    self.accb = K.buf("acc_b", 1, dtypes.int32)
+    self.accb = K.buf("acc_b", 4, dtypes.int32)                            # [a, the record parity (gsplit), 0, 0]
     self.jit_vgdn, self.jit_vatt, self.jit_head, self.jit_d1 = {}, {}, {}, {}
     self.pcommit = None                                                   # a commit left for the next draft pass's job (commit(fold=True))
     # adaptive draft depth: after the first draft, the chain goes on only while the draft head's probability of its draft is
@@ -389,14 +430,14 @@ class Model:
     g = self.W.g; kind, dims, raw = g.raw("token_embd.weight"); assert kind == "PTQ1_0" and dims[0] == R.H, (kind, dims)
     self.e_vocab = int(dims[1]); self.etab = dev(np.array(np.frombuffer(raw, np.uint8)))   # (a copy: the GGUF map is read-only)
     s_ = g.had.signs.get(R.H) if "token_embd.weight" in g.had.inverse else None
-    self.esign = dev(np.ones(R.H, np.float32) if s_ is None else np.asarray(s_, np.float32)); self.edesc = dev(QK.embed_tern_desc(R.H))
+    self.esign = dev(np.ones(R.H, np.float32) if s_ is None else np.asarray(s_, np.float32)); self.edesc = dev(QK.embed_tern_desc(R.H, R.HADB))
     K = self.ver.K
     self.vtok, self.dtok, self.nxtb, self.acco = (K.buf(t, 16, dtypes.int32) for t in ("ids_vt", "ids_dt", "ids_nxt", "ids_acc"))
     self.embrows = K.buf("emb_rows", 16 * R.H, dtypes.float32)
     self.ne1, self.nh1, self.fn1 = (dev((1.0 + w).astype(np.float32)) for w in (self.mtp_ne, self.mtp_nh, self.fnorm))
     self.jd = dev(np.zeros(16, np.int32)); self.jit_ids = {}
   def _embed_dev(self, K, m, out, ids):
-    return K.call(f"embed_tern|{m}|{R.H}|{self.e_vocab}", QK.embed_tern_src(m, R.H, self.e_vocab, R.H), out, ids, self.etab, self.esign, self.edesc)
+    return K.call(f"embed_tern|{m}|{R.H}|{self.e_vocab}|{R.HADB}", QK.embed_tern_src(m, R.H, self.e_vocab, R.H, hb=R.HADB), out, ids, self.etab, self.esign, self.edesc)
   def _jid(self, key, fn):
     """The small id / row kernels as one JIT submission each (`self.jd`: a dummy input; no kernel reads a JIT input)."""
     if key not in self.jit_ids: self.jit_ids[key] = TinyJit(fn)
@@ -462,7 +503,7 @@ class Model:
     if commit_fn is not None: commit_fn()
     if rows_fn is not None: rows_fn(None)
     nm = len(self.MTP_LIN); out = self.mtp_step(m, aix, *views[:nm])
-    if devhead: return self._head_parts(L, out, self.mtp_norm_w1, hp, n, c0s, pick, x3, *views[nm:])
+    if devhead: return self._head_parts(L, out, self.mtp_norm_w1, hp, n, c0s, pick, x3, *views[nm:], split=True)
     for i in range(n): self._head_part(L, i, out, self.mtp_norm_w1, views[nm + i], top3=top3, hp=hp)
     return out
   def _take_commit(self):
@@ -481,7 +522,9 @@ class Model:
       own = self._mtp_map_own(); views = [own[k] for k in self.MTP_LIN] + self._dhead_views(hp, parts)
       key = ("d1", rows[0], m, pick, x3, cm[0] if cm else None)
       if key not in self.jit_d1: self.jit_d1[key] = TinyJit(functools.partial(self._draft1, m, rows[1], cm[1] if cm else None, L, hp, len(parts), c0s, pick, x3, False, True))
-      with one_job(): o = self.jit_d1[key](self.aix[self.NATT], *views)
+      sp = self._draft_arm(m, len(parts) if hp is self.mhead else 0)    # (QWEN_CPU_SPLIT head= / QWEN_CPU_SPLIT_MTP: split steps in the job)
+      with one_job(): o = jcall(self.jit_d1[key], self.aix[self.NATT], *views)
+      if sp is not None: sp.wait()
       ids, pr = self._head_out(o, L, parts, c0s, x3)
       self._draft_feats(r); self.prof["mtp_dev"] = self.prof.get("mtp_dev", 0.0) + time.perf_counter() - t0
       return m, ids, pr
@@ -493,7 +536,9 @@ class Model:
       zc["raw"].slot_map(zc["slots"][0][0], self.mtp_w[0], 0, self.mtp_w[2]); zc.setdefault("slot_src", [None, None])[0] = None
       views = zc["views"][(0, "full")]
     if m not in self.jit_mtp: self.jit_mtp[m] = TinyJit(functools.partial(self.mtp_step, m))
+    sp = self._draft_arm(m, 0)
     with one_job(): out = self.jit_mtp[m](self.aix[self.NATT], *[views[k] for k in self.MTP_LIN])   # (the capture: one job)
+    if sp is not None: sp.wait()
     ids, pr = self._head_top_dev(out, self._dheadL(m), self.mtp_norm_w1, self.dhead, self.dhead["parts"][:self.draft_parts], pick=pick, x3=pick if self.leaf else False)
     self._draft_feats(r); self.prof["mtp_dev"] = self.prof.get("mtp_dev", 0.0) + time.perf_counter() - t0
     return m, ids, pr
@@ -519,13 +564,22 @@ class Model:
     """Capture every verify geometry's (and the MTP layer's) JITs up front -- a capture pass costs ~1.2 s more than a replay --
     with throwaway passes at position 0, before any prefill: prefill rebuilds every state they touch (the DeltaNet states, the
     caches' low positions; the rings are never written by a verify pass)."""
-    t0 = time.perf_counter()
+    t0 = time.perf_counter(); self._warm = True                         # (QWEN_IDS_FOLD: the head job's acceptance writes vt[0]; no check of vt in these passes)
     for m in self.geos:
       for _ in range(2): self.verify([0] * m, 0)                       # TinyJit: the second call captures, the third replays
+    if PREFILL_FOLD and self.blk > 1 and self.ringc and (R.Q8 or os.environ.get("QWEN_PREFILL") == "chunked"):   # the prompt chunks' block 0, the previous chunk's commit folded
+      self._prompt_pass = True                                          # (QWEN_PREFILL_FOLD; the words copy nothing: a = 0)
+      for m in self.geos:
+        for _ in range(2):
+          poke(self.cwords, np.array([0, self.M, 0, -1, -1] + [0] * self.M, np.int32)); self.pcommit = self._commit_call(m); self.verify([0] * m, 0, head=None)
+      self._prompt_pass = False; self.pcommit = None; poke(self.cwords, np.zeros(QK.RC_W + self.M, np.int32))
     if self.MTPL:
       for g in self.mtp_geos:
         for _ in range(2): self.mtp_pass(np.zeros((g, 2 * R.H), np.float32), 0)
+        if self.mtp_prompt:
+          for _ in range(2): self.mtp_pass(np.zeros((g, 2 * R.H), np.float32), 0, head=False)   # (QWEN_MTP_PROMPT: the layer alone)
       if os.environ.get("QWEN_DRAFT_WARM", "1") == "1": self._draft_warmup()
+    self._warm = False
     gb = sum(t.nbytes() for V_ in self.vers.values() for t in V_.K.bufs.values()) / 1e9   # every verify / draft geometry's persistent buffers
     self.prof = {}; print(f"   speculative decoding: geometries {self.geos} (+ the MTP layer) captured in {time.perf_counter() - t0:.0f} s; their device buffers "
                           f"{gb:.2f} GB (of which the state banks {self.banks.nbytes() / 1e9:.2f} GB)", flush=True)
@@ -560,6 +614,10 @@ class Model:
     if m not in self.vers:
       V_ = Layers(m, self.cache); V_.slots, V_._inflight = self.pre.slots, self.pre._inflight
       V_.pinned, V_._small_dev, V_.stage, V_.zc = self.pre.pinned, self.pre._small_dev, self.pre.stage, self.pre.zc
+      # QWEN_CPU_SPLIT=<share> (bonsai2-27b; ../bonsai2-27b/cpu_split.py): a <= 4-row verify geometry's GEMMs (the MLP's by default) split by
+      # columns between the NPU and the CPU's big cores -- set up before anything is captured (its A buffers stay in DDR)
+      if (cs := os.environ.get("QWEN_CPU_SPLIT", "0") or "0") not in ("0", "off") and m <= 4 and R.HAD:   # a share, or per linear (cpu_split.py)
+        import cpu_split; cpu_split.CpuSplit(V_, cs, chain=not self.tree)
       self.vers[m] = V_; self.xbvs[m] = [V_.K.rows_buf("xiov0", R.H), V_.K.rows_buf("xiov1", R.H)]
     return self.vers[m]
   def _mtp_init(self):
@@ -624,6 +682,12 @@ class Model:
     self.meta_mtp = dict(self.meta_mtp, fc=tuple(int(v) for v in np.load(os.path.join(self.mtp_cache, f"L{self.MTPL}_fc.npz"))["meta"]))
     self.mtp_fc = dev(np.fromfile(os.path.join(self.mtp_cache, f"L{self.MTPL}_fc.bin"), np.uint8))
     self.mtp_ne, self.mtp_nh = small["mtp_pre_fc_norm_embedding_weight"], small["mtp_pre_fc_norm_hidden_weight"]
+    # QWEN_MTP_ALIGN=align.npz (A [H, H], b [H]): the first draft's normed hidden half u -> u A + b, a closed-form least-squares map of
+    # the target's states toward the ones the borrowed MTP layer was trained on (the drafter-input
+    # alignment). Host rows only (QWEN_NPU_IDS=0: mtp_rows); chained drafts read the MTP's own output and are left alone.
+    al = os.environ.get("QWEN_MTP_ALIGN")
+    self.mtp_align = (lambda z: (z["A"].astype(np.float32), z["b"].astype(np.float32)))(np.load(al)) if al else None
+    assert al is None or not NPU_IDS, "QWEN_MTP_ALIGN applies on the host rows: QWEN_NPU_IDS=0"
     w1 = 1.0 + small["mtp_norm_weight"]
     if R.HAD and self.dhead is self.mhead: w1 = (w1 * self.dec.signs[R.H]).astype(np.float32)   # the ternary head's input signs (as the final norm's)
     K = self.ver.K; self.mtp_norm_w1 = K.buf("mtp_norm_w1", R.H, dtypes.float32).assign(dev(w1)).realize()
@@ -632,9 +696,20 @@ class Model:
     # (the tree verify keeps the chain's draft geometries 3 / 4 / 6: a catch-up pass has at most NC = 6 rows, the widest a rescue hit commits)
     gs = [3, 4, 6] if self.tree and not self.leaf else self.geos
     self.mtp_geos = sorted({1} | {g for g in gs if g <= self.kmax + 1} | {min(g for g in gs if g >= self.kmax + 1)})
+    # QWEN_MTP_PROMPT=<rows> (default 0: off): the drafter's catch-up over the prompt (spec_generate: its K / V rows for every prompt
+    # position, before the first draft) on a geometry of that many rows, and without the draft head on every chunk but the last
+    # (only the last chunk's draft is used). Off, the chunks are the widest draft geometry's (QWEN_DRAFT_MAX + 1 rows) and each runs
+    # the head: at one draft a pass, 12 two-row passes with a head part each for a 24-token prompt
+    pg = int(os.environ.get("QWEN_MTP_PROMPT", "0") or 0); self.mtp_prompt = pg > 0
+    if pg: assert not self.tree and pg <= max(gs), ("QWEN_MTP_PROMPT", pg, gs); self.mtp_geos = sorted(set(self.mtp_geos) | {min(g for g in gs if g >= pg)})
     for g in self.mtp_geos:
       self._ver(g)
       if self.mtp_x and g not in self.mtpg: self.mtpg[g] = Layers(g, self.mtp_cache, fp8=True)
+      if self.mtp_x and getattr(self.mtpg[g], "cpu_split", None) is None:   # (mtpg[1] exists before this: the MTP layer's meta source)
+        # QWEN_CPU_SPLIT_MTP=<share> (bonsai2-27b/cpu_split.py MtpSplit): the drafter's 4-bit linears split NPU + CPU as the verify's, in the
+        # draft job (the head geometry's CpuSplit serves it: _draft_arm); needs QWEN_CPU_SPLIT on (the pool, the words) and a q4t cache
+        if (ms := os.environ.get("QWEN_CPU_SPLIT_MTP", "0") or "0") not in ("0", "off") and getattr(self.vers[g], "cpu_split", None) is not None:
+          import cpu_split; cpu_split.MtpSplit(self.mtpg[g], self.meta_mtp, self.mtp_cache, self.MTPL, ms, self.vers[g].cpu_split)
     self.jit_mtp = {}; self.prof = {}
     # QWEN_HEAD_TOP3=1: the draft head's kernel returns each part's top-3 (logit, column) per row (head_top3_src); the drafts
     # are unchanged (the top-1 of the merged lists); QWEN_SPEC_LOG gets them and the model's token's rank among them
@@ -652,7 +727,7 @@ class Model:
     oc = L.K.attn_decm(q_rows, kv_rows, self.QN, self.KN, self.ROPE, *self._kv(self.NATT), ah, R.NH, R.NKV, R.HD, self.TMAX, R.ROT, nidx=bool(self.kvs), kvb=self._kvb(self.NATT), kvh=self.kvh)
     x = L.K.resid(u, L.lin_ct(L.K.rms_a(oc, None, R.NH * R.HD, "a_o", norm=False), slot, self.meta_mtp, "o"), R.H, "x1")
     return L.mlp(x, slot, self.meta_mtp, (self.Wpost_a, ah), "mtp_out").realize()
-  def mtp_pass(self, rows, pos):
+  def mtp_pass(self, rows, pos, head=True):
     """rows [r, 2 H] (normed embedding | normed hidden) at positions pos.. -> (the layer's output rows [r, H], the draft head's
     (ids [r], probabilities [r]) over the draft vocabulary). Runs on the smallest MTP geometry m >= r (padded with the last row)."""
     zc = self.pre.zc; r = len(rows); m = min(g for g in self.mtp_geos if g >= r); L = self._mtpL(m); pf = self.prof; t0 = time.perf_counter()
@@ -660,13 +735,15 @@ class Model:
     poke(L.K.rows_buf("mtp_in", 2 * R.H), x)                              # only the m real rows (the kernels read no others)
     poke(self.aix[self.NATT], self._aixw(self.NATT, pos))
     hp = self.dhead; parts = hp["parts"][:self.draft_parts]; n0 = len(parts) if self.parts_thresh is None else 1   # (thresh: part 0, then maybe more)
-    if self._draft1_ok(hp, parts[:n0]):                                    # one job: the pending commit, the MTP layer, the first n0 parts
+    if head and self._draft1_ok(hp, parts[:n0]):                           # one job: the pending commit, the MTP layer, the first n0 parts
       cm = self._take_commit(); own = self._mtp_map_own(); Ld = self._dheadL(m); top3 = self.head_top3
       views = [own[k] for k in self.MTP_LIN] + self._dhead_views(hp, parts[:n0])
       key = ("h1", m, n0, top3, cm[0] if cm else None)
       if key not in self.jit_d1: self.jit_d1[key] = TinyJit(functools.partial(self._draft1, m, None, cm[1] if cm else None, Ld, hp, n0, None, None, False, top3, False))
       t1 = time.perf_counter()
+      sp = self._draft_arm(m, 0)                                         # (the host path's head is not split: only the MTP layer's steps)
       with one_job(): out = self.jit_d1[key](self.aix[self.NATT], *views)
+      if sp is not None: sp.wait()
       hx = OA.host_invalidate(out).numpy()[:r].copy()
       pre = [OA.host_invalidate(Ld.K.bufs[f"top3_head{i}" if top3 else f"top_head{i}"]).numpy().reshape(-1, Ld.n, 8 if top3 else 4).copy() for i in range(n0)]
       t2 = time.perf_counter(); ids, pr = self.head_top(out, Ld, self.mtp_norm_w1, self.draft_parts, thresh=self.parts_thresh, row=r - 1, top3=top3, hp=hp, pre=pre)
@@ -680,7 +757,10 @@ class Model:
       views = zc["views"][(0, "full")]
     if m not in self.jit_mtp: self.jit_mtp[m] = TinyJit(functools.partial(self.mtp_step, m))
     t1 = time.perf_counter()
+    sp = self._draft_arm(m, 0)
     with one_job(): out = self.jit_mtp[m](self.aix[self.NATT], *[views[k] for k in self.MTP_LIN])
+    if sp is not None: sp.wait()
+    if not head: sync(); return None, None                                 # (a prompt chunk, QWEN_MTP_PROMPT: the layer's K / V rows only)
     hx = OA.host_invalidate(out).numpy()[:r].copy()
     t2 = time.perf_counter(); ids, pr = self.head_top(out, self._dheadL(m), self.mtp_norm_w1, self.draft_parts, thresh=self.parts_thresh, row=r - 1, top3=self.head_top3, hp=self.dhead)
     lg = (ids[:r], pr[:r]); t3 = time.perf_counter(); self._draft_feats(r)
@@ -696,7 +776,9 @@ class Model:
     """The MTP inputs: [rms(embed(tok), pre_fc_norm_embedding) | rms(h, pre_fc_norm_hidden)], h the 27B's final-normed hidden
     (or, chained, the MTP layer's own output)."""
     h = hid if chained else R.rms(hid, self.fnorm)
-    return np.concatenate([R.rms(self.mtp_embed(list(toks)), self.mtp_ne), R.rms(h, self.mtp_nh)], 1).astype(np.float32)
+    u = R.rms(h, self.mtp_nh)
+    if not chained and getattr(self, "mtp_align", None) is not None: u = u @ self.mtp_align[0] + self.mtp_align[1]   # QWEN_MTP_ALIGN
+    return np.concatenate([R.rms(self.mtp_embed(list(toks)), self.mtp_ne), u], 1).astype(np.float32)
   def mtp_embed(self, ids):
     """The drafted tokens' embeddings: the target's (W.embed), or QWEN_MTP_EMBED=qwen: Qwen3.8-27B's bf16 rows."""
     if not self.mtp_x or self.mtp_emb != "qwen": return self.W.embed(ids)
@@ -724,8 +806,9 @@ class Model:
     return d
   def vgdn_step(self, m, par, idx, *rest):
     L = self.vers[m]; slot = dict(zip(self.GDN_LIN, rest[:len(self.GDN_LIN)])); x = self.xbvs[m][par]; idh = L.K.hold("idx_held", idx)
-    a_h = L.K.rms_a(x, (self.Win_g, idh), R.H, "a_h")
+    a_h = L.K.rms_a(x, (self.Win_g, idh), R.H, "a_h", req=L.req_for(self.meta_gdn, ("qkv", "z")))   # (req: the split's REQ in the producer)
     ct = L.lin_cts(a_h, slot, self.meta_gdn, ("qkv", "z"))                   # one GEMM when the cache fuses qkv | z
+    zd = getattr(L, "zdefer_ack", None)                                   # the CPU split's z columns ACKed after the recurrence (QWEN_CPU_SPLIT_ZDEFER)
     if self.leaf:                                                         # the leaf tree: leaves read-only from their parent's state, the deferred commit (QWEN_GDN_FAST: gdn_fast_src(tree=True))
       rows = R.HAD or QK.gdn_fast() == "off"                              # (else o_proj's A straight from the kernel)
       a_o = L.K.gdn_tokl(self.Sall, self.Call, idh, self.posb, ct["qkv"][0], ct["z"][0], x, self.Wab, self.Adt, self.Cwt, self.Nw, self.banks, self.rawm, self.pathb, self.treeb,
@@ -735,44 +818,56 @@ class Model:
       a_o = L.K.gdn_tokt(self.Sall, self.Call, idh, self.posb, ct["qkv"][0], ct["z"][0], x, self.Wab, self.Adt, self.Cwt, self.Nw, self.banks, self.rawm, self.treeb,
                          R.NV, R.NK, R.DK, R.DV, self.C, R.CONV, R.H, self.NGDN, xoff=ct["qkv"][1], zoff=ct["z"][1])
     else:
-      a_o = L.K.gdn_tokm(self.Sall, self.Call, idh, self.posb, ct["qkv"][0], ct["z"][0], x, self.Wab, self.Adt, self.Cwt, self.Nw, self.banks, self.rawm,
+      ms = self._ms(m); banks = self.banks4 if ms == 4 and self.ms_split else self.banks
+      a_o = L.K.gdn_tokm(self.Sall, self.Call, idh, self.posb, ct["qkv"][0], ct["z"][0], x, self.Wab, self.Adt, self.Cwt, self.Nw, banks, self.rawm,
                          R.NV, R.NK, R.DK, R.DV, self.C, R.CONV, R.H, self.NGDN, xoff=ct["qkv"][1], zoff=ct["z"][1], rows=R.HAD,
-                         defer=(self.M, self.accb) if self.defer else None)
-      if R.HAD: a_o = L.K.rms_a(a_o, None, R.NV * R.DV, "a_o", norm=False)   # o_proj's A from the fp32 rows (had_a32: whole 1024-blocks across heads)
+                         defer=(ms, self.accb) if self.defer else None, raw=self.gdn_raw or zd is not None, pre_onorm=zd)
+      if R.HAD: a_o = L.K.rms_a(a_o, None, R.NV * R.DV, "a_o", norm=False, req=L.req("o"))   # o_proj's A from the fp32 rows (had_a32: whole 1024-blocks across heads)
     x = L.K.resid(x, L.lin_ct(a_o, slot, self.meta_gdn, "o"), R.H, "x1")
     return L.mlp(x, slot, self.meta_gdn, (self.Wpost_g, idh), f"xiov{1 - par}").realize()
-  def vblk_step(self, m, types, kvb, *args):
+  def vblk_step_c(self, commit_fn, m, types, kvbs, *args):
+    """vblk_step after a folded commit's kernel (the prompt's chunks: the previous chunk's ring copies, then the block's layers)."""
+    commit_fn(); return self.vblk_step(m, types, kvbs, *args)
+  def vblk_step(self, m, types, kvbs, *args):
     """A block of layers (types: their LAYER_TYPES; the block starts at an even layer) as one JIT: per layer its index buffer (sidx /
     aix) then its linears' views, in order; layer j reads xbvs[m][j % 2] and writes the other, as the per-layer steps do."""
-    i = 0; out = None
+    i = 0; out = None; kv = iter(kvbs)                                   # kvbs: the block's attention layers' cache base codes, in order
     for j, lt in enumerate(types):
       nl = len(self.ATT_LIN if lt == "full" else self.GDN_LIN)
-      out = self.vatt_step(m, j % 2, kvb, *args[i:i + 1 + nl]) if lt == "full" else self.vgdn_step(m, j % 2, *args[i:i + 1 + nl]); i += 1 + nl
+      out = self.vatt_step(m, j % 2, next(kv), *args[i:i + 1 + nl]) if lt == "full" else self.vgdn_step(m, j % 2, *args[i:i + 1 + nl]); i += 1 + nl
     return out
   def vatt_step(self, m, par, kvb, aix, *rest):
     """kvb: the cache's DMA base code (the caches in ASIDs: the layer's ASID, whose views the kernel gets; 0: the stacks). The JIT is keyed by it."""
     L = self.vers[m]; Kall, Vall = self.kvs.views[kvb - 1] if self.kvs and kvb else (self.Kall, self.Vall); slot = dict(zip(self.ATT_LIN, rest[:len(self.ATT_LIN)])); x = self.xbvs[m][par]; ah = L.K.hold("aix_held", aix)
-    a_h = L.K.rms_a(x, (self.Win_a, ah), R.H, "a_h"); ct = L.lin_cts(a_h, slot, self.meta_att, ("q", "kv"))   # one GEMM when fused
-    q_rows = L.K.unpack(ct["q"][0], R.NH * 2 * R.HD, "q_rows", goff=ct["q"][1])
+    a_h = L.K.rms_a(x, (self.Win_a, ah), R.H, "a_h", req=L.req_for(self.meta_att, ("q", "kv"))); ct = L.lin_cts(a_h, slot, self.meta_att, ("q", "kv"))   # one GEMM when fused
+    gq = ct["q"][1]; gt = isinstance(gq, tuple) and not self.tree and L.K.attn_gt_ok()   # a --gtail cache (the gates at the fused tail): q alone, the gates read by attn_comb
+    gd = getattr(L, "gdefer_ack", None); assert gd is None or gt, "the split's gate step: the gate-tail attention path (chain verify, <= 4 rows)"
+    q_rows = L.K.unpack(ct["q"][0], R.NH * R.HD, "qc_rows", goff=gq[0]) if gt else L.K.unpack(ct["q"][0], R.NH * 2 * R.HD, "q_rows", goff=gq)
     kv_rows = L.K.unpack(ct["kv"][0], 2 * R.NKV * R.HD, "kv_rows", goff=ct["kv"][1])
     if self.tree: oc = L.K.attn_tree(q_rows, kv_rows, self.QN, self.KN, self.ROPE, Kall, Vall, ah, self.treeb, R.NH, R.NKV, R.HD, self.TMAX, R.ROT)
-    else: oc = L.K.attn_decm(q_rows, kv_rows, self.QN, self.KN, self.ROPE, Kall, Vall, ah, R.NH, R.NKV, R.HD, self.TMAX, R.ROT, nidx=bool(self.kvs), kvb=kvb, kvh=self.kvh)
-    x = L.K.resid(x, L.lin_ct(L.K.rms_a(oc, None, R.NH * R.HD, "a_o", norm=False), slot, self.meta_att, "o"), R.H, "x1")
+    else: oc = L.K.attn_decm(q_rows, kv_rows, self.QN, self.KN, self.ROPE, Kall, Vall, ah, R.NH, R.NKV, R.HD, self.TMAX, R.ROT, nidx=bool(self.kvs), kvb=kvb, kvh=self.kvh,
+                             gate=(ct["q"][0], gq[1]) if gt else None, pre_comb=gd)   # (gd: the CPU split's gate columns ACKed after attn_part)
+    x = L.K.resid(x, L.lin_ct(L.K.rms_a(oc, None, R.NH * R.HD, "a_o", norm=False, req=L.req("o")), slot, self.meta_att, "o"), R.H, "x1")
     return L.mlp(x, slot, self.meta_att, (self.Wpost_a, ah), f"xiov{1 - par}").realize()
-  def _head_part(self, L, i, x, norm_w1, view, top3=False, hp=None, red=None, pick=None, x3=False):
+  def _head_part(self, L, i, x, norm_w1, view, top3=False, hp=None, red=None, pick=None, x3=False, split=False):
     """Head part i on geometry L's rows (under TinyJit: one submission) -> its top-1 partials (`top3`: top-3); part 0 first takes the norm.
-    `hp`: the head (parts, GEMM keywords, slot, vocabulary; default the model's own, `mhead`)."""
+    `hp`: the head (parts, GEMM keywords, slot, vocabulary; default the model's own, `mhead`). `split`: when L's CPU split holds the
+    head (QWEN_CPU_SPLIT head=<share>), the NPU computes the part's first head_gn[i] groups and the CPU the rest, bracketed by the
+    hand-off kernels -- every submission of such a JIT must be armed (cpu_split.arm_head: _head_top_dev, mtp_pass_dev)."""
     hp = self.mhead if hp is None else hp; K = L.K; p_ = hp["parts"][i]
+    sp = getattr(L, "cpu_split", None) if split and hp is self.mhead else None; sp = sp if sp is not None and sp.head_gn else None
     a = K.rms_a(x, norm_w1, R.H, "a_head") if i == 0 else K.buf("a_head", K.a_size(R.H), dtypes.uint16)
-    ct = OA.gemm_gs(a, view, ks=KS, ns=3, nrb=L.nrb, nslices=R.H // (4 * KS), ngroups=p_["groups"], b8=True, bscale=True, q8=Q8MODE, scales=SCALES, piece=L.piece,
+    if sp is not None and not (i and sp.head_early): K.cpu_req_copy(a, sp.mirror_head)   # (QWEN_CPU_SPLIT_HEAD_EARLY: the CPU holds part 0's A)
+    ct = OA.gemm_gs(a, view, ks=KS, ns=3, nrb=L.nrb, nslices=R.H // (4 * KS), ngroups=sp.head_gn[i] if sp is not None else p_["groups"], b8=True, bscale=True, q8=Q8MODE, scales=SCALES, piece=L.piece,
                     rows=L.n, out=K.buf(f"ct_head{i}", p_["groups"] * L.nrb * 3 * 192, dtypes.float32), **hp["kw"])
+    if sp is not None: ct = ct.realize(); K.cpu_ack()                    # (the GEMM realized first: else the ACK's wait runs before it, in series)
     t = K.head_top(ct, min(p_["groups"] * 48, hp["n"] - p_["c0"]), f"top3_head{i}" if top3 else f"top_head{i}", top3=top3)
     if x3: K.head_top3_row(ct, min(p_["groups"] * 48, hp["n"] - p_["c0"]), f"top3r_head{i}", pick[1])   # (the leaf tree's drafts: each part's top-3 on the pick row)
     if not red: return t
     o = K.head_reduce(red)                                                # the last part read: the token on the device too
     if pick is not None and red: K.call(f"pick_id|{pick[0]}|{pick[1]}", QK.pick_src(*pick), self.vtok, o, self.dtok)   # a draft: into vt
     return o
-  def head_top(self, x, L, norm_w1=None, parts=None, thresh=None, row=None, top3=False, hp=None, pre=None):
+  def head_top(self, x, L, norm_w1=None, parts=None, thresh=None, row=None, top3=False, hp=None, pre=None, dev=None, acc=False, armed=False):
     """The block-scaled head's top-1 on geometry L's rows of x (after the final norm, or `norm_w1`'s) -> (ids [m], probabilities
     [m]); `parts`: the head's first parts only (a draft needs no exact vocabulary: the verify pass decides). Per part the GEMM
     and head_top run as one JIT submission (their slot mapped first); only the 12 tasks' partials come back.
@@ -781,7 +876,10 @@ class Model:
     Also set: `head_ptop` [parts read, m] (each part's top logit) and, when `need_feats`, `head_feats`. `hp`: as _head_part's.
     `pre`: the first parts' partials, already computed (the one-job draft pass, _draft1)."""
     zc = self.pre.zc; raw = zc["raw"]; nw = self.norm_w1 if norm_w1 is None else norm_w1; tops = list(pre or []); hp = self.mhead if hp is None else hp
-    if NPU_IDS and thresh is None and not top3 and not pre: return self._head_top_dev(x, L, nw, hp, hp["parts"][:parts])
+    # `dev`: the token reduced on the device (head_reduce, one job, one small readback) regardless of NPU_IDS -- the batch step
+    # (bonsai2_batch), which embeds on the host anyway, asks for it: 4 partial readbacks -> 1
+    if (NPU_IDS if dev is None else dev) and thresh is None and not top3 and not pre: return self._head_top_dev(x, L, nw, hp, hp["parts"][:parts], acc=acc, armed=armed)
+    assert not armed, "QWEN_HEAD_OVERLAP: the head is not the one-job device head"
     if not pre and thresh is None and DRAFT_JOB and getattr(self, "blk", 1) > 1 and hp["sid"] is None and len(hp["parts"][:parts]) <= 2 * self.blk \
        and all(p_["n"] <= zc["bsize"] for p_ in hp["parts"][:parts]):
       tops = self._head_tops_blk(x, L, nw, hp, hp["parts"][:parts], top3)   # layer blocks: every part in a block slot, one job
@@ -813,24 +911,43 @@ class Model:
   def _head_parts_host(self, L, x, nw, hp, n, top3, *views):
     for i in range(n): t = self._head_part(L, i, x, nw, views[i], top3=top3, hp=hp)
     return t
-  def _head_top_dev(self, x, L, nw, hp, parts, pick=None, x3=False):
+  def _head_parts_acc(self, L, x, nw, hp, n, c0s, *views):
+    """The verify head's parts, then the acceptance (accept_src: _vacc's kernel) in the same job (QWEN_IDS_FOLD)."""
+    o = self._head_parts(L, x, nw, hp, n, c0s, None, False, *views, split=True).realize()
+    L.K.call(f"accept|{L.n}", QK.accept_src(L.n), self.acco, self.vtok, L.K.bufs["ids_head"], self.accb, self.nxtb); return o
+  def _head_top_dev(self, x, L, nw, hp, parts, pick=None, x3=False, acc=False, armed=False):
     """head_top with the token chosen on the device (QWEN_NPU_IDS): the last part's job ends with head_reduce, and only its
     [ids | probabilities] come back. Telemetry (need_feats: QWEN_SPEC_LOG) still reads the partials and checks the ids."""
     zc = self.pre.zc; raw = zc["raw"]; c0s = tuple(p_["c0"] for p_ in parts); m = L.n
     if getattr(self, "blk", 1) > 1 and hp["sid"] is None and len(parts) <= self.blk and all(p_["n"] <= zc["bsize"] for p_ in parts):
       # layer blocks: every part in a block slot of parity 0 (the last block, parity 1, may still run) -> one JIT, one job
       for i, p_ in enumerate(parts): slot_map_nodrain(raw, zc["bslots"][(0, i)][0], p_["wid"], 0, p_["n"])
-      key = ("all", L.n, id(L), id(x), id(nw), id(hp), len(parts), pick, x3)
-      if key not in self.jit_head: self.jit_head[key] = TinyJit(functools.partial(self._head_parts, L, x, nw, hp, len(parts), c0s, pick, x3))
-      with one_job(): o = self.jit_head[key](*[self.pre.blob_view(0, i, p_["n"]) for i, p_ in enumerate(parts)])
+      key = ("all", L.n, id(L), id(x), id(nw), id(hp), len(parts), pick, x3, acc)
+      if key not in self.jit_head:
+        self.jit_head[key] = TinyJit(functools.partial(self._head_parts_acc, L, x, nw, hp, len(parts), c0s) if acc else functools.partial(self._head_parts, L, x, nw, hp, len(parts), c0s, pick, x3, split=True))
+      self._acc_done = acc                                                # (spec_generate: the acceptance ran in this job)
+      sp = L.cpu_split if armed else self._head_arm(L, hp, len(parts)); th = time.perf_counter()   # (armed: verify armed the pass and this job together)
+      with one_job(): o = jcall(self.jit_head[key], *[self.pre.blob_view(0, i, p_["n"]) for i, p_ in enumerate(parts)])
+      if sp is not None: sp.wait()
     else:
-      o = self._head_parts_seq(L, x, nw, hp, parts, c0s, pick, x3)
-    return self._head_out(o, L, parts, c0s, x3)
-  def _head_parts(self, L, x, nw, hp, n, c0s, pick, x3, *views):
+      assert not armed; th = time.perf_counter(); o = self._head_parts_seq(L, x, nw, hp, parts, c0s, pick, x3)
+    r = self._head_out(o, L, parts, c0s, x3)
+    if getattr(self, "prof", None) is not None: k_ = f"head{len(parts)}"; self.prof[k_] = self.prof.get(k_, 0.0) + time.perf_counter() - th   # (the job + its readback)
+    return r
+  def _head_parts(self, L, x, nw, hp, n, c0s, pick, x3, *views, split=False):
     """Head parts 0..n-1 (each in its own slot: views) as one JIT, the last ending with head_reduce (and pick_id)."""
     o = None
-    for i in range(n): o = self._head_part(L, i, x, nw, views[i], hp=hp, red=c0s if i == n - 1 else None, pick=pick if i == n - 1 or x3 else None, x3=x3)
+    for i in range(n): o = self._head_part(L, i, x, nw, views[i], hp=hp, red=c0s if i == n - 1 else None, pick=pick if i == n - 1 or x3 else None, x3=x3, split=split)
     return o
+  def _draft_arm(self, m, n):
+    """Arm the CPU split for a draft job on m rows: the MTP layer's split linears (MtpSplit), then the head's parts 0..n-1 (n = 0:
+    the job's head is not split) -> the split to wait on after the job, or None (nothing split in it)."""
+    sp = getattr(self.vers.get(m), "cpu_split", None)
+    return sp if sp is not None and sp.arm_draft(n) else None
+  def _head_arm(self, L, hp, n):
+    """Arm L's CPU split for a head job of parts 0..n-1 -> the split to wait on after the job, or None (the head not split)."""
+    sp = getattr(L, "cpu_split", None)
+    return sp if hp is self.mhead and sp is not None and sp.arm_head(n) else None
   def _head_parts_seq(self, L, x, nw, hp, parts, c0s, pick, x3=False):
     zc = self.pre.zc; raw = zc["raw"]
     for i, p_ in enumerate(parts):
@@ -839,8 +956,13 @@ class Model:
       if key not in self.jit_head: self.jit_head[key] = TinyJit(functools.partial(self._head_part, L, i, x, nw, hp=hp, red=red, pick=pk, x3=x3))
       o = self.jit_head[key](p_["views"][par])
     return o
+  def _peek(self, t, n, o=None):
+    """The first n int32 of the persistent buffer t on the host (o: the JIT's tensor of the same buffer): QWEN_IDS_FOLD through the
+    host mapping (cpu_split.peek, when the CPU split's library is loaded), else host_invalidate + numpy."""
+    cs = sys.modules.get("cpu_split") if IDS_FOLD else None; r = cs.peek(t, n) if cs is not None else None
+    return OA.host_invalidate(t if o is None else o).numpy() if r is None else r
   def _head_out(self, o, L, parts, c0s, x3=False):
-    m = L.n; o = OA.host_invalidate(o).numpy(); ids, pr = o[:m].astype(np.int64), o[m:2 * m].view(np.float32).copy()
+    m = L.n; o = self._peek(L.K.bufs["ids_head"], 16 * -(-2 * m // 16), o); ids, pr = o[:m].astype(np.int64), o[m:2 * m].view(np.float32).copy()
     if x3:                                                                # the parts' top-3 partials on the pick row -> head_t3 [m] (that row's; combine_tops' merge)
       t3s = [OA.host_invalidate(L.K.bufs[f"top3r_head{i}"]).numpy().reshape(-1, 1, 8).copy() for i in range(len(parts))]
       t3s = [np.concatenate([t[..., :6], np.ones_like(t[..., 6:7]), t[..., 7:]], -1) for t in t3s]   # (no sum of exp: a dummy 1)
@@ -869,16 +991,26 @@ class Model:
     (head_top), "full": logits [M, vocab], None: no head; the attention caches get the M rows, every DeltaNet layer its
     per-token state banks (commit() picks the accepted one). QWEN_SPEC_TREE: `tree` (a spec_tree.Tree over the M rows; None =
     the chain) is the kernels' table -- rows at pos + depth, attending their ancestors; the rescue rows' K / V at pos + row."""
-    M = len(toks); L = self._ver(M); xbv = self.xbvs[M]; assert 2 <= M <= self.M and pos + M <= self.TMAX
+    M = len(toks); L = self._ver(M); xbv = self.xbvs[M]; assert 2 <= M <= self.M and pos + M <= self.TMAX; emb = False; self._acc_done = False
+    cm = self._take_commit() if self.blk > 1 and PREFILL_FOLD and getattr(self, "_prompt_pass", False) else None   # the prompt's chunks: into block 0's job
     self._commit_flush()                                                  # (a folded commit no draft pass took)
+    if getattr(self, "defer", False) and self.pend and (self.pend_ms != self._ms(M) or self.pend_split != self._gsp(M)): self.flush()   # the pending records sit in the other bank buffer, or in the other layout
     if NPU_IDS and not getattr(self, "_prompt_pass", False):              # vt holds [cur, drafts] (accept / pick_id wrote them)
-      if self.need_feats: assert OA.host_invalidate(self.vtok).numpy()[:M].tolist() == [int(t) for t in toks], ("vt", OA.host_invalidate(self.vtok).numpy()[:M], toks)
-      self._vemb(M)
+      if self.need_feats and not getattr(self, "_warm", False): assert OA.host_invalidate(self.vtok).numpy()[:M].tolist() == [int(t) for t in toks], ("vt", OA.host_invalidate(self.vtok).numpy()[:M], toks)
+      emb = IDS_FOLD and self.blk > 1 and cm is None                      # QWEN_IDS_FOLD: the embedding first in block 0's job
+      if not emb: self._vemb(M)
     else: poke(xbv[0], self._embed_prompt(toks, pos) if getattr(self, "_prompt_pass", False) else self.W.embed(list(toks)).astype(np.float32))   # rows M.. stay zero (no kernel writes them)
     for i, t in enumerate(self.aix): poke(t, self._aixw(i, pos))
     poke(self.posb, np.array([pos], np.int32))
     if self.tree: assert M == self.M or self.leaf; poke(self.treeb, spec_tree.table(tree) if tree is not None else spec_tree.chain_table(M))
-    if self.blk > 1: self._verify_blocks(M, L)
+    # QWEN_HEAD_OVERLAP: the decode loop's verify (device ids, the split head as one job) arms the CPU split once for the layers'
+    # steps and the head's, so the head's JIT call (its Python, its submit) runs while the last block does, not after it
+    sp = getattr(L, "cpu_split", None); hpv = self.mhead["parts"] if getattr(self, "mhead", None) else []
+    ov = (HEAD_OVERLAP and NPU_IDS and head == "top" and sp is not None and bool(sp.head_gn) and self.blk > 1 and not self.tree and self.dump is None
+          and not self.gdump_layers and not getattr(self, "_prompt_pass", False) and self.mhead["sid"] is None and len(hpv) <= self.blk
+          and all(p_["n"] <= self.pre.zc["bsize"] for p_ in hpv))
+    if sp is not None: sp.arm_pass_head(len(hpv)) if ov else sp.arm()   # the CPU half serves this pass's split GEMMs
+    if self.blk > 1: self._verify_blocks(M, L, cm, emb)
     else:
       zc = self.pre.zc; late = STREAM_LATE and bool(zc) and bool(zc.get("stream"))   # streamed layers: refill / prefetch after the next submit
       L.prefetch(0)
@@ -896,24 +1028,38 @@ class Model:
           self.jit_vgdn[kp](self.sidx[self.gidx[l]], *[slot[k] for k in self.GDN_LIN])
         if late: L.after_submit(l)
       if late: zc["late_refill"] = False
+    if sp is not None and not ov: sp.wait()
     if not NPU_IDS or self.dump is not None or getattr(self, "_prompt_pass", False): self.v_hidden = OA.host_invalidate(xbv[0]).numpy()[:M].copy()   # the MTP draft head's input
+    if self.gdump_layers:                                                 # QWEN_DUMP_GDN: the pass's raw conv rows of those layers (rawm [NG][M][CP], M this pass's rows)
+      assert self.blk > 1 and not self.tree and all(l in self._gd_x for l in self.gdump_layers), (self.blk, self.tree, list(self._gd_x))
+      raw = OA.host_invalidate(self.rawm).numpy()
+      self._gd_raw = {l: raw[self.gidx[l] * M * self.CP:(self.gidx[l] + 1) * M * self.CP].reshape(M, self.CP)[:, :self.C].copy() if l < R.NL else None for l in self.gdump_layers}
     if head is None: return None                                          # (the last layer, parity 1, wrote xbv[0])
-    return self.head_top(xbv[0], L)[0] if head == "top" else self.logits_rows(xbv[0], L=L)
-  def _verify_blocks(self, M, L):
+    acc = IDS_FOLD and NPU_IDS and not self.tree and not getattr(self, "_prompt_pass", False)   # QWEN_IDS_FOLD: the acceptance in the head's job
+    return self.head_top(xbv[0], L, acc=acc, armed=ov)[0] if head == "top" else self.logits_rows(xbv[0], L=L)
+  def _verify_blocks(self, M, L, cm=None, emb=False):
     """The 64 layers QWEN_LAYER_BLOCK at a time (vblk_step): block b's layers mapped into the slots of block parity b % 2 while block
-    b - 1 runs (the backend's async tail), then the block as one JIT call."""
+    b - 1 runs (the backend's async tail), then the block as one JIT call. `cm` (a prompt chunk, QWEN_PREFILL_FOLD): the previous
+    chunk's commit (_commit_call's (key, call)) run first in block 0's job -- no job, no scheduling of its own a chunk."""
     k = self.blk
     for b in range(R.NL // k):
-      bp = b % 2; types = tuple(R.LAYER_TYPES[b * k + j] for j in range(k)); args = []; kvb = 0
+      bp = b % 2; types = tuple(R.LAYER_TYPES[b * k + j] for j in range(k)); args = []; kvbs = ()   # (each attention layer's own: the caches in ASIDs
+      #                                                                    put attention layer i in ASID 1 + i % 3, so a block of 8 holds two)
       for j in range(k):
         l = b * k + j; views, meta = L.map_block(l, bp, j)
-        if types[j] == "full": self.meta_att = meta; kvb = self._kvb(self.aidx[l]); args += [self.aix[self.aidx[l]], *[views[n] for n in self.ATT_LIN]]
+        if types[j] == "full": self.meta_att = meta; kvbs += (self._kvb(self.aidx[l]),); args += [self.aix[self.aidx[l]], *[views[n] for n in self.ATT_LIN]]
         else: self.meta_gdn = meta; args += [self.sidx[self.gidx[l]], *[views[n] for n in self.GDN_LIN]]
-      if (key := (M, bp, types, kvb)) not in self.jit_vblk: self.jit_vblk[key] = TinyJit(functools.partial(self.vblk_step, M, types, kvb))
+      ck = cm[0] if cm is not None and b == 0 else None
+      if emb and b == 0: ck, cm = ("emb",), (("emb",), lambda: self._embed_dev(L.K, M, L.K.bufs["xiov0"], self.vtok))   # (the ids' embedding rows: _vemb's kernel)
+      if (key := (M, bp, types, kvbs) + ((ck,) if ck is not None else ())) not in self.jit_vblk:
+        self.jit_vblk[key] = TinyJit(functools.partial(self.vblk_step, M, types, kvbs) if ck is None else functools.partial(self.vblk_step_c, cm[1], M, types, kvbs))
       jit = self.jit_vblk[key]
       if jit.cnt < 2:                                                     # the capture: the whole block as one graph, one chain
         with one_job(): jit(*args)
-      else: jit(*args)
+      else: jcall(jit, *args)
+      if self.gdump_layers and (ln := (b + 1) * k) in self.gdump_layers:   # QWEN_DUMP_GDN: layer ln's input rows (parity 0 after an even-length block)
+        assert k % 2 == 0 and (ln == R.NL or R.LAYER_TYPES[ln] == "linear"), (k, ln)
+        self._gd_x[ln] = OA.host_invalidate(self.xbvs[M][0]).numpy()[:M].copy()
   def commit(self, a, pos, m=None, path=None, fold=False):
     """After verify(toks, pos) accepted a of its M tokens: the DeltaNet states and rings as after toks[:a] (posb still = pos).
     QWEN_SPEC_TREE: `path` = the committed rows (spec_tree.accept; None = the chain's first a): the state from the path's last
@@ -923,12 +1069,19 @@ class Model:
     (the decode loop, a draft pass next): the kernel is not run here but by the next draft pass's job (QWEN_COMMIT_FOLD, `pcommit`);
     anything else that runs first (verify, flush, prefill) runs it on its own (_commit_flush)."""
     m = self.M if m is None else m; self._commit_flush()
+    if self.gdump_layers:                                                 # QWEN_DUMP_GDN: the committed rows' inputs (the chain: rows 0..a-1)
+      assert path is None or list(path) == list(range(a)), ("QWEN_DUMP_GDN: the chain only", path)
+      for l in self.gdump_layers: self.gdump[l].append((self._gd_x[l][:a], self._gd_raw[l][:a] if self._gd_raw[l] is not None else None))
     self.pend = self.defer                                                # (the deferred commit: the accepted updates wait for the next verify pass)
+    self.pend_ms, self.pend_split = self._ms(m), self._gsp(m)
+    if getattr(self, "gsplit", False):
+      if self.pend_split: self.rec_par ^= 1                                # (a split pass wrote its records at 1 - parity)
+      self._poke_acc(a)
     nc = None
     if self.tree:                                                         # (leaf: pathb is also the next pass's pending path, gdn_tokl)
       nc = getattr(self, "pass_nc", m) if self.leaf and path is not None else (m if self.leaf else self.NC)
       poke(self.pathb, spec_tree.path_words(list(range(a)) if path is None else path, self.M if self.leaf else m, nc))
-    elif not NPU_IDS or getattr(self, "_prompt_pass", False): poke(self.accb, np.array([a], np.int32))   # QWEN_NPU_IDS: accept wrote it (not for a prompt pass)
+    elif not NPU_IDS or getattr(self, "_prompt_pass", False): self._poke_acc(a)   # QWEN_NPU_IDS: accept wrote it (not for a prompt pass)
     if self.ringc: poke(self.cwords, QK.ring_commit_words(a, m, pos, path, nc if self.tree else None, self.M))
     c = self._commit_call(m)
     if fold and COMMIT_FOLD and self.ringc: self.pcommit = c
@@ -964,7 +1117,7 @@ class Model:
       cm = max(self.mtp_geos); p0 = min(getattr(self, "mtp_from", 0), n - 1)   # the prefix cache: the drafter's rows for [0, p0) are in its cache
       for c0 in range(p0, n, cm):
         c1 = min(n, c0 + cm)
-        if c1 < n: self.mtp_pass(self.mtp_rows(self.pre_hidden[c0:c1], nxt_all[c0:c1]), c0)
+        if c1 < n: self.mtp_pass(self.mtp_rows(self.pre_hidden[c0:c1], nxt_all[c0:c1]), c0, head=not self.mtp_prompt)
         else: dnext = self.mtp_draft(self.pre_hidden[c0:c1], nxt_all[c0:c1], c0, self.kmax)
       st["t_draft"] = st.get("t_draft", 0.0) + time.perf_counter() - t0
       if NPU_IDS: poke(self.vtok, np.array(([first] + dnext + [dnext[-1]] * 16)[:16], np.int32))   # the prompt's: the last host write of ids
@@ -992,7 +1145,8 @@ class Model:
         while a < m and d[a - 1] == int(g[a - 1]): a += 1
         path, new, ac = list(range(a)), d[:a - 1] + [int(g[a - 1])], a - 1
         if NPU_IDS:                                                       # the device's acceptance (accb, vt[0], nxt), checked against the host's
-          self._vacc(m); o_ = OA.host_invalidate(self.acco).numpy(); ad = int(o_[0])
+          if not self._acc_done: self._vacc(m)
+          o_ = self._peek(self.acco, 16); ad = int(o_[0])
           assert (ad, [int(v) for v in o_[2:2 + ad]]) == (a, new), ("accept differs", o_.tolist(), a, new)
       if mtp:                                                             # (draft depth, probability, accepted) for the threshold's choice
         st.setdefault("draft_log", []).extend((j, self.draft_p[j], j < ac) for j in range(nd))
@@ -1003,6 +1157,7 @@ class Model:
         if t in EOS or len(out) >= max_new: break
       more = mtp and len(out) < max_new and out[-1] not in EOS            # a draft pass next: the commit rides in its job (QWEN_COMMIT_FOLD)
       tc = time.perf_counter(); self.commit(a, pos, m, path, fold=more); tc = time.perf_counter() - tc
+      if self.dump is not None: self.dump.extend(self.v_hidden[path])     # QWEN_DUMP_HIDDEN: the committed rows' hidden states (generation too)
       if cb is not None: cb(out[n0:], tv)
       if more:                                                            # the MTP cache caught up on the committed path's hidden rows
         t0 = time.perf_counter(); dnext = self.mtp_draft_dev(m, a, pos, self.kmax) if NPU_IDS else self.mtp_draft(self.v_hidden[path], new, pos, self.kmax)
@@ -1115,18 +1270,21 @@ class Model:
     self.mtp_from = start; c0 = start
     while c0 < n:
       nb = next((b for b in stops if b > c0), n); chunk = list(ids[c0:min(c0 + m, nb)]); a = len(chunk); mm = min(g for g in self.geos if g >= max(2, a))
-      lg = self.verify(chunk + [chunk[-1]] * (mm - a), c0, head="full" if c0 + a >= n else None); self.commit(a, c0, mm)
+      lg = self.verify(chunk + [chunk[-1]] * (mm - a), c0, head="full" if c0 + a >= n else None); self.commit(a, c0, mm, fold=PREFILL_FOLD)
       if self.dump is not None or self.MTPL: self.pre_hidden[c0:c0 + a] = self.v_hidden[:a]
       c0 += a
       if c0 in stops and on_snap is not None and c0 < n: on_snap(c0, self.snapshot_state())
       if c0 < n: yield c0
     if self.dump is not None: self.dump.extend(self.pre_hidden[start:])  # QWEN_DUMP_HIDDEN: every prompt position
+    self._commit_flush()                                                  # (the last chunk's folded commit: the state as after an unfolded one)
     self._prompt_pass = False; self.prefill_lg = lg[a - 1]
     yield n
   def snapshot_state(self):
     """The recurrent state at the current position, on the host: (the DeltaNet states, the conv rings), the deferred commit folded in
-    first. With the K / V rows the prompt wrote, enough to continue from here later (restore_state + prefill_chunks(start=))."""
-    self.prefill_prelude()
+    first. With the K / V rows the prompt wrote, enough to continue from here later (restore_state + prefill_chunks(start=)).
+    flush, not prefill_prelude: the prelude drops the pending updates (the snapshot and the rest of the prompt lacked the last
+    chunk's DeltaNet updates before 2026-11-17)."""
+    self.flush()
     return OA.host_invalidate(self.Sall).numpy().copy(), OA.host_invalidate(self.Call).numpy().copy()
   def restore_state(self, snap):
     """The states of snapshot_state back on the device (the caches' rows are untouched: the caller knows they still hold the prefix)."""
@@ -1139,7 +1297,7 @@ class Model:
   def prefill_prelude(self):
     """Before a prompt: a folded commit run, nothing pending for the next verify pass."""
     self._commit_flush()
-    if getattr(self, "defer", False): poke(self.accb, np.zeros(1, np.int32)); self.pend = False   # no update pending for the next verify pass (gdn_defer_src)
+    if getattr(self, "defer", False): self._poke_acc(0); self.pend = False   # no update pending for the next verify pass (gdn_defer_src)
     if getattr(self, "leaf", False) and self.M: poke(self.pathb, np.zeros(4 + self.M, np.int32))   # (the leaf tree's gdn_tokl: its pending path)
   def prefill_long(self):
     """True when the context is past the exact attention path's slices (attn_plan): the one-pass prefill's part kernels do not
@@ -1236,14 +1394,25 @@ class Model:
     x = L.K.resid(x, L.lin_ct(L.K.rms_a(oc, None, R.NH * R.HD, "a_o", norm=False), slot, self.meta_att, "o"), R.H, "x1")
     return L.mlp(x, slot, self.meta_att, (self.Wpost_a, ah), f"xio{1 - par}").realize()
 
+  def _poke_acc(self, a):
+    """accb <- [a, parity]: the pending count and (gsplit) the parity the next pass reads its records at."""
+    poke(self.accb, np.array([a, getattr(self, "rec_par", 0), 0, 0], np.int32))
+  def _ms(self, m):
+    """The deferred commit's slots a head for a pass of geometry m: 4 for the decode geometries when the prompt chunks are wider (ms_split), else QWEN_SPEC."""
+    return 4 if getattr(self, "ms_split", False) and m <= 4 else self.M
+  def _gsp(self, m):
+    """True when a pass of geometry m runs the split DeltaNet kernel (QK.gdn_split_for): its records in two parities."""
+    return getattr(self, "gsplit", False) and QK.gdn_split_for(R.NV, m, R.HAD) is not None
   def flush(self):
     """The deferred commit's pending updates into Sall now (gdn_flush), none left pending: before a plain decode step, which reads
     Sall -- the Q8_0 models' prompt goes through the verify path (prefill_chunked), and a step may follow a verify pass."""
     self._commit_flush()
     if not getattr(self, "pend", False): return
-    K = self.ver.K; acc = self.pathb if self.leaf else self.accb
-    K.gdn_flush(self.Sall, self.banks, acc, R.NV, R.DK, R.DV, self.NGDN, self.M, tree=self.leaf)
-    poke(acc, np.zeros(4 + self.M if self.leaf else 1, np.int32)); self.pend = False
+    K = self.ver.K; acc = self.pathb if self.leaf else self.accb; ms = getattr(self, "pend_ms", self.M)
+    K.gdn_flush(self.Sall, self.banks4 if ms == 4 and self.ms_split else self.banks, acc, R.NV, R.DK, R.DV, self.NGDN, ms, tree=self.leaf, split=getattr(self, "pend_split", False))
+    if self.leaf: poke(acc, np.zeros(4 + self.M, np.int32))
+    else: self._poke_acc(0)
+    self.pend = False
   def step(self, tok, pos):
     L = self.dec; assert pos < self.TMAX
     self.flush()
@@ -1271,17 +1440,18 @@ def pin_cpus():
   """QWEN_CPUS (default auto): run the host on the CPU that takes the NPU's interrupt (/proc/interrupts' "aipu" line) and one other
   core of its speed. The driver completes every job group on that CPU: with the host there it stays awake, and a 4-row verify
   pass of bonsai2-27b took 0.513 s pinned against 0.565 s unpinned (the gaps between a job's kernels ~0.45 ms shorter a layer,
-  and a fast core for the host). off: no pinning; a list "0,1": those CPUs."""
+  and a fast core for the host). irq: that CPU alone (the CPU split's default: the other big cores are its pool). off: no pinning;
+  a list "0,1": those CPUs."""
   v = os.environ.get("QWEN_CPUS", "auto")
   if v == "off" or not hasattr(os, "sched_setaffinity"): return None
-  if v != "auto": cpus = {int(c) for c in v.split(",")}
+  if v not in ("auto", "irq"): cpus = {int(c) for c in v.split(",")}
   else:
     try:
       line = next(l for l in open("/proc/interrupts") if l.rstrip().endswith(" aipu"))
       counts = [int(x) for x in line.split()[1:1 + os.cpu_count()]]
       c0 = max(range(len(counts)), key=counts.__getitem__)
       fmax = lambda c: open(f"/sys/devices/system/cpu/cpu{c}/cpufreq/cpuinfo_max_freq").read().strip()
-      cpus = {c0} | set([c for c in range(os.cpu_count()) if c != c0 and fmax(c) == fmax(c0)][:1])
+      cpus = {c0} | (set() if v == "irq" else set([c for c in range(os.cpu_count()) if c != c0 and fmax(c) == fmax(c0)][:1]))
     except (StopIteration, OSError, ValueError): return None
   os.sched_setaffinity(0, cpus); return sorted(cpus)
 
