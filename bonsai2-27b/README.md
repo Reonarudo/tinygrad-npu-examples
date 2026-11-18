@@ -294,15 +294,16 @@ pass's own argmax, so the output is the same as plain greedy decoding.
 | `QWEN_NPU` | `/mnt/ssd/bonsai2-npu` | the packed cache. Set it to your path |
 | `QWEN_TOK` | the cache | the folder holding `tokenizer.json` |
 | `QWEN_MTP_CACHE` | `$QWEN_NPU/mtp_q4t` with the CPU split (if it exists), else `$QWEN_NPU/mtp` | the drafter's cache: Qwen3.8-27B's MTP layer (FP8 with single-layout scales, or its 4-bit q4t packing) |
-| `QWEN_CPU_SPLIT` | on, when the cache has its CPU files: `qkvz=0.70,qkv=0.65,gu=0.50,o=0.44,dn=0.44,head=0.50` (`qkv=0.50` without the gate tail); the 2B `qkvz=0.35,qkv=0.35,gu=0.35,o=0.30,dn=0.30,head=0.35` | the NPU + CPU column split of every ternary linear: the share of each linear's columns the CPU computes. `0`: the NPU alone |
-| `QWEN_CPU_SPLIT_MTP` | `0.55` with the split, if the drafter cache has its CPU files | the drafter's linears split the same way: a q4t cache's 4-bit ones (`cpu_split_pack.py --mtp`), or an fp8 cache's E4M3 ones as they are (`--mtp8`: the 2B's drafter) |
+| `QWEN_CPU_SPLIT` | on, when the cache has its CPU files: `qkvz=0.70,qkv=0.65,gu=0.50,o=0.44,dn=0.44,head=0.50` (`qkv=0.50` without the gate tail); the 2B `qkvz=0.58,qkv=0.50,gu=0.578,o=0.72,dn=0.45,head=0.60` | the NPU + CPU column split of every ternary linear: the share of each linear's columns the CPU computes. `0`: the NPU alone |
+| `QWEN_CPU_SPLIT_MTP` | `0.55` (the 2B `0.5`) with the split, if the drafter cache has its CPU files | the drafter's linears split the same way: a q4t cache's 4-bit ones (`cpu_split_pack.py --mtp`), or an fp8 cache's E4M3 ones as they are (`--mtp8`: the 2B's drafter) |
 | `QWEN_CPUS` | `irq` with the split (the CPU taking the NPU's interrupt, alone), else `auto` | the host's CPUs; the split's pool takes the other big cores, never the little ones (`QWEN_CPU_SPLIT_CPUS` to choose) |
 | `QWEN_MTP_HEAD` | `bonsai` | the draft head: Bonsai's own ternary head, or `qwen`: Qwen3.8-27B's FP8 head, read from `QWEN_MTP_CACHE` |
 | `QWEN_MTP_EMBED` | `bonsai` | the drafted token's embedding: Bonsai's, or `qwen`: Qwen3.8-27B's table, from `QWEN_MTP_DIR` |
 | `QWEN_MTP_DIR` | unset | Qwen3.8-27B-FP8's folder (its `outside.safetensors`), needed only with `QWEN_MTP_EMBED=qwen` |
 | `QWEN_SPEC` | `4` | rows of a verify pass at most (the token + up to 3 drafts); `0` decodes plainly |
 | `QWEN_SPEC_GEOS` | `2,3,4` | the verify pass sizes prepared at start-up (with the leaf tree: every size from 2 to `QWEN_SPEC`) |
-| `QWEN_DRAFT_MAX` | `3` | drafts a pass at most |
+| `QWEN_DRAFT_MAX` | `3` (the 2B `1`) | drafts a pass at most |
+| `QWEN_IDS_FOLD`, `QWEN_JIT_FAST`, `QWEN_HEAD_OVERLAP` | `1` on the 27B and the 2B | the host's part of a pass: the ids' two small jobs folded into their neighbours, captured JITs replayed without tinygrad's per-call input preparation, the head's job submitted under the last layer block (the 27B +1.2 %, the 2B +6 %; the same tokens). `0`: as before |
 | `QWEN_SPEC_TREE` | `leaf` | the verify rows the chain leaves free take the drafts' 2nd / 3rd candidates; `off`: the chain only |
 | `QWEN_TREE_TC` | `0.5` | with the leaf tree: keep drafting while the chain's probability is at least this |
 | `QWEN_DRAFT_TAU` | `0.2` (`0.4` with the Qwen head) | without the leaf tree (`QWEN_SPEC_TREE=off`): keep drafting while the draft head's probability is at least this |
@@ -383,16 +384,12 @@ safetensors file, then `--mtp-gguf` on that file). Board o6n, 2026-10-26, three 
 | 4B | 1.5 GB | 29-35 | 6.9 | **16.2-24.2** | 1.0-2.0 |
 | 9B | 2.7 GB | 15-17 | 4.5 | **9.2-10.7** | 1.5-1.9 |
 
-**The 2B's fastest single-user decode (opt-in, 2026-11-18).** The defaults above are tuned for three drafts a pass. One draft a
-pass with the ids on the device, the shares retuned and the host's round trips cut gives **56.3 tok/s** pooled over the 10
-EXPLORE prompts (120 tokens each), against 32.4 for the default on the same pool, every output identical to plain greedy's:
-
-```sh
-python3 cpu_split_pack.py --mtp8 /mnt/ssd/bonsai2-2b-npu/mtp      # once: the drafter's CPU files
-QWEN_MODEL=bonsai2-2b QWEN_DRAFT_MAX=1 QWEN_DRAFT_PARTS=1 QWEN_NPU_IDS=1 \
-  QWEN_CPU_SPLIT=qkvz=0.58,qkv=0.50,gu=0.578,o=0.72,dn=0.45,head=0.60 QWEN_CPU_SPLIT_MTP=0.5 QWEN_CPU_SPLIT_HEAD_EARLY=1 \
-  QWEN_IDS_FOLD=1 QWEN_JIT_FAST=1 QWEN_HEAD_OVERLAP=1 QWEN_MTP_PROMPT=8 python3 bonsai2_generate.py "prompt"
-```
+**The 2B's single-user decode defaults (2026-11-18).** One draft a pass (`QWEN_DRAFT_MAX=1`, from the draft head's part 0:
+`QWEN_DRAFT_PARTS=1`) with the ids on the device (`QWEN_NPU_IDS=1`), the split's shares set per linear for the 2-row verify pass,
+the fp8 drafter's layer split with the CPU (`QWEN_CPU_SPLIT_MTP=0.5`; its CPU files once: `python3 cpu_split_pack.py --mtp8
+/mnt/ssd/bonsai2-2b-npu/mtp`) and the host's round trips cut: **57.2 tok/s** pooled over the 10 EXPLORE prompts (120 tokens each)
+against 32.4 for the three-draft defaults before it, every output identical to plain greedy's; 48 tok/s against 25 after a
+729-token prompt. `bonsai2_generate.py` sets all of it; the 2B's own switches (each `0` turns it off):
 
 | variable | what it does |
 | --- | --- |
@@ -400,11 +397,13 @@ QWEN_MODEL=bonsai2-2b QWEN_DRAFT_MAX=1 QWEN_DRAFT_PARTS=1 QWEN_NPU_IDS=1 \
 | `QWEN_JIT_FAST=1` | a captured JIT is replayed without tinygrad's per-call input preparation (0.45 of the 0.6 ms a 4-layer block's call took) |
 | `QWEN_HEAD_OVERLAP=1` | the verify head's job is submitted while the last layer block runs (one CPU schedule for both) |
 | `QWEN_CPU_SPLIT_HEAD_EARLY=1` | the head's parts 1.. reuse part 0's input on the CPU: the pool computes them back to back |
+| `QWEN_CPU_GLUE=1` | inside a block of layers, a layer's closing residual and the next layer's input norm + rotation run on the CPU pool instead of two NPU launches (the NPU kernels' operations in their order: the same bits); +0.5 %, 56.3 -> 56.6 tok/s |
 | `QWEN_MTP_PROMPT=<rows>` | the drafter's pass over the prompt in chunks of that many rows, its head only on the last (a per-generation cost: 12 passes become 3 on a 24-token prompt) |
 
 The drafter's fp8 kernel on the CPU (`cpu_split.c` fmt 2) multiplies in fp16, 4.5e-4 relative rms against exact sums; it changes
-drafts only, never a token. These switches are not defaults: they were gated on short prompts in `bonsai2_generate.py` only, not in the servers or on long contexts. On the 27B the three generic ones measured +1 % on
-two prompts.
+drafts only, never a token. The defaults were gated as shipped: the 10 prompts on the
+default pool, a 729-token prompt, the plain path, and `bonsai2_serve.py` against a plain-decoding server on four requests at three
+output lengths (a repeat from the prefix cache, a follow-up turn).
 
 The prompt goes through the verify path (`QWEN_PREFILL=chunked`: the one-pass prefill's DeltaNet kernel wants 48 value heads). Plain
 decoding on these sizes is `QWEN_DRAFT=none` (the verify path without drafts); `QWEN_SPEC=0` has no geometries for the chunked prefill.
@@ -477,6 +476,9 @@ chat path did not have:
   few positions: after the first message (the system turn), at the prompt's end and at the generation's end (`QWEN_PREFIX_SNAPS`, 6).
   A snapshot first applies the deferred DeltaNet commit's pending updates (`flush`); before 2026-11-17 it dropped them, so a snapshot
   and the rest of the prompt it was taken in lacked the last pass's updates (the cold path snapshots too, so it agreed with them).
+  A generation that ends inside a verify pass (`max_tokens`, or an end token before the pass's last accepted one) commits only the
+  rows whose tokens it kept; before 2026-11-18 it committed every accepted row, so the end snapshot's state was up to two tokens
+  ahead of its label and the conversation's next turn could continue from the wrong place (seen on the 2B at three drafts a pass).
   A new prompt resumes from the largest snapshot inside its common prefix with the cached tokens and prefills only the rest; the
   drafter's prompt pass starts there too. A turn that continues a conversation (the previous prompt, the answer, the tool results)
   prefills its new tokens only; a new conversation with the same system prompt starts after it. Images bypass the cache. Past

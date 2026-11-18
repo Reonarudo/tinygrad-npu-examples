@@ -413,6 +413,7 @@ class Model:
     ok = k > 1 and k % 2 == 0 and R.NL % k == 0 and bool(zc) and not zc.get("stream") and (not self.tree or self.leaf)
     if k > 1 and not ok: print(f"   QWEN_LAYER_BLOCK={k}: needs an even k dividing {R.NL}, every layer pinned zero-copy, the chain verify; a job per layer", flush=True)
     self.blk = k if ok else 1; self.jit_vblk = {}
+    for V_ in self.vers.values(): self._glue_init(V_)                    # (the geometries made before the block size was known)
     if self.blk > 1:
       self.pre.block_slots(self.blk)
       print(f"   layer blocks: {self.blk} layers a job, {2 * self.blk} window slots of {zc['bsize'] / 1e6:.0f} MB", flush=True)
@@ -609,6 +610,11 @@ class Model:
     self.pcommit = None
     if self.ringc: poke(self.cwords, np.zeros(QK.RC_W + self.M, np.int32))
     print(f"   draft JITs warmed: {n} passes in {time.perf_counter() - t0:.0f} s", flush=True)
+  def _glue_init(self, V_):
+    sp = getattr(V_, "cpu_split", None)
+    if os.environ.get("QWEN_CPU_GLUE", "0") != "1" or sp is None or self.tree or getattr(self, "blk", 1) <= 1 or getattr(sp, "glue_on", False): return
+    wg, wa = (OA.host_invalidate(t).numpy().reshape(-1, R.H).copy() for t in (self.Win_g, self.Win_a))
+    sp.set_glue({l: (wa[self.aidx[l]] if R.LAYER_TYPES[l] == "full" else wg[self.gidx[l]]) for l in range(R.NL)}, self.blk)
   def _ver(self, m):
     """The verify geometry for m tokens (Layers(m): compact rows), sharing the weight slots; its two ping-pong row buffers."""
     if m not in self.vers:
@@ -619,6 +625,10 @@ class Model:
       if (cs := os.environ.get("QWEN_CPU_SPLIT", "0") or "0") not in ("0", "off") and m <= 4 and R.HAD:   # a share, or per linear (cpu_split.py)
         import cpu_split; cpu_split.CpuSplit(V_, cs, chain=not self.tree)
       self.vers[m] = V_; self.xbvs[m] = [V_.K.rows_buf("xiov0", R.H), V_.K.rows_buf("xiov1", R.H)]
+      # QWEN_CPU_GLUE=1 (default 0; the chain verify in layer blocks, 512-block models): inside a block, a layer's closing residual
+      # and the next layer's input norm + rotation run on the CPU pool (cpu_split.c's glue: the NPU kernels' operations in their
+      # order, the same bits) instead of two NPU launches; the NPU hands off with one one-task kernel (cpu_sync)
+      self._glue_init(V_)
     return self.vers[m]
   def _mtp_init(self):
     """The MTP head: its attention-format linears in one weight buffer (mapped into slot 0 between verify passes: the attention
@@ -804,9 +814,11 @@ class Model:
     self.draft_p, self.draft_t3 = pr, t3
     if log: self.draft_rec = dict(td=tl, f=fx, fp=px, catch_rows=a, **(dict(t3=t3) if self.head_top3 else {}))
     return d
-  def vgdn_step(self, m, par, idx, *rest):
+  def vgdn_step(self, m, par, idx, *rest, a_h=None, glue=None):
+    """`a_h` (QWEN_CPU_GLUE): the layer's input A, built by the CPU's glue after the layer before; `glue`: this layer ends in the
+    glue's hand-off (Layers.mlp) and returns the next layer's A instead of its output rows (the CPU writes those)."""
     L = self.vers[m]; slot = dict(zip(self.GDN_LIN, rest[:len(self.GDN_LIN)])); x = self.xbvs[m][par]; idh = L.K.hold("idx_held", idx)
-    a_h = L.K.rms_a(x, (self.Win_g, idh), R.H, "a_h", req=L.req_for(self.meta_gdn, ("qkv", "z")))   # (req: the split's REQ in the producer)
+    if a_h is None: a_h = L.K.rms_a(x, (self.Win_g, idh), R.H, "a_h", req=L.req_for(self.meta_gdn, ("qkv", "z")))   # (req: the split's REQ in the producer)
     ct = L.lin_cts(a_h, slot, self.meta_gdn, ("qkv", "z"))                   # one GEMM when the cache fuses qkv | z
     zd = getattr(L, "zdefer_ack", None)                                   # the CPU split's z columns ACKed after the recurrence (QWEN_CPU_SPLIT_ZDEFER)
     if self.leaf:                                                         # the leaf tree: leaves read-only from their parent's state, the deferred commit (QWEN_GDN_FAST: gdn_fast_src(tree=True))
@@ -824,7 +836,7 @@ class Model:
                          defer=(ms, self.accb) if self.defer else None, raw=self.gdn_raw or zd is not None, pre_onorm=zd)
       if R.HAD: a_o = L.K.rms_a(a_o, None, R.NV * R.DV, "a_o", norm=False, req=L.req("o"))   # o_proj's A from the fp32 rows (had_a32: whole 1024-blocks across heads)
     x = L.K.resid(x, L.lin_ct(a_o, slot, self.meta_gdn, "o"), R.H, "x1")
-    return L.mlp(x, slot, self.meta_gdn, (self.Wpost_g, idh), f"xiov{1 - par}").realize()
+    return L.mlp(x, slot, self.meta_gdn, (self.Wpost_g, idh), f"xiov{1 - par}", glue=glue).realize()
   def vblk_step_c(self, commit_fn, m, types, kvbs, *args):
     """vblk_step after a folded commit's kernel (the prompt's chunks: the previous chunk's ring copies, then the block's layers)."""
     commit_fn(); return self.vblk_step(m, types, kvbs, *args)
@@ -832,14 +844,20 @@ class Model:
     """A block of layers (types: their LAYER_TYPES; the block starts at an even layer) as one JIT: per layer its index buffer (sidx /
     aix) then its linears' views, in order; layer j reads xbvs[m][j % 2] and writes the other, as the per-layer steps do."""
     i = 0; out = None; kv = iter(kvbs)                                   # kvbs: the block's attention layers' cache base codes, in order
+    sp = getattr(self.vers[m], "cpu_split", None); gl = sp is not None and getattr(sp, "glue_on", False); a_h = None
     for j, lt in enumerate(types):
       nl = len(self.ATT_LIN if lt == "full" else self.GDN_LIN)
-      out = self.vatt_step(m, j % 2, next(kv), *args[i:i + 1 + nl]) if lt == "full" else self.vgdn_step(m, j % 2, *args[i:i + 1 + nl]); i += 1 + nl
+      # QWEN_CPU_GLUE: inside a block the CPU closes layer j (its residual, the next layer's input norm): layer j ends in the
+      # hand-off and passes the next layer its A
+      g = ("qkv" if types[j + 1] == "full" else "qkvz") if gl and j + 1 < len(types) else None
+      out = self.vatt_step(m, j % 2, next(kv), *args[i:i + 1 + nl], a_h=a_h, glue=g) if lt == "full" else self.vgdn_step(m, j % 2, *args[i:i + 1 + nl], a_h=a_h, glue=g); i += 1 + nl
+      a_h = out if g is not None else None
     return out
-  def vatt_step(self, m, par, kvb, aix, *rest):
+  def vatt_step(self, m, par, kvb, aix, *rest, a_h=None, glue=None):
     """kvb: the cache's DMA base code (the caches in ASIDs: the layer's ASID, whose views the kernel gets; 0: the stacks). The JIT is keyed by it."""
     L = self.vers[m]; Kall, Vall = self.kvs.views[kvb - 1] if self.kvs and kvb else (self.Kall, self.Vall); slot = dict(zip(self.ATT_LIN, rest[:len(self.ATT_LIN)])); x = self.xbvs[m][par]; ah = L.K.hold("aix_held", aix)
-    a_h = L.K.rms_a(x, (self.Win_a, ah), R.H, "a_h", req=L.req_for(self.meta_att, ("q", "kv"))); ct = L.lin_cts(a_h, slot, self.meta_att, ("q", "kv"))   # one GEMM when fused
+    if a_h is None: a_h = L.K.rms_a(x, (self.Win_a, ah), R.H, "a_h", req=L.req_for(self.meta_att, ("q", "kv")))   # (a_h, glue: as vgdn_step's)
+    ct = L.lin_cts(a_h, slot, self.meta_att, ("q", "kv"))   # one GEMM when fused
     gq = ct["q"][1]; gt = isinstance(gq, tuple) and not self.tree and L.K.attn_gt_ok()   # a --gtail cache (the gates at the fused tail): q alone, the gates read by attn_comb
     gd = getattr(L, "gdefer_ack", None); assert gd is None or gt, "the split's gate step: the gate-tail attention path (chain verify, <= 4 rows)"
     q_rows = L.K.unpack(ct["q"][0], R.NH * R.HD, "qc_rows", goff=gq[0]) if gt else L.K.unpack(ct["q"][0], R.NH * 2 * R.HD, "q_rows", goff=gq)
@@ -848,7 +866,7 @@ class Model:
     else: oc = L.K.attn_decm(q_rows, kv_rows, self.QN, self.KN, self.ROPE, Kall, Vall, ah, R.NH, R.NKV, R.HD, self.TMAX, R.ROT, nidx=bool(self.kvs), kvb=kvb, kvh=self.kvh,
                              gate=(ct["q"][0], gq[1]) if gt else None, pre_comb=gd)   # (gd: the CPU split's gate columns ACKed after attn_part)
     x = L.K.resid(x, L.lin_ct(L.K.rms_a(oc, None, R.NH * R.HD, "a_o", norm=False, req=L.req("o")), slot, self.meta_att, "o"), R.H, "x1")
-    return L.mlp(x, slot, self.meta_att, (self.Wpost_a, ah), f"xiov{1 - par}").realize()
+    return L.mlp(x, slot, self.meta_att, (self.Wpost_a, ah), f"xiov{1 - par}", glue=glue).realize()
   def _head_part(self, L, i, x, norm_w1, view, top3=False, hp=None, red=None, pick=None, x3=False, split=False):
     """Head part i on geometry L's rows (under TinyJit: one submission) -> its top-1 partials (`top3`: top-3); part 0 first takes the norm.
     `hp`: the head (parts, GEMM keywords, slot, vocabulary; default the model's own, `mhead`). `split`: when L's CPU split holds the
@@ -1060,7 +1078,7 @@ class Model:
       if self.gdump_layers and (ln := (b + 1) * k) in self.gdump_layers:   # QWEN_DUMP_GDN: layer ln's input rows (parity 0 after an even-length block)
         assert k % 2 == 0 and (ln == R.NL or R.LAYER_TYPES[ln] == "linear"), (k, ln)
         self._gd_x[ln] = OA.host_invalidate(self.xbvs[M][0]).numpy()[:M].copy()
-  def commit(self, a, pos, m=None, path=None, fold=False):
+  def commit(self, a, pos, m=None, path=None, fold=False, host_acc=False):
     """After verify(toks, pos) accepted a of its M tokens: the DeltaNet states and rings as after toks[:a] (posb still = pos).
     QWEN_SPEC_TREE: `path` = the committed rows (spec_tree.accept; None = the chain's first a): the state from the path's last
     row's bank, the ring from the path's raw rows, a committed rescue row's K / V rows moved to its position (gdn_commit_tree).
@@ -1081,7 +1099,7 @@ class Model:
     if self.tree:                                                         # (leaf: pathb is also the next pass's pending path, gdn_tokl)
       nc = getattr(self, "pass_nc", m) if self.leaf and path is not None else (m if self.leaf else self.NC)
       poke(self.pathb, spec_tree.path_words(list(range(a)) if path is None else path, self.M if self.leaf else m, nc))
-    elif not NPU_IDS or getattr(self, "_prompt_pass", False): self._poke_acc(a)   # QWEN_NPU_IDS: accept wrote it (not for a prompt pass)
+    elif not NPU_IDS or getattr(self, "_prompt_pass", False) or host_acc: self._poke_acc(a)   # QWEN_NPU_IDS: accept wrote it (not for a prompt pass; host_acc: the host's own count)
     if self.ringc: poke(self.cwords, QK.ring_commit_words(a, m, pos, path, nc if self.tree else None, self.M))
     c = self._commit_call(m)
     if fold and COMMIT_FOLD and self.ringc: self.pcommit = c
@@ -1156,7 +1174,13 @@ class Model:
         out.append(t)
         if t in EOS or len(out) >= max_new: break
       more = mtp and len(out) < max_new and out[-1] not in EOS            # a draft pass next: the commit rides in its job (QWEN_COMMIT_FOLD)
-      tc = time.perf_counter(); self.commit(a, pos, m, path, fold=more); tc = time.perf_counter() - tc
+      # The generation ends inside this pass (max_new, or an end token before the pass's last): commit only the rows whose tokens
+      # were kept, so the state has been fed exactly out[:-1] -- what a caller resuming from it assumes (the servers' prefix
+      # cache snapshots it at that length; committing all `a` rows left the state up to a - 1 tokens ahead of its label, and the
+      # next turn of the conversation continued from the wrong place)
+      cut = len(out) - n0 < a
+      if cut: a = len(out) - n0; path = path[:a]
+      tc = time.perf_counter(); self.commit(a, pos, m, path, fold=more, host_acc=cut); tc = time.perf_counter() - tc
       if self.dump is not None: self.dump.extend(self.v_hidden[path])     # QWEN_DUMP_HIDDEN: the committed rows' hidden states (generation too)
       if cb is not None: cb(out[n0:], tv)
       if more:                                                            # the MTP cache caught up on the committed path's hidden rows

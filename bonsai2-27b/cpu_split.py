@@ -42,6 +42,10 @@ a DeltaNet layer, qkv = q|kv on an attention layer), o, gate|up, down.
   QWEN_CPU_SPLIT_HEAD_EARLY=1 (default 0): the head's parts 1.. as steps without a REQ (part 0's A): computed back to back
   QWEN_CPU_SPLIT_MTP on an fp8 drafter cache (cpu_split_pack.py --mtp8: .f8c files): cpu_split.c fmt 2, the E4M3 codes as they are
   (fp16 products; 4.5e-4 relative rms -- the drafts only). peek(): a device buffer's words read through the host mapping
+  QWEN_CPU_GLUE=1 (default 0; qwen38_generate, the chain verify in layer blocks, 512-block models): inside a block a layer's closing
+  residual and the next layer's input norm + rotation on the CPU (set_glue; cpu_split.c GLUE_RESID_NORM: the NPU kernels' operations
+  in their order -- the same bits), the NPU handing off with one one-task kernel (qwen38_kernels.cpu_sync). The device buffers are
+  mapped uncached for the host, so the glue copies what it reads in whole lines, a share a worker. +0.6 % on the 2B
   QWEN_CPU_SPLIT_STATS=1: at exit, the orchestrator's per-pass medians (waiting for REQ, the A copies, the compute; by linear) on stderr"""
 import atexit, ctypes, os, subprocess, sys
 import numpy as np
@@ -49,7 +53,7 @@ from tinygrad import dtypes
 import qwen38_ref as R
 
 NS = 3; HERE = os.path.dirname(os.path.abspath(__file__)); NKIND = 16
-KINDS = ("qkvz", "qkv", "o", "gu", "dn", "head", "mtp", "z", "g")   # the stats' buckets (head: the ternary head's parts; mtp: the drafter's linears; z: qkvz's z columns under QWEN_CPU_SPLIT_ZDEFER; g: qkv's gate columns under QWEN_CPU_SPLIT_GDEFER)
+KINDS = ("qkvz", "qkv", "o", "gu", "dn", "head", "mtp", "z", "g", "glue")   # the stats' buckets (head: the ternary head's parts; mtp: the drafter's linears; z: qkvz's z columns under QWEN_CPU_SPLIT_ZDEFER; g: qkv's gate columns under QWEN_CPU_SPLIT_GDEFER)
 MTP_LIN = ("fc", "q", "kv", "o", "gu", "dn")      # the drafter's MTP layer's linears in its chain's order (qwen38_generate.mtp_step)
 A_TAG = {"qkvz": "a_h", "qkv": "a_h", "o": "a_o", "gu": "a_post", "dn": "a_sw"}   # each linear's A buffer (qwen38_generate.vgdn_step / vatt_step, Layers.mlp)
 class Step(ctypes.Structure):
@@ -57,13 +61,17 @@ class Step(ctypes.Structure):
               ("K", ctypes.c_int32), ("N", ctypes.c_int32), ("n0", ctypes.c_int32), ("gstride", ctypes.c_int32), ("kind", ctypes.c_int32), ("pad_", ctypes.c_int32), ("codes2", ctypes.c_void_p),
               ("fmt", ctypes.c_int32), ("rows", ctypes.c_int32), ("n1", ctypes.c_int32), ("flags", ctypes.c_int32)]
 
+class Glue(ctypes.Structure):   # cpu_split.c's glue_t
+  _fields_ = [("kind", ctypes.c_int32), ("rows", ctypes.c_int32), ("c", ctypes.c_int32), ("hb", ctypes.c_int32), ("n0", ctypes.c_int32), ("gstride", ctypes.c_int32),
+              ("post", ctypes.c_float), ("eps", ctypes.c_float), ("ct", ctypes.c_void_p), ("xin", ctypes.c_void_p), ("xout", ctypes.c_void_p), ("w", ctypes.c_void_p), ("mirror", ctypes.c_void_p)]
+
 _lib = None
 def lib(cpus):
   global _lib
   if _lib is None:
     so, src = os.path.join(HERE, "libcpu_split.so"), os.path.join(HERE, "cpu_split.c")
     if not os.path.exists(so) or os.path.getmtime(so) < max(os.path.getmtime(src), os.path.getmtime(os.path.join(HERE, "cpu_split_asm.h"))):
-      subprocess.check_call(["gcc", "-O3", "-march=armv8.2-a+fp16+i8mm", "-shared", "-fPIC", "-pthread", "-o", so, src])
+      subprocess.check_call(["gcc", "-O3", "-ffp-contract=off", "-march=armv8.2-a+fp16+i8mm", "-shared", "-fPIC", "-pthread", "-o", so, src])   # (no fused multiply-add but the written ones: the glue's bits)
     _lib = ctypes.CDLL(so); _lib.cs_wait.restype = ctypes.c_int; _lib.cs_init(len(cpus), (ctypes.c_int * len(cpus))(*cpus))
     _lib.cs_set_kernel(int(os.environ.get("QWEN_CPU_SPLIT_KERNEL", "7461")))
     if os.environ.get("QWEN_CPU_SPLIT_EVEN", "0") == "1": _lib.cs_set_weights(None)
@@ -173,10 +181,12 @@ class CpuSplit:
       if self.gdefer and "qkv" in ks:
         assert isinstance(sub["q"][1], tuple), f"cpu_split: layer {l}'s q|kv is not gate-tail but another layer's is (a mixed cache)"
         dc[l, "qkv"] = (16 * NS * sub["q"][1][1], "g")
-    self.steps = (Step * (sum(len(ks) for _, ks in order) + len(dc)))(); self._keep = []; self.first = []; i = 0
+    self.steps = (Step * (sum(len(ks) for _, ks in order) + len(dc)))(); self._keep = []; self.first = []; i = 0; self._sk = []; self._cva = cva
     for l, ks in order:
       self.first.append(i)
       for k in ks:
+        self._sk.append((l, k))
+        if (l, k) in dc: self._sk.append((l, dc[l, k][1]))
         c2, sct = weights(L.cache, l, k); self._keep += [c2, sct]; n0 = self.gn[k] * 16 * NS
         self.steps[i] = Step(None, sct.ctypes.data, va(self.a[k]), cva[k], shp[k][0], self.npad[k], n0, L.nrb * NS * 192, KINDS.index(k), 0, c2.ctypes.data, 0, L.K.real); i += 1
         if (l, k) in dc:   # the step's columns end at the deferred ones' first; the deferred step after it (flags 1: the same A)
@@ -220,11 +230,46 @@ class CpuSplit:
       print(f"cpu_split head share {self.head_share} NPU groups {self.head_gn}: {len(self.acc_head)} head jobs, per job (median) wait {m['wait_ms']:.2f} ms, "
             f"A copies {m['copy_ms']:.2f} ms, compute {m['compute_ms']:.2f} ms", file=sys.stderr, flush=True)
     if not self.acc: return
+    if getattr(self, "glue_on", False):
+      g = (ctypes.c_double * 6)(); self.lib.cs_glue_stats(g)
+      print(f"cpu_split glue ({self.L.n} rows): {int(g[5])} calls, us a call: invalidate {g[0] / 1e3:.1f}, copies in {g[1] / 1e3:.1f}, compute {g[2] / 1e3:.1f}, "
+            f"rows out {g[3] / 1e3:.1f}, A out {g[4] / 1e3:.1f}", file=sys.stderr, flush=True)
     m = {k: float(np.median([a[k] for a in self.acc])) for k in self.acc[0] if k != "by"}
     by = {k: tuple(float(np.median([a["by"][k][j] for a in self.acc])) for j in range(2)) for k in self.acc[0]["by"]}
     print(f"cpu_split shares {self.share} NPU groups {self.gn}: {len(self.acc)} passes, per pass (median) wait {m['wait_ms']:.2f} ms, "
           f"A copies {m['copy_ms']:.2f} ms, compute {m['compute_ms']:.2f} ms (longest step {m['max_compute_ms']:.3f} ms), {m['steps']:.0f} steps; "
           + ", ".join(f"{k} wait {w:.2f} compute {c:.2f} ms" for k, (w, c) in by.items()), file=sys.stderr, flush=True)
+  def set_glue(self, win, blk):
+    """QWEN_CPU_GLUE: inside each block of `blk` layers, layer l's closing residual and layer l + 1's input norm + rotation on the
+    CPU (cpu_split.c GLUE_RESID_NORM) -- after l's dn step (now without an ACK) a glue step (its REQ: the NPU's dn part is done;
+    it writes the layer's output rows and the next layer's first linear's A, then ACKs), and l + 1's first step takes that A
+    (no REQ, no copy). `win`: {layer: its input norm's (1 + weight) x signs [H], host}. Needs dn and the layers' first linears
+    split, the hand-off kernels, no deferred steps, a 512-block model at <= 4 rows."""
+    L, K = self.L, self.L.K; ok = (self.handoff and self.agm and not self.shadow and not self.zdefer and not self.gdefer and "dn" in self.gn and K.had_b == 512
+                                   and K.had_post != 1.0 and L.K.real <= 4 and all(l in win for l in self.layers))
+    if not ok: print("   QWEN_CPU_GLUE: not available for this split (needs dn and the first linears split, no deferred steps, 512 blocks): off", flush=True); return
+    va = lambda t: t.uop.buffer._buf.va
+    xin = va(K.buf("x1", K.rows * R.H, dtypes.float32)); xo = [va(K.buf(f"xiov{p}", K.rows * R.H, dtypes.float32)) for p in (0, 1)]
+    old = [(self._sk[i], self.steps[i]) for i in range(len(self.steps))]; new = []; self._glues = []; self._win = {l: np.ascontiguousarray(w, np.float32) for l, w in win.items()}
+    have = set(self.layers); take = set()                                 # take: the layers whose first step reads the glue's A
+    for (l, k), st in old:
+      nk = None
+      if k == "dn" and l + 1 in have and (l + 1) % blk != 0:
+        nk = next((kk for (ll, kk), _ in old if ll == l + 1), None); nk = nk if nk in ("qkvz", "qkv") else None
+      c = Step.from_buffer_copy(st)
+      if (l, k) == next(((ll, kk) for (ll, kk), _ in old if ll == l), None) and l in take: c.flags |= 2
+      if nk is not None:
+        c.flags |= 4; new.append(((l, k), c))
+        g = Glue(0, K.real, R.H, K.had_b, self.gn["dn"] * 16 * NS, L.nrb * NS * 192, float(K.had_post), float(K.eps), self._cva["dn"], xin, xo[1 - l % 2],
+                 self._win[l + 1].ctypes.data, va(self.mirror[nk])); self._glues.append(g)
+        new.append(((l, "glue"), Step(ctypes.addressof(g), None, None, None, R.H, 0, 0, 0, KINDS.index("glue"), 0, None, 0, K.real, 0, 8))); take.add(l + 1)
+      else: new.append(((l, k), c))
+    self.steps = (Step * len(new))(); self._sk = [x for x, _ in new]; self.first = []
+    for i, (lk, c) in enumerate(new):
+      self.steps[i] = c
+      if i == 0 or lk[0] != new[i - 1][0][0]: self.first.append(i)
+    self.first.append(len(new)); self._ph_steps = {}; self.glue_on = True
+    print(f"   QWEN_CPU_GLUE: {len(self._glues)} of {len(self.layers)} layers' closing residual + next input norm on the CPU ({K.real} rows)", flush=True)
   def arm(self, i0=0, n=None):
     """Serve the next pass: layers[i0 : i0 + n] in order (default all)."""
     n = len(self.layers) - i0 if n is None else n; s0, s1 = self.first[i0], self.first[i0 + n]
@@ -258,7 +303,7 @@ class CpuSplit:
   def stats(self):
     s = (ctypes.c_double * (5 + 2 * NKIND))(); self.lib.cs_stats(s)
     return dict(wait_ms=s[0] / 1e6, copy_ms=s[1] / 1e6, compute_ms=s[2] / 1e6, max_compute_ms=s[3] / 1e6, steps=int(s[4]),
-                by={k: (s[5 + KINDS.index(k)] / 1e6, s[5 + NKIND + KINDS.index(k)] / 1e6) for k in list(self.gn) + ["head", "mtp"] + (["z"] if self.zdefer else []) + (["g"] if self.gdefer else [])})
+                by={k: (s[5 + KINDS.index(k)] / 1e6, s[5 + NKIND + KINDS.index(k)] / 1e6) for k in list(self.gn) + ["head", "mtp"] + (["z"] if self.zdefer else []) + (["g"] if self.gdefer else []) + (["glue"] if getattr(self, "glue_on", False) else [])})
 
 
 class MtpSplit:

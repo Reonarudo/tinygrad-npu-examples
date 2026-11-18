@@ -357,7 +357,7 @@ class Layers:
     return x.cast(dtypes.half).reshape(Rr // 12, 3, 4, K // (4 * KS), KS, 4).permute(3, 0, 4, 1, 2, 5).contiguous().bitcast(dtypes.uint16)
   def C(self, ct, ngroups):
     return ct.reshape(ngroups, self.nrb, NS, 3, 4, 4, 4).permute(1, 3, 5, 0, 2, 4, 6).reshape(self.R, 16 * NS * ngroups)
-  def lin_ct(self, a, slot, meta, k, full=False):
+  def lin_ct(self, a, slot, meta, k, full=False, ack=True):
     """The GEMM of a prebuilt A layout: the raw fp32 C tiles [ngroups][nrb][3][192], in the persistent buffer `ct_<k>`."""
     N, npad, K = meta[k]; ng = npad // (16 * NS)
     out = self.K.buf(f"ct_{k}", ng * self.nrb * NS * 192, dtypes.float32)
@@ -373,7 +373,7 @@ class Layers:
     assert fold is None or (split and sp.handoff and sp.agm and fold is sp.mirror[k]), f"lin_ct {k}: an A produced for another hand-off"
     if split and sp.handoff and fold is None: self.K.cpu_req_copy(a, sp.mirror[k]) if sp.agm else self.K.cpu_req()   # the split's hand-off: REQ once the A is in DDR, ACK (the CPU's columns written) before the C's consumer
     ct = OA.gemm_gs(a, slot[k], ks=self.gks, ns=NS, nrb=self.nrb, nslices=K // (4 * self.gks), ngroups=ng, b8=True, bscale=True, q8=self.gq8, scales=self.gsc, piece=piece, rows=rows, out=out, **self.tern_kw).realize()
-    if split and sp.handoff: self.K.cpu_ack()
+    if split and sp.handoff and ack: self.K.cpu_ack()                  # (ack=False: the CPU glue's hand-off follows and takes the ACK)
     return ct
   def req(self, k):
     """The DDR mirror of split linear k when its hand-off would copy the A there (lin_ct's cpu_req_copy), for the A's producer to
@@ -530,13 +530,16 @@ class Layers:
     if R.LAYER_TYPES[l] == "full": return self.attention_layer(x, l), None
     return self.gdn_layer(x, l, **kw)
 
-  def mlp(self, x, slot, meta, w1_post, out="x2", a_post=None, next_norm=None):
+  def mlp(self, x, slot, meta, w1_post, out="x2", a_post=None, next_norm=None, glue=None):
     """x + down(silu(gate(h)) * up(h)), h = rmsnorm(x) * w1_post: three hand-written kernels around the two GEMMs; into the persistent `out`.
     `w1_post`: the 1 + w vector, or (stack, idx) -- read on the device (no per-layer copy). `a_post`: h's A already built (the caller fused
     it into x's residual, Kernels.resid_had). `next_norm` ((stack, idx) of the next layer's input norm): the closing residual also
     builds that norm's A ("a_h") -> (out rows, A)."""
     if a_post is None: a_post = self.K.rms_a(x, w1_post if isinstance(w1_post, tuple) else self.K.hold("w_post", w1_post), R.H, "a_post", req=self.req("gu"))
-    ct_dn = self.lin_ct(self.K.swiglu_a(self.lin_ct(a_post, slot, meta, "gu"), R.INTER, "a_sw", req=self.req("dn")), slot, meta, "dn")   # (a split linear's hand-off: in lin_ct)
+    ct_dn = self.lin_ct(self.K.swiglu_a(self.lin_ct(a_post, slot, meta, "gu"), R.INTER, "a_sw", req=self.req("dn")), slot, meta, "dn", ack=glue is None)   # (a split linear's hand-off: in lin_ct)
+    # QWEN_CPU_GLUE (`glue`: the next layer's first split linear): the closing residual and the next layer's input norm run on the
+    # CPU (cpu_split.c's glue: it writes `out`'s rows and that linear's A); here only the hand-off -> the next layer's A
+    if glue is not None: return self.K.cpu_sync("a_h", R.H, self.cpu_split.mirror[glue])
     if next_norm is None: return self.K.resid(x, ct_dn, R.H, out)
     return self.K.resid_had(x, ct_dn, R.H, out, next_norm, "a_h")
 

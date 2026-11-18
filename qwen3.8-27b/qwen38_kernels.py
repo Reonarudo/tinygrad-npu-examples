@@ -3955,6 +3955,28 @@ __kernel void cpu_ack(__global int* restrict out, __global int* restrict desc, c
   }}
   DMA_WAIT_ALL();
 }}"""
+def cpu_sync_desc(nbytes): return V._desc_slots((nbytes // 2,), (64,), (NT * 64,))
+def cpu_sync_src(nbytes, maxp=1 << 22):
+  """The CPU glue's hand-off (bonsai2-27b/cpu_split.c GLUE_RESID_NORM; one task): the NPU's part of a split linear is done, so raise
+  the NT REQ lines (the CPU then reads this linear's tiles and builds the next linear's A in its DDR mirror); wait for ACK == 1 and
+  clear it (cpu_ack's poll and bound); copy the A from the mirror to its buffer (two halves through LSRAM, as cpu_req_copy the
+  other way). args: out (the A), ack (the ACK line), reqw (REQ, NT 64-byte lines), mirror (DDR), desc (cpu_sync_desc(nbytes))."""
+  h = nbytes // 2; assert nbytes % 128 == 0 and h <= 8192, nbytes
+  return V.FULL_H + f"""
+__kernel void cpu_sync(__global char* restrict out, __global int* restrict ack, __global int* restrict reqw, __global char* restrict mirror, __global int* restrict desc, const int core_id) {{
+  if (core_id == 0) {{
+    __global volatile int* w = (__global volatile int*)LSF(16384);
+    for (int j = 0; j < {NT}; j++) w[16 * j] = 1;
+    DMA_DRAIN(2, DESC(desc, 2), 16384, (int)reqw); DMA_WAIT(2);
+    int v = 0;
+    for (int n = 0; n < {maxp} && v != 1; n++) {{ DMA_FILL(2, DESC(desc, 1), 16384, (int)ack); DMA_WAIT(2); v = w[0]; }}
+    w[0] = 0; DMA_DRAIN(2, DESC(desc, 1), 16384, (int)ack);
+    DMA_FILL(0, DESC(desc, 0), 0, (int)mirror); DMA_FILL(1, DESC(desc, 0), {h}, (int)(mirror + {h}));
+    DMA_WAIT(0); DMA_DRAIN(0, DESC(desc, 0), 0, (int)out);
+    DMA_WAIT(1); DMA_DRAIN(1, DESC(desc, 0), {h}, (int)(out + {h}));
+  }}
+  DMA_WAIT_ALL();
+}}"""
 
 class Kernels:
   """The kernels for one row geometry (nrb row blocks), registered once per (kind, shape). Every output is a persistent,
@@ -4230,6 +4252,13 @@ class Kernels:
     """REQ after copying the A `a` (GM staging or DDR) to the DDR `mirror` (cpu_req_copy_src): NT REQ lines."""
     nb = mirror.shape[0] * mirror.dtype.itemsize
     return self.call(f"cpu_req_copy|{nb}", cpu_req_copy_src(nb), self.buf("cpu_req_w", 16 * NT, dtypes.int32), mirror, a, self.desc(f"cpu_req_copy_desc{nb}", lambda: cpu_req_copy_desc(nb)))
+  def cpu_sync(self, tag, c, mirror):
+    """The CPU glue's hand-off (cpu_sync_src) -> the A buffer `tag` of width c, copied from the CPU-written `mirror`; lin_ct takes
+    it as an A whose REQ is already served (req_folded)."""
+    a = self.buf(tag, self.a_size(c), dtypes.uint16); nb = mirror.shape[0] * mirror.dtype.itemsize; assert nb == a.shape[0] * 2, (nb, a.shape)
+    self.call(f"cpu_sync|{nb}", cpu_sync_src(nb), a, self.buf("cpu_ack_w", 16, dtypes.int32), self.buf("cpu_req_w", 16 * NT, dtypes.int32), mirror,
+              self.desc(f"cpu_sync_desc{nb}", lambda: cpu_sync_desc(nb)), ntasks=1)
+    self.req_folded[id(a)] = mirror; return a
   def cpu_ack(self):
     # one task: only task 0 polls and clears the word, and a chained 12-task launch costs the job ~11.8 us of device time, a 1-task
     # one ~3.8 (board: -1.7 ms a 27B verify pass)

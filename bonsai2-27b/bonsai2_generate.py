@@ -36,9 +36,13 @@ os.environ.setdefault("QWEN_SPEC", "8" if os.environ["QWEN_MODEL"] == "bonsai2-2
 # its CPU files (cpu_split_pack.py) -- the 27B 6.70 -> 11.42 tok/s on the 10-prompt gate, the 2B +10 % (the same tokens; QWEN_CPU_SPLIT=0:
 # the NPU alone). With it: the chain verify (the split's deferred steps run in its kernels), the host on the NPU's interrupt CPU alone and
 # the pool on the other big cores (cpu_split.pool_cpus: never the little ones); on the 27B the q4t drafter (its 4-bit linears split too).
-# The 2B's GEMMs are smaller against their fixed cost a call, so its best shares are lower (0.30-0.40 flat)
-SPLIT_SHARES = {"bonsai2-27b": lambda gt: f"qkvz=0.70,qkv={0.65 if gt else 0.50},gu=0.50,o=0.44,dn=0.44", "bonsai2-2b": lambda gt: "qkvz=0.35,qkv=0.35,gu=0.35,o=0.30,dn=0.30"}
-SPLIT_HEAD = {"bonsai2-27b": 0.50, "bonsai2-2b": 0.35}
+# The 2B's shares are those of its decode default below (one draft a pass: a 2-row verify), each linear at its own snap step
+# (cpu_split.py: the NPU's groups in twelves -- gate|up 108, qkv|z 72, q|kv 48, down 24, o 12 of 256 / 171 / 108 / 43 / 43); its
+# fp8 drafter's layer is split as it is (cpu_split_pack.py --mtp8)
+SPLIT_SHARES = {"bonsai2-27b": lambda gt: f"qkvz=0.70,qkv={0.65 if gt else 0.50},gu=0.50,o=0.44,dn=0.44", "bonsai2-2b": lambda gt: "qkvz=0.58,qkv=0.50,gu=0.578,o=0.72,dn=0.45"}
+SPLIT_HEAD = {"bonsai2-27b": 0.50, "bonsai2-2b": 0.60}
+SPLIT_MTP = {"bonsai2-27b": "0.55", "bonsai2-2b": "0.5"}
+TWO = os.environ["QWEN_MODEL"] == "bonsai2-2b"
 if os.environ["QWEN_MODEL"] in SPLIT_SHARES and os.environ["QWEN_SPEC"] != "0" and "QWEN_CPU_SPLIT" not in os.environ:
   _c = os.path.expanduser(os.environ["QWEN_NPU"]); _q4t = os.path.join(_c, "mtp_q4t")
   if "QWEN_MTP_CACHE" not in os.environ and os.path.exists(os.path.join(_q4t, f"L{R.NL}_small.npz")): os.environ["QWEN_MTP_CACHE"] = _q4t
@@ -48,21 +52,27 @@ if os.environ["QWEN_MODEL"] in SPLIT_SHARES and os.environ["QWEN_SPEC"] != "0" a
     _gt = any("gtail.npy" in zipfile.ZipFile(f).namelist() for f in glob.glob(os.path.join(_c, "L*_fused.npz")))   # (the gates at the q|kv tail)
     _hd = os.path.exists(os.path.join(_c, "cpu_split", "head_0.c2c"))
     os.environ["QWEN_CPU_SPLIT"] = SPLIT_SHARES[os.environ["QWEN_MODEL"]](_gt) + (f",head={SPLIT_HEAD[os.environ['QWEN_MODEL']]:.2f}" if _hd else "")
-    if os.path.isdir(os.path.join(_m, "cpu_split")): os.environ.setdefault("QWEN_CPU_SPLIT_MTP", "0.55")
+    if os.path.isdir(os.path.join(_m, "cpu_split")): os.environ.setdefault("QWEN_CPU_SPLIT_MTP", SPLIT_MTP[os.environ["QWEN_MODEL"]])
 if os.environ.get("QWEN_CPU_SPLIT", "0") not in ("0", "off"):
   os.environ.setdefault("QWEN_SPEC_TREE", "off"); os.environ.setdefault("QWEN_CPUS", "irq")
+  os.environ.setdefault("QWEN_HEAD_OVERLAP", "1")             # the head's job submitted under the last layer block (27B and 2B gated)
+  if TWO:   # the 2B with the split (the 10-prompt gate, identical tokens; each a few tenths of a per cent to +1 %):
+    os.environ.setdefault("QWEN_CPU_SPLIT_HEAD_EARLY", "1")   # the head's parts back to back on the CPU (its share 0.60 goes with it)
+    os.environ.setdefault("QWEN_CPU_GLUE", "1")               # a layer's closing residual + the next input norm on the CPU (the same bits)
 if os.environ["QWEN_MODEL"] != "bonsai2-27b": os.environ.setdefault("QWEN_KV_ASID", "1")    # the K / V caches in the NPU's ASIDs 1-3 (3 GiB each, reached by DMA): contexts past the ASID0 window
 if os.environ.get("QWEN_KV_ASID") == "1": os.environ.setdefault("ZHOUYI_ASID_BASES", "0x100000000,0x200000000,0x300000000")   # the chain head's ASID bases (the KMD's layout)
 # spare rows take the drafts' rank-2/3 candidates (+3.9 % on 10 prompts, exact) -- not with the caches in ASIDs (its commit moves K / V rows in every layer's cache through ASID0 pointers)
 os.environ.setdefault("QWEN_SPEC_TREE", "off" if os.environ.get("QWEN_KV_ASID") == "1" else "leaf")
 os.environ.setdefault("QWEN_TREE_TC", "0.5")             # the chain drafts on while its path probability >= 0.5
 os.environ.setdefault("QWEN_SPEC_GEOS", "2,3,4,8" if os.environ["QWEN_SPEC"] == "8" else "2,3,4")
-os.environ.setdefault("QWEN_DRAFT_MAX", "3")
+# The 2B: one draft a pass -- a draft is ~15-25 % of its 2-row verify pass and 0.47 of first drafts are accepted, fewer of the later
+# ones (+21 % over three drafts; a second draft still loses with the drafter split) -- from the draft head's part 0 alone (+3 %)
+os.environ.setdefault("QWEN_DRAFT_MAX", "1" if TWO else "3")
 os.environ.setdefault("QWEN_MTP_EMBED", "bonsai")        # the drafted token's embedding: Bonsai's (the GGUF row)
 os.environ.setdefault("QWEN_MTP_HEAD", "bonsai")         # the draft head: Bonsai's ternary head, parts 0-1 (ids < 124416)
 QHEAD = os.environ["QWEN_MTP_HEAD"] == "qwen"            # Qwen3.8-27B's fp8 head: part 1 only when part 0's top logit is <= 20
 os.environ.setdefault("QWEN_DRAFT_TAU", "0.4" if QHEAD else "0.2")
-os.environ.setdefault("QWEN_DRAFT_PARTS", "2,thresh:20" if QHEAD else "2")
+os.environ.setdefault("QWEN_DRAFT_PARTS", "2,thresh:20" if QHEAD else "1" if TWO else "2")
 mtp = os.path.expanduser(os.environ.get("QWEN_MTP_CACHE", os.path.join(os.environ["QWEN_NPU"], "mtp")))
 drafter = os.path.exists(os.path.join(mtp, f"L{R.NL}_small.npz"))
 if os.environ["QWEN_SPEC"] != "0" and not drafter:
@@ -70,10 +80,19 @@ if os.environ["QWEN_SPEC"] != "0" and not drafter:
   # the 27B prefills in one pass; the smaller sizes' chunked prefill runs on the verify geometries, so they stay (no MTP layer loaded)
   if os.environ["QWEN_MODEL"] == "bonsai2-27b": os.environ["QWEN_SPEC"] = "0"
   else: os.environ.setdefault("QWEN_DRAFT", "none")
-# the decode loop's token ids chosen, embedded, accepted and drafted on the NPU: with the drafter, by default on the 27B. The 2B / 4B
-# (512 Hadamard blocks) take it too (QWEN_NPU_IDS=1: embed_tern_src(hb), 2026-11-17; the 2B +12.8 % at one draft a pass, lossless);
+# the decode loop's token ids chosen, embedded, accepted and drafted on the NPU: with the drafter, by default on the 27B and the 2B
+# (512 Hadamard blocks: embed_tern_src(hb); +12.8 % at one draft a pass, lossless). The 4B takes it too (QWEN_NPU_IDS=1, not gated);
 # not the 9B (its 4096 block does not fit the embedding kernel's LSRAM)
-os.environ.setdefault("QWEN_NPU_IDS", "1" if os.environ["QWEN_SPEC"] != "0" and drafter and os.environ["QWEN_MODEL"] == "bonsai2-27b" else "0")
+os.environ.setdefault("QWEN_NPU_IDS", "1" if os.environ["QWEN_SPEC"] != "0" and drafter and os.environ.get("QWEN_DRAFT") != "none"
+                      and os.environ["QWEN_MODEL"] in ("bonsai2-27b", "bonsai2-2b") else "0")
+# The host-side levers (the 10-prompt gates, identical tokens): the 2B 49.2 -> 56.6 tok/s with the split's above; the 27B +1.2 %
+# on every prompt with these two and QWEN_HEAD_OVERLAP (its passes are 9x longer, so the host's share is smaller)
+if os.environ["QWEN_MODEL"] in ("bonsai2-27b", "bonsai2-2b"):
+  os.environ.setdefault("QWEN_JIT_FAST", "1")                 # captured JITs replayed without tinygrad's per-call input preparation (the 2B +2.7 %)
+  if os.environ["QWEN_NPU_IDS"] == "1": os.environ.setdefault("QWEN_IDS_FOLD", "1")   # the ids' embedding / acceptance in the block's / head's job (the 2B +2.7 %)
+if TWO:
+  if drafter and os.environ.get("QWEN_DRAFT") != "none" and "8" in os.environ["QWEN_SPEC_GEOS"].split(",") and os.environ["QWEN_SPEC_TREE"] == "off":
+    os.environ.setdefault("QWEN_MTP_PROMPT", "8")             # the drafter's pass over the prompt in 8-row chunks, its head on the last only
 import qwen38_generate                                                   # noqa: E402
 
 if __name__ == "__main__": qwen38_generate.main()

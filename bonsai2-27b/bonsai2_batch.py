@@ -14,6 +14,9 @@ import argparse, functools, os, sys, time
 import numpy as np
 HERE = os.path.dirname(os.path.abspath(__file__))
 os.environ.setdefault("QWEN_MODEL", "bonsai2-2b"); os.environ.setdefault("QWEN_DRAFT", "none"); os.environ.setdefault("QWEN_SPEC_GEOS", "2,3,4")
+# The batched step runs on the NPU alone: the NPU + CPU column split (bonsai2_generate's default when the cache has its CPU files) hooks
+# the <= 4-row geometries' GEMMs and waits for a CPU half this step never arms -- with it on, N <= 4 users hung after the set-up
+os.environ.setdefault("QWEN_CPU_SPLIT", "0")
 import bonsai2_generate                                                   # noqa: E402,F401  (the paths and the small sizes' settings)
 sys.path.insert(0, os.path.join(HERE, "..", "seqmix"))
 from tinygrad import Tensor, dtypes                                      # noqa: E402

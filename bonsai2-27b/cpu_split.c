@@ -35,7 +35,10 @@ typedef struct { const uint8_t *codes4; const float *sct; const uint16_t *a; flo
 // w = u - 8, u in 0..15) in codes4 as [K/128][N/2 column pairs][8][16 B]: byte j of block b holds column 2cp + j / 8 at k = 16 b + j % 8
 // (bits 3:0) and k = 16 b + 8 + j % 8 (bits 7:4); sct the (slice, column) scale (cols_q4). rows: the geometry's rows (<= 2: one row
 // pair computed). n1: the columns' end (0: N). flags bit 0: the previous step's A (no REQ, no copy, no limbs: the CPU split's z
-// columns, computed under the NPU's recurrence and ACKed before the gated norm -- QWEN_CPU_SPLIT_ZDEFER).
+// columns, computed under the NPU's recurrence and ACKed before the gated norm -- QWEN_CPU_SPLIT_ZDEFER). flags bit 1: the A is
+// already in the pool's copy (the glue step before it wrote it): no REQ, no copy. bit 2: no ACK after the step (a glue step follows
+// and ACKs). bit 3: a glue step (codes4 = its glue_t): after its REQ (the NPU's part of the linear before it is done) the
+// orchestrator runs the glue, then ACKs.
 // fmt 2: E4M3 weights (an fp8 drafter's linears, the cache's own codes: no requantisation) in codes4 as [K/128][N][128 B] (column n's
 // 128 k of a slice together), sct the (slice, column) scale (cols_f8: fp16 products, 8 a lane, summed in fp32).
 
@@ -284,15 +287,114 @@ static void copy_part(const step_t *s, int id) {   // the A out of the device bu
   while (atomic_load(&step_copied) < pool_n) ;
 }
 
+// ---- the glue (QWEN_CPU_GLUE): a layer's small kernels between two split linears, on the CPU instead of two NPU launches.
+// GLUE_RESID_NORM: after the down projection -- x2 = x1 + C (the residual: resid32q's add), then the next layer's input norm and
+// rotation into that layer's first linear's A (had_fast's "rms" producer): the row's sum of squares in 8 lanes (fused, K
+// ascending), the lanes summed in order, inv = sqrt(1 / (sum / c + eps)), v = (x inv) w, the unnormalised Walsh-Hadamard transform
+// of each hb-block (stages 1, 2, 4, ...: a + b, a - b), times post, to fp16 -- the NPU kernels' operations in their order, so
+// the same bits (checked against the device's own buffers over 24 passes: cs_test_glue). Built with -ffp-contract=off:
+// only the fma written here is fused.
+typedef struct {
+  int32_t kind, rows, c, hb, n0, gstride; float post, eps;
+  const float *ct;        // the added linear's C tiles (columns < n0 written by the NPU: their lines are dropped first)
+  const float *xin;       // the residual rows read (device buffer, NPU-written), pitch c
+  float *xout;            // the residual rows written (device buffer), pitch c
+  const float *w;         // the next norm's (1 + weight) x signs [c]
+  uint16_t *mirror;       // the next linear's A (DDR mirror: the NPU copies it to its A buffer), the compact layout [c/4][4 rows][4 k]
+} glue_t;
+static float *gl_buf = NULL; static size_t gl_cap = 0;
+static double gl_t[6]; static long gl_n;   // the glue's phases (ns, summed): invalidate, the copies in, the compute, the rows out, the A out
+void cs_glue_stats(double *out) { for (int i = 0; i < 6; i++) out[i] = gl_n ? gl_t[i] / gl_n : 0; out[5] = (double)gl_n; }
+static inline void inval_range(const void *p, size_t n) { const char *a = (const char *)((uintptr_t)p & ~(uintptr_t)63), *e = (const char *)p + n; for (; a < e; a += 64) line_inval(a); }
+static inline void clean_range(const void *p, size_t n) { const char *a = (const char *)((uintptr_t)p & ~(uintptr_t)63), *e = (const char *)p + n; for (; a < e; a += 64) line_clean(a); }
+static void fwht_block(float *v, int hb) {   // in place, stages 1, 2, 4, .., hb / 2: (a, b) -> (a + b, a - b)
+  for (int i = 0; i < hb; i += 8) {           // stages 1, 2, 4 inside 8 values
+    float32x4_t a = vld1q_f32(v + i), b = vld1q_f32(v + i + 4);
+    float32x4_t e = vuzp1q_f32(a, b), o = vuzp2q_f32(a, b);                 // e = x0 x2 x4 x6, o = x1 x3 x5 x7
+    float32x4_t s1 = vaddq_f32(e, o), d1 = vsubq_f32(e, o);                 // stage 1: y(2j) = s1[j], y(2j + 1) = d1[j]
+    float32x4_t e2 = vuzp1q_f32(s1, d1), o2 = vuzp2q_f32(s1, d1);           // e2 = y0 y4 y1 y5, o2 = y2 y6 y3 y7
+    float32x4_t s2 = vaddq_f32(e2, o2), d2 = vsubq_f32(e2, o2);             // stage 2: z0 z4 z1 z5 | z2 z6 z3 z7
+    float32x4_t e4 = vuzp1q_f32(s2, d2), o4 = vuzp2q_f32(s2, d2);           // e4 = z0 z1 z2 z3, o4 = z4 z5 z6 z7
+    vst1q_f32(v + i, vaddq_f32(e4, o4)); vst1q_f32(v + i + 4, vsubq_f32(e4, o4));   // stage 4
+  }
+  for (int h = 8; h < hb; h *= 2)
+    for (int i = 0; i < hb; i += 2 * h)
+      for (int j = 0; j < h; j += 4) {
+        const float32x4_t a = vld1q_f32(v + i + j), b = vld1q_f32(v + i + j + h);
+        vst1q_f32(v + i + j, vaddq_f32(a, b)); vst1q_f32(v + i + j + h, vsubq_f32(a, b));
+      }
+}
+// The device buffers are mapped uncached for the host: a load from one is a DRAM access (and a load after a store to one waits
+// for it). So the glue copies what it reads into host memory in whole lines first (the residual rows; each 16-column strip's
+// first 4 lines: rows 0-3), computes there, and writes its two results (the rows, the A) with one copy each.
+static float *gl_x = NULL, *gl_t4 = NULL; static size_t gl_xcap = 0; static const glue_t * volatile gl_cur = NULL;
+static void glue_copy(const glue_t *g, int id) {   // worker id's share of the residual rows and of the strips' first 4 lines
+  const int c = g->c, nr = g->rows > 4 ? 4 : g->rows, ns = c / 16; const size_t xl = (size_t)nr * c / 16;   // the rows' lines
+  const size_t l0 = xl * id / pool_n, l1 = xl * (id + 1) / pool_n;
+  memcpy((char *)gl_x + l0 * 64, (const char *)g->xin + l0 * 64, (l1 - l0) * 64);
+  for (int st = ns * id / pool_n; st < ns * (id + 1) / pool_n; st++)    // strip st: [4 quads][4 rows][4 cols]
+    memcpy(gl_t4 + (size_t)st * 64, g->ct + (size_t)(st / 3) * g->gstride + (st % 3) * 192, 64 * sizeof(float));
+}
+static void glue_resid_norm(const glue_t *g) {
+  const int c = g->c, nr = g->rows > 4 ? 4 : g->rows, ns = c / 16; const double tg0 = now_ns();
+  if (gl_cap < (size_t)c) { free(gl_buf); gl_buf = aligned_alloc(64, (size_t)c * sizeof(float)); gl_cap = c; }
+  if (gl_xcap < (size_t)c) { free(gl_x); free(gl_t4); gl_x = aligned_alloc(64, (size_t)c * 4 * sizeof(float)); gl_t4 = aligned_alloc(64, (size_t)ns * 64 * sizeof(float)); gl_xcap = c; }
+  // the NPU's bytes out of this core's caches: its columns' tiles (row block 0: 576 floats a group) and the residual rows
+  for (int gi = 0; gi < g->n0 / 48; gi++) inval_range(g->ct + (size_t)gi * g->gstride, 576 * sizeof(float));
+  for (int r = 0; r < nr; r++) inval_range(g->xin + (size_t)r * c, (size_t)c * sizeof(float));
+  dsb();
+  double tp0 = now_ns(), tp1, tp2, tp3; gl_t[0] += tp0 - tg0;
+  // the copies in, a share a worker (the pool is idle under the glue): glue_copy
+  gl_cur = g; atomic_store(&step_done, 0); atomic_fetch_add(&step_gen, 1);
+  glue_copy(g, 0);
+  while (atomic_load(&step_done) < pool_n - 1) ;
+  tp1 = now_ns(); gl_t[1] += tp1 - tp0;
+  uint16_t *A = acopy;                         // the next step's A (flags bit 1: no REQ, no copy)
+  memset(A, 0, (size_t)c * 8);
+  for (int r = 0; r < nr; r++) {
+    float *x = gl_x + (size_t)r * c, *v = gl_buf;
+    float32x4_t a0 = vdupq_n_f32(0), a1 = vdupq_n_f32(0);
+    for (int n = 0; n < c; n += 8) {            // column n, row r: strip n / 16, quad (n % 16) / 4, at 16 quad + 4 r + n % 4
+      const float *t0 = gl_t4 + (size_t)(n / 16) * 64 + ((n % 16) / 4) * 16 + 4 * r;
+      const float32x4_t x0 = vaddq_f32(vld1q_f32(x + n), vld1q_f32(t0)), x1 = vaddq_f32(vld1q_f32(x + n + 4), vld1q_f32(t0 + 16));
+      vst1q_f32(x + n, x0); vst1q_f32(x + n + 4, x1);
+      a0 = vfmaq_f32(a0, x0, x0); a1 = vfmaq_f32(a1, x1, x1);
+    }
+    float l[8]; vst1q_f32(l, a0); vst1q_f32(l + 4, a1);
+    float sum = l[0]; for (int i = 1; i < 8; i++) sum = sum + l[i];
+    const float m = sum * (1.0f / (float)c) + g->eps, inv = sqrtf(1.0f / m);
+    const float32x4_t iv = vdupq_n_f32(inv);
+    for (int n = 0; n < c; n += 4) vst1q_f32(v + n, vmulq_f32(vmulq_f32(vld1q_f32(x + n), iv), vld1q_f32(g->w + n)));
+    for (int b = 0; b < c; b += g->hb) fwht_block(v + b, g->hb);
+    const float32x4_t po = vdupq_n_f32(g->post);
+    for (int n = 0; n < c; n += 4) vst1_u16(A + (n / 4) * 16 + r * 4, vreinterpret_u16_f16(vcvt_f16_f32(vmulq_f32(vld1q_f32(v + n), po))));
+  }
+  gl_cur = NULL; tp2 = now_ns(); gl_t[2] += tp2 - tp1;
+  memcpy(g->xout, gl_x, (size_t)nr * c * sizeof(float)); clean_range(g->xout, (size_t)nr * c * sizeof(float)); tp0 = now_ns(); gl_t[3] += tp0 - tp2;
+  memcpy(g->mirror, A, (size_t)c * 8); clean_range(g->mirror, (size_t)c * 8); dsb(); tp3 = now_ns(); gl_t[4] += tp3 - tp0; gl_n++;
+}
+static void do_glue(const step_t *s) {
+  size_t ab = (size_t)s->K * 8;
+  if (acopy_cap < ab) { free(acopy); acopy = aligned_alloc(64, ab); acopy_cap = ab; }
+  double t0 = now_ns(); const glue_t *g = (const glue_t *)s->codes4;
+  if (g->kind == 0) glue_resid_norm(g);
+  double t1 = now_ns(); st_comp += t1 - t0; st_ck[s->kind & (NKIND - 1)] += t1 - t0;
+}
+// a test entry: the glue alone (no pool), its A left in `a_out` ([c/4][4 rows][4 k] fp16)
+void cs_test_glue(const glue_t *g, uint16_t *a_out) {
+  size_t ab = (size_t)g->c * 8; uint16_t *sv = acopy; size_t svc = acopy_cap; acopy = aligned_alloc(64, ab); acopy_cap = ab;
+  glue_resid_norm(g); memcpy(a_out, acopy, ab); free(acopy); acopy = sv; acopy_cap = svc;
+}
+
 static void do_step(const step_t *s) {      // the orchestrator: A in (all workers, a share each), the pool, C out
   size_t ab = (size_t)s->K * 8;             // K/4 k-quads x 16 halves x 2 B
   if (acopy_cap < ab) { free(acopy); acopy = aligned_alloc(64, ab); acopy_cap = ab; }   // (between steps: no worker reads it now)
   if (limbs_cap < (size_t)(s->K / 128)) { free(limbs); limbs = aligned_alloc(64, (size_t)(s->K / 128) * sizeof(alimb_t)); limbs_cap = s->K / 128; }
   if (s->fmt == 2 && fa8_cap < (size_t)(s->K / 128)) { free(fa8); fa8 = aligned_alloc(64, (size_t)(s->K / 128) * sizeof(af8_t)); fa8_cap = s->K / 128; }
   double t0 = now_ns();
-  const int same_a = s->flags & 1;
+  const int same_a = s->flags & 1, have_a = s->flags & 2;   // have_a: the glue left the A in acopy (no copy; the limbs still to prepare)
   cur = s; atomic_store(&step_done, 0); atomic_store(&step_copied, 0); atomic_store(&step_prepped, 0); atomic_fetch_add(&step_gen, 1);
-  if (!same_a) copy_part(s, 0);
+  if (!same_a && !have_a) copy_part(s, 0);
   double t1 = now_ns();
   if (!same_a) prep_shared(s, 0);
   run_slice(s, 0);
@@ -310,7 +412,7 @@ static void *worker(void *p) {
       st_wait = st_copy = st_comp = st_max_comp = 0; st_steps = 0; int bad = 0; memset(st_wk, 0, sizeof st_wk); memset(st_ck, 0, sizeof st_ck);
       for (int i = 0; i < nsteps && !bad; i++) {
         double t0 = now_ns();
-        if (req && !(sched[i].flags & 1)) {
+        if (req && !(sched[i].flags & 3)) {
           long spins = 0;
           for (;;) {
             for (int j = 0; j < req_lines; j++) line_inval(req + 16 * j);
@@ -323,9 +425,9 @@ static void *worker(void *p) {
           dsb();
         }
         double tw = now_ns() - t0; st_wait += tw; st_wk[sched[i].kind & (NKIND - 1)] += tw;
-        if (!no_compute && !(no_compute_head && sched[i].kind == 5)) do_step(&sched[i]);
+        if (!no_compute && !(no_compute_head && sched[i].kind == 5)) { if (sched[i].flags & 8) do_glue(&sched[i]); else do_step(&sched[i]); }
         st_steps++;
-        if (ack) {   // the NPU has taken the previous ACK (cpu_ack clears it): a step without a REQ (flags bit 0) can finish before that
+        if (ack && !(sched[i].flags & 4)) {   // the NPU has taken the previous ACK (cpu_ack clears it): a step without a REQ (flags bit 0) can finish before that
           double ta = now_ns();
           for (;;) { line_inval(ack); dsb(); if (*ack == 0) break; if (now_ns() - ta > 5e9) { bad = i + 1; break; } }
           st_wait += now_ns() - ta;
@@ -341,7 +443,12 @@ static void *worker(void *p) {
     } else {
       while (atomic_load(&pass_active)) {
         int g = atomic_load(&step_gen);
-        if (g != seen_step) { seen_step = g; if (!(cur->flags & 1)) { copy_part(cur, id); prep_shared(cur, id); } run_slice(cur, id); atomic_fetch_add(&step_done, 1); }
+        if (g != seen_step) {
+          seen_step = g;
+          if (gl_cur) glue_copy(gl_cur, id);       // (a glue step: the copies in)
+          else { if (!(cur->flags & 1)) { if (!(cur->flags & 2)) copy_part(cur, id); prep_shared(cur, id); } run_slice(cur, id); }
+          atomic_fetch_add(&step_done, 1);
+        }
       }
       seen_step = atomic_load(&step_gen);
     }
