@@ -1134,6 +1134,12 @@ class Model:
         head_c0=[p_["c0"] for p_ in self.dhead["parts"]], pos0=pos,
         **(dict(drafter=dict(cache=self.mtp_cache, embed=self.mtp_emb, head=self.mtp_head)) if self.mtp_x else {}), max_new=max_new, time=time.time(),
         env={k: v for k, v in os.environ.items() if k.startswith("QWEN_")})}) + "\n")
+    # QWEN_PLAIN_AT: past this position plain greedy steps (Model.step: one row, the decode attention) instead of verify passes -- a
+    # verify pass's attention grows ~2.7x faster with the context than a plain step's (the 2B: the two cross near 20k positions).
+    # The same tokens either way; a prompt already past it skips the drafter's catch-up
+    plain_at = int(os.environ.get("QWEN_PLAIN_AT", "0") or 0)
+    to_plain = lambda p_: plain_at > 0 and p_ >= plain_at
+    if mtp and to_plain(pos): mtp = False; drafter = None
     if mtp:                                                               # the MTP cache over the prompt, then the first drafts
       t0 = time.perf_counter(); n = len(self.pre_hidden); nxt_all = self.ids_prompt[1:] + [first]
       cm = max(self.mtp_geos); p0 = min(getattr(self, "mtp_from", 0), n - 1)   # the prefix cache: the drafter's rows for [0, p0) are in its cache
@@ -1141,9 +1147,9 @@ class Model:
         c1 = min(n, c0 + cm)
         if c1 < n: self.mtp_pass(self.mtp_rows(self.pre_hidden[c0:c1], nxt_all[c0:c1]), c0, head=not self.mtp_prompt)
         else: dnext = self.mtp_draft(self.pre_hidden[c0:c1], nxt_all[c0:c1], c0, self.kmax)
-      st["t_draft"] = st.get("t_draft", 0.0) + time.perf_counter() - t0
+      st["t_draft"] = st.get("t_draft", 0.0) + time.perf_counter() - t0; st["t_catchup"] = time.perf_counter() - t0   # (the prompt's: once a generation)
       if NPU_IDS: poke(self.vtok, np.array(([first] + dnext + [dnext[-1]] * 16)[:16], np.int32))   # the prompt's: the last host write of ids
-    while len(out) < max_new and cur not in EOS:
+    while len(out) < max_new and cur not in EOS and not to_plain(pos):
       if flog: drec = self.draft_rec
       if mtp: d = dnext
       else: d = list(drafter(cur, pos, out))[:self.M - 1]; d += [cur] * (self.M - 1 - len(d))
@@ -1200,6 +1206,12 @@ class Model:
       cur, pos = out[-1], pos + a
       st.setdefault("passes", 0); st["passes"] += 1; st.setdefault("accepted", 0); st["accepted"] += a - 1; st.setdefault("t_verify", 0.0); st["t_verify"] += tv
     self._commit_flush()                                                  # (a commit no draft pass took: run it)
+    if to_plain(pos):                                                     # past QWEN_PLAIN_AT: plain steps from `cur` (generated, not yet fed)
+      while len(out) < max_new and cur not in EOS and pos < self.TMAX:
+        t0 = time.perf_counter(); t = int(np.argmax(self.step(cur, pos))); tv = time.perf_counter() - t0
+        out.append(t); cur, pos = t, pos + 1                              # (the state has been fed out[:-1], as after a pass)
+        st["plain_steps"] = st.get("plain_steps", 0) + 1; st["t_plain"] = st.get("t_plain", 0.0) + tv
+        if cb is not None: cb([t], tv)
     if flog:
       flog.write(json.dumps({"end": dict(tokens=len(out), dt=time.perf_counter() - t_start, passes=st.get("passes", 0), out_ids=[int(v) for v in out])}) + "\n"); flog.close()
     return out
@@ -1527,7 +1539,7 @@ def main():
     out = M.spec_generate(first, len(ids), a.max_new, "mtp" if M.MTPL else (lambda cur, pos, o: [cur] * (M.M - 1)), st, cb)
     dt = time.perf_counter() - t0
     print(f"== answer: {tok.decode(out)!r}\n   {len(out)} tokens in {dt:.1f} s after the first: {dt / max(1, len(out) - 1):.2f} s / token "
-          f"({max(1, len(out) - 1) / dt:.2f} tok/s) | {st['passes']} verify passes, {st['accepted']} drafts accepted"
+          f"({max(1, len(out) - 1) / dt:.2f} tok/s) | {st.get('passes', 0)} verify passes, {st.get('accepted', 0)} drafts accepted" + (f", {st['plain_steps']} plain steps past QWEN_PLAIN_AT {os.environ.get('QWEN_PLAIN_AT')}" if st.get("plain_steps") else "") + (f" | the drafter's catch-up over the prompt {st['t_catchup']:.1f} s" if "t_catchup" in st else "")
           + (f", {st.get('rescue_hits', 0)} rescue-row hits (QWEN_SPEC_TREE={os.environ.get('QWEN_SPEC_TREE')})" if M.tree else ""), flush=True)
     if getattr(M, "prof", None): print("   drafting: " + " ".join(f"{k} {v:.2f} s" for k, v in M.prof.items()), flush=True)
     if a.out: np.savez(a.out, prompt_ids=np.array(ids), out_ids=np.array(out), draft_log=np.array(st.get("draft_log", []), np.float64).reshape(-1, 3),

@@ -399,6 +399,7 @@ against 32.4 for the three-draft defaults before it, every output identical to p
 | `QWEN_CPU_SPLIT_HEAD_EARLY=1` | the head's parts 1.. reuse part 0's input on the CPU: the pool computes them back to back |
 | `QWEN_CPU_GLUE=1` | inside a block of layers, a layer's closing residual and the next layer's input norm + rotation run on the CPU pool instead of two NPU launches (the NPU kernels' operations in their order: the same bits); +0.5 %, 56.3 -> 56.6 tok/s |
 | `QWEN_MTP_PROMPT=<rows>` | the drafter's pass over the prompt in chunks of that many rows, its head only on the last (a per-generation cost: 12 passes become 3 on a 24-token prompt) |
+| `QWEN_PLAIN_AT=<position>` | past that position, plain one-row steps instead of verify passes (the same tokens; a prompt already past it skips the drafter's catch-up). Off: per token a verify pass stays ~6x cheaper than a plain step up to 24k; it only pays for short answers to long prompts (below) |
 
 The drafter's fp8 kernel on the CPU (`cpu_split.c` fmt 2) multiplies in fp16, 4.5e-4 relative rms against exact sums; it changes
 drafts only, never a token. The defaults were gated as shipped: the 10 prompts on the
@@ -411,22 +412,24 @@ same as plain (3.9 tok/s; its defaults need `--tmax` <= ~4608: at 8192 the draft
 `bonsai2_generate.py` with the chunked prefill now sets up on the verify geometries as the servers do (its unused prompt-sized
 geometry asked 3.85 GB at 32k tokens; the 10 prompts and the 12k prompt the same after it); a prompt can come from a file (`@FILE`).
 
-**Long contexts: the speculative defaults lose past ~20k tokens on the 2B.** Board o6n, 2026-11-19, one prompt each length,
-200 new tokens, the same tokens in both columns. Plain = `QWEN_DRAFT=none QWEN_CPU_SPLIT=0`, the median of its printed `M.step` times:
+**Long contexts: the drafter's catch-up over the prompt, not the verify pass, is the cost.** Board o6n, 2026-11-19, one prompt
+each length, 200 new tokens, the same tokens in every column. Plain = one-row steps (`QWEN_PLAIN_AT=1`); the speculative run's
+time split into the drafter's catch-up over the prompt (once a generation: 8 rows a pass, each attending over everything before it)
+and the passes:
 
-| prompt tokens | plain | defaults | defaults: a verify pass |
-|---|---|---|---|
-| 1524 | 10.0 tok/s | 40.4 tok/s | 34 ms |
-| 4032 | 8.3 | 26.5 | 54 ms |
-| 8022 | 6.7 | 14.5 | 98 ms |
-| 12018 | 5.6 | 9.0 | 151 ms |
-| 16043 | 4.8 | 6.2 | 229 ms |
-| 24093 | 3.7 | 3.4 | 425 ms |
-| 32143 | 3.1 | 2.1 | 638 ms |
+| prompt tokens | plain | speculative, as measured | the catch-up | speculative without it | a verify pass + draft |
+|---|---|---|---|---|---|
+| 8022 | 6.7 tok/s | 14.5 tok/s | 8.3 s | 37 tok/s | 39 ms |
+| 12018 | 5.3 | 9.0 | 15.4 s | 29 | 46 ms |
+| 20068 | 4.0 | 4.5 | 36.0 s | 23 | 60 ms |
+| 24093 | 3.6 | 3.4 | 49.4 s | 22 | 67 ms |
 
-A plain step grows by ~7 ms per 1000 tokens of context and a verify pass by ~19 ms, while a pass still yields 1.34-1.44 tokens:
-the verify path's attention (two rows, plus the drafter's own cache) costs ~2.6x the decode kernel's per position. Prefill: 179 tok/s
-at 1.5k, 105 at 12k, 58 at 32k.
+Per token the speculative path stays ~6x ahead of plain decoding; a pass grows ~1.7 ms per 1000 tokens of context. The catch-up
+grows as ~0.53 n + 0.064 n^2 seconds (n in thousands of tokens): 8 s at 8k, 49 s at 24k, ~82 s at 32k. So plain decoding wins
+only when the answer is shorter than catch-up / (plain - speculative per token): ~70 tokens at 8k, ~100 at 12k, ~210 at 24k, ~300
+at 32k. In the servers the prefix cache resumes the drafter too, so a conversation's turn pays the catch-up of its new tokens only.
+A switch by position (`QWEN_PLAIN_AT`) is therefore off: at 24000 it made a 23.9k-token prompt slower (73 s for 200 tokens against
+~58 speculative) and a 32k one faster (2.98 against 2.11 tok/s). Prefill: 179 tok/s at 1.5k, 105 at 12k, 58 at 32k.
 
 The prompt goes through the verify path (`QWEN_PREFILL=chunked`: the one-pass prefill's DeltaNet kernel wants 48 value heads). Plain
 decoding on these sizes is `QWEN_DRAFT=none` (the verify path without drafts); `QWEN_SPEC=0` has no geometries for the chunked prefill.
