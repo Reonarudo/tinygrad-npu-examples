@@ -68,6 +68,11 @@ class BatchEngine:
     pfx = self.pfx[u] if self.pfx and not vis else None
     if self.pfx and vis: self.pfx[u].invalidate()
     p = pfx.plan(ids) if pfx else 0; b = S.PrefixCache.boundaries(ids, self.im_end) if pfx else []
+    if p and not M.kvs:   # without the ASID caches the prefill runs on the model's own K / V stacks: the slot's cached rows first
+      NA, rs = M.NATT, R.NKV * R.HD                                          # (else the resume read whatever was prefilled last)
+      for i in range(NA):
+        src, dst = (u * NA + i) * self.tmax * rs, i * M.TMAX * rs
+        M.Kall[dst:dst + p * rs].assign(self.B.Kall[src:src + p * rs]).realize(); M.Vall[dst:dst + p * rs].assign(self.B.Vall[src:src + p * rs]).realize()
     print(f"   slot {u}: prompt {len(ids)} tokens, {len(ids) - p} to prefill ({p} from the prefix cache; the slots hold {[len(c.ids) for c in self.pfx] if self.pfx else '-'})", flush=True)
     return dict(job=job, gen=M.prefill_chunks(ids, start=p, snap_at=b[:1], on_snap=pfx.add if pfx else None), t0=time.perf_counter(), u=u, delta=M.pos_delta)   # delta: the m-RoPE counter's lag after the images (0 without)
   def _place(self, pre):
@@ -138,7 +143,7 @@ class BatchEngine:
         if s is None or s is PRE: toks.append(0); pos.append(0); rpos.append(0)
         elif s["k"] < len(s["ids"]): toks.append(s["ids"][s["k"]]); pos.append(s["pos"]); rpos.append(s["pos"] - s["delta"])
         else: toks.append(s["out"][-1]); pos.append(s["pos"]); rpos.append(s["pos"] - s["delta"])
-      try: nxt = self.B.step(toks, pos, rpos)
+      try: nxt = self.B.step(toks, pos, rpos, idle=[u for u, s in enumerate(self.slots) if s is None or s is PRE])   # (idle rows: off the slots' caches)
       except Exception as e:
         for u, s in enumerate(self.slots):
           if s is not None and s is not PRE: s["q"].put(("error", f"{type(e).__name__}: {e}")); self.slots[u] = None

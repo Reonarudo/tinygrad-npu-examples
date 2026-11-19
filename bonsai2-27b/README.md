@@ -403,7 +403,30 @@ against 32.4 for the three-draft defaults before it, every output identical to p
 The drafter's fp8 kernel on the CPU (`cpu_split.c` fmt 2) multiplies in fp16, 4.5e-4 relative rms against exact sums; it changes
 drafts only, never a token. The defaults were gated as shipped: the 10 prompts on the
 default pool, a 729-token prompt, the plain path, and `bonsai2_serve.py` against a plain-decoding server on four requests at three
-output lengths (a repeat from the prefix cache, a follow-up turn).
+output lengths (a repeat from the prefix cache, a follow-up turn). Then (2026-11-18): the 2B's prompts of 1.5k, 4k and 12k tokens
+(200 new tokens: the same as the NPU alone; 40.6, 26.5 and 9.0 tok/s), and the 2B's, 4B's and 9B's servers against plain-decoding
+servers on 15 requests each, a 1511-token prompt and its follow-up from the prefix cache among them (all the same); the 27B on a 1980-token prompt
+(chunked prefill: its one-pass prefill runs out of NPU memory there) the same as plain, 4.2 tok/s. The 27B on a 4032-token prompt the
+same as plain (3.9 tok/s; its defaults need `--tmax` <= ~4608: at 8192 the drafter's buffers and the caches overflow the NPU window).
+`bonsai2_generate.py` with the chunked prefill now sets up on the verify geometries as the servers do (its unused prompt-sized
+geometry asked 3.85 GB at 32k tokens; the 10 prompts and the 12k prompt the same after it); a prompt can come from a file (`@FILE`).
+
+**Long contexts: the speculative defaults lose past ~20k tokens on the 2B.** Board o6n, 2026-11-19, one prompt each length,
+200 new tokens, the same tokens in both columns. Plain = `QWEN_DRAFT=none QWEN_CPU_SPLIT=0`, the median of its printed `M.step` times:
+
+| prompt tokens | plain | defaults | defaults: a verify pass |
+|---|---|---|---|
+| 1524 | 10.0 tok/s | 40.4 tok/s | 34 ms |
+| 4032 | 8.3 | 26.5 | 54 ms |
+| 8022 | 6.7 | 14.5 | 98 ms |
+| 12018 | 5.6 | 9.0 | 151 ms |
+| 16043 | 4.8 | 6.2 | 229 ms |
+| 24093 | 3.7 | 3.4 | 425 ms |
+| 32143 | 3.1 | 2.1 | 638 ms |
+
+A plain step grows by ~7 ms per 1000 tokens of context and a verify pass by ~19 ms, while a pass still yields 1.34-1.44 tokens:
+the verify path's attention (two rows, plus the drafter's own cache) costs ~2.6x the decode kernel's per position. Prefill: 179 tok/s
+at 1.5k, 105 at 12k, 58 at 32k.
 
 The prompt goes through the verify path (`QWEN_PREFILL=chunked`: the one-pass prefill's DeltaNet kernel wants 48 value heads). Plain
 decoding on these sizes is `QWEN_DRAFT=none` (the verify path without drafts); `QWEN_SPEC=0` has no geometries for the chunked prefill.
@@ -487,6 +510,18 @@ chat path did not have:
   drafter cache; the context halves): a request goes to the region it can resume furthest in, else to the one holding the least, so an
   agent's side requests (titles, summaries) land in the other region and leave the conversation's prefix in place. The batched server
   does the same per slot (a slot's end-of-generation state comes from the batch's own stacks; a short prompt takes the emptiest slot).
+  A slot with no request still runs a dummy row in every batch step, at position 0. Since 2026-11-18 that row's K / V go to the
+  caches' spare margin rows; before, they went to row 0 of the slot's own cache, which is either a prompt being prefilled while others
+  decode or the prefix cache of a finished conversation. One overwritten row changed two answers in 23 on the 2B: a long prompt sent
+  beside three others, and a follow-up turn. With the fix, `bonsai2_batch_serve.py` at 4 users equals a plain single-user server on
+  15 requests and on two rounds of four concurrent ones, the 1511-token prompt and its follow-up among them.
+  Without the ASID caches (`QWEN_KV_ASID=0`) a resumed prompt prefilled on the model's own K / V stacks, which held the last prompt
+  prefilled, not the slot's cached rows (10 answers in 28 differed, every one a resume); the slot's rows are now copied in first.
+  The 4B's and 9B's batched servers did not start since 2026-11-07: the batched DeltaNet kernel's a|b chunk of 512 columns overflows
+  their LSRAM (H 2560 / 4096, three heads a task); it is now the largest of 512 / 256 / 128 that fits (`gdn_batch.gdn_kb`: 256 there,
+  512 on the 2B as before; the lane sums run in the same order, so the same bits). After both: the 2B with and without the ASID caches
+  28 / 28 the same as a plain server (an image prompt alone, a follow-up on it, and beside three text prompts among them), the 4B and
+  the 9B 23 / 23.
 
   Board o6n, the 9B (72704 context, two regions): a 1964-token prompt cold 74 s; its continuation 19 new tokens in 0.8 s, with a
   22-token side request in between; a new conversation on the same system prompt 23 tokens in 1.1 s. Answers identical to the cold

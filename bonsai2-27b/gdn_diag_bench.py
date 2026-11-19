@@ -18,8 +18,8 @@ def timed(fn, x, reps=10):
   return min(ts) * 1e3
 n = int(os.environ.get("ROWS", "8")); B = Batch(M, n, 512); L = B.L; K = L.K; X = B.X[0]; L.prefetch(0); slot, meta, sm = L.load(0); i = M.gidx[0]
 a_h = K.rms_a(X, (M.Win_g, M.sidx[i]), R.H, "a_h"); ct = L.lin_cts(a_h, slot, meta, ("qkv", "z")); xoff, zoff = ct["qkv"][1], ct["z"][1]
-O = K.rows_buf("o_gather", max(R.NV * R.DV, R.NH * R.HD)); d = K.desc(f"gdn_tokb_desc|{GB.GDN_KB}", lambda: GB.gdn_tokb_desc(R.DK, R.DV, R.H, QK.gdn_hpt(R.NV), B.C, R.CONV))
+O = K.rows_buf("o_gather", max(R.NV * R.DV, R.NH * R.HD)); d = K.desc(f"gdn_tokb_desc|{GB.gdn_kb(R.H, R.NV)}", lambda: GB.gdn_tokb_desc(R.DK, R.DV, R.H, QK.gdn_hpt(R.NV), B.C, R.CONV))
 for diag in ((), ("noab",), ("nostate",), ("noab", "nostate")):
   src = QK.ct_goff(GB.gdn_tokb_src(R.NV, R.NK, R.DK, R.DV, B.C, R.CONV, R.H, K.nrb, R.EPS, n, diag=diag), K.nrb, (xoff, zoff), ("x", "z"))
-  t = timed(lambda: K.call(f"gdn_tokb|{n}|{xoff}|{zoff}|{GB.GDN_KB}|{diag}", src, O, B.Sall, B.Call, B.gtab[0], B.ptab, ct["qkv"][0], ct["z"][0], X, B.Wab, B.Adt, B.Cwt, B.Nw, d), X)
+  t = timed(lambda: K.call(f"gdn_tokb|{n}|{xoff}|{zoff}|{GB.gdn_kb(R.H, R.NV)}|{diag}", src, O, B.Sall, B.Call, B.gtab[0], B.ptab, ct["qkv"][0], ct["z"][0], X, B.Wab, B.Adt, B.Cwt, B.Nw, d), X)
   print(f"  {os.environ['QWEN_MODEL']} {n} rows diag {diag or 'full'}: {t:.3f} ms", flush=True)

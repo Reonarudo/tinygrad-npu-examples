@@ -21,11 +21,11 @@ def timed(fn, x, reps=10):
   return min(ts) * 1e3
 n = int(os.environ.get("ROWS", "1")); B = Batch(M, n, 512); L = B.L; K = L.K; X = B.X[0]; L.prefetch(0); slot, meta, sm = L.load(0); i = M.gidx[0]
 a_h = K.rms_a(X, (M.Win_g, M.sidx[i]), R.H, "a_h"); ct = L.lin_cts(a_h, slot, meta, ("qkv", "z")); xoff, zoff = ct["qkv"][1], ct["z"][1]
-O = K.rows_buf("o_gather", max(R.NV * R.DV, R.NH * R.HD)); d = K.desc(f"gdn_tokb_desc|{GB.GDN_KB}", lambda: GB.gdn_tokb_desc(R.DK, R.DV, R.H, QK.gdn_hpt(R.NV), B.C, R.CONV))
+O = K.rows_buf("o_gather", max(R.NV * R.DV, R.NH * R.HD)); d = K.desc(f"gdn_tokb_desc|{GB.gdn_kb(R.H, R.NV)}", lambda: GB.gdn_tokb_desc(R.DK, R.DV, R.H, QK.gdn_hpt(R.NV), B.C, R.CONV))
 dg = K.buf("gdn_dg", 12 * 16, dtypes.int32)
 src = QK.ct_goff((GB.gdn_tokb2_src if GB.TOKB2 else GB.gdn_tokb_src)(R.NV, R.NK, R.DK, R.DV, B.C, R.CONV, R.H, K.nrb, R.EPS, n, diag=("phases",)), K.nrb, (xoff, zoff), ("x", "z"))
-t = timed(lambda: K.call(f"gdn_tokb|{n}|{xoff}|{zoff}|{GB.GDN_KB}|{GB.TOKB2}|{GB.SPREAD}|phases", src, O, B.Sall, B.Call, B.gtab[0], B.ptab, ct["qkv"][0], ct["z"][0], X, B.Wab, B.Adt, B.Cwt, B.Nw, d, dg), X)
+t = timed(lambda: K.call(f"gdn_tokb|{n}|{xoff}|{zoff}|{GB.gdn_kb(R.H, R.NV)}|{GB.TOKB2}|{GB.SPREAD}|phases", src, O, B.Sall, B.Call, B.gtab[0], B.ptab, ct["qkv"][0], ct["z"][0], X, B.Wab, B.Adt, B.Cwt, B.Nw, d, dg), X)
 v = OA.host_invalidate(dg).numpy().reshape(12, 16)
-print(f"  {os.environ['QWEN_MODEL']} {n} rows KB {GB.GDN_KB} tokb2 {GB.TOKB2} spread {GB.SPREAD}: {t:.3f} ms a launch (phases build); cycles a task, tasks 0..11:", flush=True)
+print(f"  {os.environ['QWEN_MODEL']} {n} rows KB {GB.gdn_kb(R.H, R.NV)} tokb2 {GB.TOKB2} spread {GB.SPREAD}: {t:.3f} ms a launch (phases build); cycles a task, tasks 0..11:", flush=True)
 for k, name in ((0, "total"), (1, "a|b"), (2, "prep"), (3, "fill wait"), (4, "drain wait"), (5, "compute"), (6, "out"), (7, "units"), (8, "blocks")):
   print(f"    {name:11s} " + " ".join(f"{int(x):8d}" for x in v[:, k]), flush=True)

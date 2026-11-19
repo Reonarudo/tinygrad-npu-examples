@@ -74,6 +74,9 @@ class Batch:
     if self.kvs: assert self.kvs.users >= N and self.kvs.tmax == tmax, (self.kvs.users, self.kvs.tmax, N, tmax); self.Kall = self.Vall = None
     else: ksz = (N * NA * tmax + QK.ATT_BT) * R.NKV * R.HD; self.Kall, self.Vall = (Tensor.zeros(ksz, device=DEV).contiguous().realize() for _ in range(2))
     self.ci = (lambda u, i: self.kvs.cidx(i, u)) if self.kvs else (lambda u, i: u * NA + i)   # a user's cache index at attention layer i
+    # an idle row's cache index: the caches' ATT_BT margin rows (after the last region), read and written at position 0 only -- on
+    # its own slot's region an idle row overwrote that user's K / V row 0 (a prefilling prompt's, a prefix cache's)
+    self.cs = (lambda i: self.kvs.scratch(i)) if self.kvs else (lambda i: N * NA)
     self.sidx = [[dev(np.array([u * NG + i], np.int32)) for i in range(NG)] for u in range(N)]; self.aix = [[dev(np.array([i, 0, self.ci(u, i)], np.int32)) for i in range(NA)] for u in range(N)]
     self.posb = [dev(np.array([0], np.int32)) for u in range(N)]; self.aix0 = [dev(np.array([i, 0], np.int32)) for i in range(NA)]
     self.K1 = [QK.Kernels(2, 24, R.EPS, real=1) for _ in range(N)]          # the users' one-row kernel sets (their own row-0 buffers)
@@ -97,9 +100,10 @@ class Batch:
     si = hold("b_sidx", sidx); gt = hold("b_gtab", gtab); pt = hold("b_ptab", ptab)
     if a_h is None: a_h = K.rms_a(X, (M.Win_g, si), H, "a_h")
     ct = L.lin_cts(a_h, slot, meta, ("qkv", "z")); xoff, zoff = ct["qkv"][1], ct["z"][1]
-    src = QK.ct_goff((GB.gdn_tokb2_src if GB.TOKB2 else GB.gdn_tokb_src)(R.NV, R.NK, R.DK, R.DV, self.C, R.CONV, H, K.nrb, R.EPS, N), K.nrb, (xoff, zoff), ("x", "z"))
+    kb = GB.gdn_kb(H, R.NV)                                               # (the a|b chunk: 512 on the 2B, 256 on the 4B / 9B: their LSRAM)
+    src = QK.ct_goff((GB.gdn_tokb2_src if GB.TOKB2 else GB.gdn_tokb_src)(R.NV, R.NK, R.DK, R.DV, self.C, R.CONV, H, K.nrb, R.EPS, N, KB=kb), K.nrb, (xoff, zoff), ("x", "z"))
     O = K.rows_buf("o_gather", max(R.NV * R.DV, R.NH * R.HD))
-    K.call(f"gdn_tokb|{N}|{xoff}|{zoff}|{GB.GDN_KB}|{GB.TOKB2}", src, O, self.Sall, self.Call, gt, pt, ct["qkv"][0], ct["z"][0], X, self.Wab, self.Adt, self.Cwt, self.Nw, K.desc(f"gdn_tokb_desc|{GB.GDN_KB}", lambda: GB.gdn_tokb_desc(R.DK, R.DV, H, QK.gdn_hpt(R.NV), self.C, R.CONV)))
+    K.call(f"gdn_tokb|{N}|{xoff}|{zoff}|{kb}|{GB.TOKB2}", src, O, self.Sall, self.Call, gt, pt, ct["qkv"][0], ct["z"][0], X, self.Wab, self.Adt, self.Cwt, self.Nw, K.desc(f"gdn_tokb_desc|{kb}", lambda: GB.gdn_tokb_desc(R.DK, R.DV, H, QK.gdn_hpt(R.NV), self.C, R.CONV, KB=kb)))
     a_o = K.rms_a(O, None, R.NV * R.DV, "a_o", norm=False)
     x1, a_post = K.resid_had(X, L.lin_ct(a_o, slot, meta, "o"), H, "x1", (M.Wpost_g, si), "a_post")
     return self._mlp_out(L.mlp(x1, slot, meta, (M.Wpost_g, si), f"xiov{1 - par}", a_post=a_post, next_norm=next_norm), next_norm)
@@ -173,16 +177,19 @@ class Batch:
       a = a[n:]; out, A = out if nn is not None else (out, None)
     return out
 
-  def step(self, toks, pos, rpos=None):
+  def step(self, toks, pos, rpos=None, idle=()):
     """toks [N] at positions pos [N] -> the next token of each user. `rpos` [N]: the users' rope rows (a user whose prompt held images:
-    the position minus its image delta; default the positions)."""
+    the position minus its image delta; default the positions). `idle`: the users whose row is a dummy (position 0): their K / V row
+    goes to the caches' margin, not to their region (its row 0 may be a prompt's in prefill, or a prefix cache's)."""
     M, L, N = self.M, self.L, self.N; t_in = time.perf_counter(); rpos = list(pos) if rpos is None else rpos
+    ci = lambda u, i: self.cs(i) if u in idle else self.ci(u, i)
+    assert all(pos[u] == 0 for u in idle), "an idle row sits at position 0 (the margin holds ATT_BT rows)"
     x = np.zeros((L.R, R.H), np.float32); x[:N] = M.W.embed([int(t) for t in toks]); poke(self.X[0], x)
     poke(self.ptab, np.array(pos, np.int32))
-    for i in range(M.NATT): poke(self.atab[i], np.array(sum(([i, pos[u], self.ci(u, i), rpos[u]] for u in range(N)), []), np.int32))
+    for i in range(M.NATT): poke(self.atab[i], np.array(sum(([i, pos[u], ci(u, i), rpos[u]] for u in range(N)), []), np.int32))
     for u in range(N):
       poke(self.posb[u], np.array([pos[u]], np.int32))
-      for i in range(M.NATT): poke(self.aix[u][i], np.array([i, pos[u], self.ci(u, i)], np.int32))
+      for i in range(M.NATT): poke(self.aix[u][i], np.array([i, pos[u], ci(u, i)], np.int32))
     if BATCHK and BLK > 1 and R.NL % BLK == 0 and BLK % 2 == 0:            # layer blocks: BLK layers a job, each in a window slot of its own
       from qwen38_generate import one_job
       prof = os.environ.get("BATCH_PROF") == "1"; tp = [time.perf_counter()]

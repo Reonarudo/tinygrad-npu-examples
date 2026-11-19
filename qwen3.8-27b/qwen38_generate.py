@@ -208,6 +208,10 @@ class KVAsid:
   def cidx(self, i, u):
     """idx[2] of attention layer i for user u: its region in the ASID's buffer (the MTP, i == natt: region u of its own buffer)."""
     return u if i >= self.natt else (i // self.na) * self.users + u
+  def scratch(self, i):
+    """idx[2] of attention layer i's spare rows: the ATT_BT margin after the last region of its ASID's buffer (a row at position 0
+    there reads and writes the margin only): where a batch's idle rows go, so they leave every user's row 0 alone."""
+    return self.nl[i % self.na] * self.users
   def host(self, i, u=0):
     """Layer i's cache rows of user u as host arrays (K, V) [tmax + ATT_BT][rowf] (the device's writes made visible first)."""
     import ctypes; a = i % self.na; b = self.bufs[a]; self.raw.cache_invalidate(b); ES = 2 if self.half else 4; r = self.cidx(i, u) * self.tmax * self.rowf * ES; n = (self.tmax + ATT_BT) * self.rowf * ES
@@ -1493,7 +1497,7 @@ def hold_cpu_latency():
 
 def main():
   cpus = pin_cpus(); lat = hold_cpu_latency()
-  ap = argparse.ArgumentParser(); ap.add_argument("prompt"); ap.add_argument("--max-new", type=int, default=32); ap.add_argument("--thinking", action="store_true")
+  ap = argparse.ArgumentParser(); ap.add_argument("prompt", help="the prompt, or @FILE"); ap.add_argument("--max-new", type=int, default=32); ap.add_argument("--thinking", action="store_true")
   ap.add_argument("--tmax", type=int, default=512, help="the K / V caches' length (prompt + generated tokens)")
   ap.add_argument("--pin-gb", type=float, default=float(os.environ.get("QWEN_PIN_GB", "24")), help="GB of layer weights held in RAM (the rest streams from the NVMe each token)")
   ap.add_argument("--dir", default=os.environ.get("QWEN_DIR", "/mnt/ssd/qwen3.8-27b-fp8")); ap.add_argument("--cache", default=os.environ.get("QWEN_NPU", "/mnt/ssd/qwen3.8-27b-npu-s1"))
@@ -1501,6 +1505,7 @@ def main():
   ap.add_argument("--raw", action="store_true", help="the prompt as plain text (no chat template)")
   ap.add_argument("--ids", help="the prompt as comma-separated token ids (the `prompt` argument is then only a label; no tokenizer needed)")
   a = ap.parse_args()
+  if a.prompt.startswith("@") and os.path.isfile(a.prompt[1:]): a.prompt = open(a.prompt[1:]).read()   # @FILE: the prompt from a file (past the 128 KiB argument limit)
   if a.ids:                                                               # e.g. another implementation's tokenisation, to compare its greedy tokens
     ids = [int(t) for t in a.ids.split(",")]
     try: tok = Tok(os.environ.get("QWEN_TOK", a.dir))
@@ -1508,7 +1513,10 @@ def main():
   else:
     tok = Tok(os.environ.get("QWEN_TOK", a.dir)); text = a.prompt if a.raw else chat_text(a.prompt, a.thinking); ids = tok.encode(text)   # QWEN_TOK: tokenizer.json's folder
   print(f"== {len(ids)} prompt tokens; greedy, up to {a.max_new} new{f'; host CPUs {cpus}' if cpus else ''}{f'; CPU latency {lat} us' if lat is not None else ''}", flush=True)
-  t0 = time.perf_counter(); M = Model(len(ids), a.cache, a.dir, a.tmax, a.pin_gb); print(f"   model set up in {time.perf_counter() - t0:.0f} s", flush=True)
+  # the one-pass prefill takes a geometry of the prompt's rows; the chunked one runs on the verify geometries (as the servers' Model(1)):
+  # its prompt-sized geometry was never used and its buffers bounded the prompt (a 32k prompt on the 2B asked for 3.85 GB)
+  n_geo = 1 if os.environ.get("QWEN_PREFILL") == "chunked" else len(ids)
+  t0 = time.perf_counter(); M = Model(n_geo, a.cache, a.dir, a.tmax, a.pin_gb); print(f"   model set up in {time.perf_counter() - t0:.0f} s", flush=True)
   M.spec_meta = dict(prompt=a.prompt, n_prompt=len(ids), thinking=a.thinking, prompt_ids=[int(v) for v in ids])   # QWEN_SPEC_LOG's run header
   t0 = time.perf_counter(); lg = M.prefill(ids); tp = time.perf_counter() - t0
   print(f"   prefill {len(ids)} tokens: {tp:.1f} s ({len(ids) / tp:.2f} tok/s)", flush=True)

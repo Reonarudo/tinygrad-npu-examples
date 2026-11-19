@@ -9,12 +9,17 @@ import os, re
 from qwen38_kernels import gdn_tok3_src, gdn_hpt, ring_pitch, NT, V
 # the a|b phase's chunk (columns of the task's 2 HPT a|b rows a DMA request): 128 (gdn_tok3's, 2 KiB a request, 16 requests one
 # in flight -- latency-bound: ~50 us of a 150 us layer at 1 row on the 2B) -> 512 (8 KiB, 4 requests). The lane sums run in column
-# order across the chunks either way: the same bits (the simulator gate against gdn_tok3 at 128). QWEN_GDN_KB overrides
-GDN_KB = int(os.environ.get("QWEN_GDN_KB", "512"))
+# order across the chunks either way: the same bits (the simulator gate against gdn_tok3 at 128). QWEN_GDN_KB overrides. 512 needs
+# H x 4 + 4 HPT x 512 x 4 bytes of LSRAM: the 2B's (H 2048, 2 heads a task) fit, the 4B's (2560, 3) and the 9B's (4096, 3) do not --
+# gdn_kb takes the largest of 512 / 256 / 128 that fits (the batched servers of the 4B / 9B failed at start-up since 2026-11-07)
+GDN_KB = int(os.environ["QWEN_GDN_KB"]) if os.environ.get("QWEN_GDN_KB") else None
+def gdn_kb(H, NV):
+  if GDN_KB: return GDN_KB
+  return next(kb for kb in (512, 256, 128) if H % kb == 0 and H * 4 + 2 * (2 * gdn_hpt(NV) * kb * 4) <= 32768 - 64)
 
 
 def gdn_tokb_desc(DK, DV, H, HPT, C, CONV, KB=None, W=16):
-  KB = GDN_KB if KB is None else KB
+  KB = (GDN_KB or 512) if KB is None else KB
   """gdn_tok3_desc's three slots, then 3: one 128-channel segment of the conv ring or of the taps (CONV rows of DK floats, DDR pitch
   ring_pitch(C) floats, LSRAM contiguous); 4-6: a row tile's strip pieces of one group (1-3 x 256 B at pitch 768 B: [4 column quads][4 rows][4]); 7: a 512-B row
   segment (the ring write) -- the conv's operands, the row's q / k / v / z segments and the ring writes by DMA instead of plain accesses."""
@@ -25,7 +30,7 @@ def gdn_tokb_desc(DK, DV, H, HPT, C, CONV, KB=None, W=16):
 def gdn_tokb_src(NV, NK, DK, DV, C, CONV, H, nrb, eps, M, W=16, KB=None, stage=True, diag=()):
   """`stage` (default): the conv's ring rows and taps of a head's 128-channel segment come into LSRAM by two DMAs (gdn_tokb_desc slot 3)
   before conv_silu runs on them -- gdn_tok3 reads them by plain loads from DDR, ~250 a head, the batched kernel's dominant cost."""
-  KB = GDN_KB if KB is None else KB
+  KB = gdn_kb(H, NV) if KB is None else KB
   src = gdn_tok3_src(NV, NK, DK, DV, C, CONV, H, nrb, eps, W, KB, rows_out=True); HPT = gdn_hpt(NV); NTU = -(-NV // HPT); LH = NV - (NTU - 1) * HPT
   def rep(a, b, n=1):
     nonlocal src; assert src.count(a) == n, (a[:60], src.count(a)); src = src.replace(a, b)
@@ -136,7 +141,7 @@ def gdn_tokb2_src(NV, NK, DK, DV, C, CONV, H, nrb, eps, M, W=16, KB=None, diag=(
   LSRAM: the a|b phase as gdn_tokb; the preparation's conv operands at 0 (3 segments x (ring 2 KiB + taps 2 KiB)), the tiles'
   staging at 12288 (4 x 2 KiB), the packed segments at 20480; the heads' q, k, v, o, z (2.5 KiB a head) from 24576 across both
   phases; the state blocks at 0 / 8192 / 16384. `diag` "phases": as gdn_tokb's (2 = the preparation)."""
-  KB = GDN_KB if KB is None else KB; PH = "phases" in diag
+  KB = gdn_kb(H, NV) if KB is None else KB; PH = "phases" in diag
   src = gdn_tokb_src(NV, NK, DK, DV, C, CONV, H, nrb, eps, M, W, KB, stage=True)
   mark = "  /* ---- the delta rule, as gdn_tok2 */"; assert src.count(mark) == 1; head = src[:src.index(mark)]
   REP = NV // NK; QO, KO, VO = 0, NK * DK, 2 * NK * DK; CP = ring_pitch(C); HPT = gdn_hpt(NV); NB = DV // W; BLK = DK * W * 4
