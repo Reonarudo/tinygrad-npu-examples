@@ -33,7 +33,8 @@ the input transform differ (see "How it works" below).
 
 The backend's requirements, listed in the [root README](../README.md#requirements-on-the-board):
 
-- the Zhouyi NPU kernel driver with its header `armchina_aipu.h` and its zero-copy weight buffers (the WBUF / SLOT ioctls),
+- the Zhouyi NPU kernel driver with its header `armchina_aipu.h` and its zero-copy weight buffers (the WBUF / SLOT ioctls of
+  [sky1-zhouyi-v3-driver](https://github.com/Reonarudo/sky1-zhouyi-v3-driver)),
 - libclang for the first run (`LIBCLANG_PATH` if your distribution ships only a versioned library),
 - the vendor's AIPU toolchain library,
 - Python 3.12 or newer with `numpy` and `tokenizers` (`pip install numpy tokenizers`).

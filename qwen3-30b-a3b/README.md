@@ -164,7 +164,7 @@ python3 qwen3moe_prefill.py --bench 3        # the pp512-style prefill benchmark
 ```
 
 Needs ~22 GB of free RAM for the pinned weights (the board has 29 GB) and the driver's zero-copy weight buffers (the WBUF / SLOT
-ioctls). The first prompt of a process captures the prefill's graphs (a few seconds). Options: `--max-new`, `--thinking` (Qwen3's
+ioctls of [sky1-zhouyi-v3-driver](https://github.com/Reonarudo/sky1-zhouyi-v3-driver)). The first prompt of a process captures the prefill's graphs (a few seconds). Options: `--max-new`, `--thinking` (Qwen3's
 thinking block; off by default), `--tmax` (cache positions, 1024). Environment: `QWEN3MOE_GGUF` (the checkpoint: the embedding and the
 reference read it), `QWEN3MOE_NPU` (the packed cache), `QWEN3MOE_TOK` (tokenizer.json's folder), `QWEN3MOE_PREFILL=step` (the
 decode step a prompt token), `QWEN3MOE_JIT=0` (no graphs), `QWEN3MOE_PROF=1` (per-phase times), `QWEN3MOE_CPUS` /

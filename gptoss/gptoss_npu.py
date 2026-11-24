@@ -56,6 +56,7 @@ class Model:
       for k, sz in sizes.items(): offs[k] = o; o += -(-(sz + 16) // CHUNK) * CHUNK
       self.packs[l] = (sizes, offs, o)
     for l in range(NL): assert self.packs[l][1] == self.packs[self.kind.index(self.kind[l])][1], l
+    raw.require_zero_copy("gpt-oss-20b")                       # its layers stream through slots: no copy path
     big = max(p[2] for p in self.packs.values()); self.NSLOT = 2; self.slots = [raw.slot_alloc(big) for _ in range(self.NSLOT)]; self.wbufs = {}
     for l in range(NL):
       sizes, offs, n = self.packs[l]; wid, mm = raw.wbuf_alloc(n)

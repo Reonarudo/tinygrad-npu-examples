@@ -91,6 +91,7 @@ class Model:
       self.packs[l] = (sizes, offs, o)
     for l in range(c.NL):   # the views are per kind: every layer of a kind must pack the same streams at the same offsets
       assert self.packs[l][1] == self.packs[self.kind.index(self.kind[l])][1], (l, "a layer's streams differ from its kind's first layer's (an unfinished q6n pack?)")
+    raw.require_zero_copy("Qwen3-30B-A3B")                       # its layers stream through slots: no copy path
     big = max(p[2] for p in self.packs.values()); self.NSLOT = 2 * LPJ; self.slots = [raw.slot_alloc(big) for _ in range(self.NSLOT)]
     self.wbufs = {}
     for l in range(c.NL):

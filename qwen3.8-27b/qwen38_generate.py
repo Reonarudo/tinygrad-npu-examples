@@ -15,6 +15,7 @@ sys.path.insert(0, os.path.expanduser(os.environ.get("TG", os.path.join(os.path.
 os.environ.setdefault("ZHOUYI_CHAIN_MAX", "16")
 from tinygrad import Tensor, dtypes                                      # noqa: E402
 from tinygrad.engine.jit import TinyJit                                  # noqa: E402
+from tinygrad.runtime.support.zhouyi.dev import RawDevice                 # noqa: E402
 from zy import OA                                                        # noqa: E402
 import qwen38_ref as R                                                   # noqa: E402
 from qwen38_kernels import ATT_BT, ring_pitch                            # noqa: E402
@@ -243,6 +244,11 @@ class Model:
     self.pre.pin(pin_gb); self.dec.pinned, self.dec._small_dev, self.dec.stage, self.dec.zc = self.pre.pinned, self.pre._small_dev, self.pre.stage, self.pre.zc
     z = np.load(os.path.join(cache, "outside_small.npz")); self.norm_w = dev(z["norm"]); self.N, self.npad, self.K = (int(v) for v in z["lm_head_n"])
     self.lm_path = os.path.join(cache, "lm_head.bin"); self.lm_size = os.path.getsize(self.lm_path) if os.path.exists(self.lm_path) else 0
+    # no zero-copy weights (an NPU driver without the WBUF / SLOT ioctls, or QWEN_ZC=0): no fp8 head. A cache without the fp16 head
+    # (Bonsai 2) or a model that prefills through the verify geometries (the Q8_0 models) cannot run
+    if not self.pre.zc and (R.Q8 or not self.lm_size):
+      raise RuntimeError(f"QWEN_MODEL={R.MODEL} needs zero-copy weights ({'Q8_0: its prompt runs the verify geometries' if R.Q8 else 'its cache has no fp16 head'}): "
+                         f"an NPU driver with the WBUF / SLOT ioctls ({RawDevice.ZC_DRIVER}) and QWEN_ZC unset")
     # QWEN_HEAD: fp8 (default when packed: E4M3 with 128 x 128 block scales like every other linear of the checkpoint, zero-copy, the
     # decoders' GEMM; measured on 41 decode steps: the same argmax every step, logits within ~1.5 %) | fp16 (the bf16 head, exact to
     # fp16) | both (runs both, prints the comparison, fp16 drives)
@@ -277,6 +283,11 @@ class Model:
     self.tree = spec_tree.mode_from_env(os.environ); self.leaf = bool(self.tree) and self.tree[0] == "leaf"
     assert not self.tree or self.leaf or not R.HAD, f"QWEN_SPEC_TREE={os.environ.get('QWEN_SPEC_TREE')} with QWEN_MODEL={R.MODEL}: rescue2 / fixed are the bank-path tree, not the rotated-input models'"
     spec_default = "4" if self.leaf else str(spec_tree.TREE_M) if self.tree else ("6" if R.Q8 else "0")
+    # no zero-copy weights: no fp8 head, so no verify pass -- the model decodes plainly, whatever QWEN_SPEC asked for
+    if not self.pre.zc:
+      if os.environ.get("QWEN_SPEC", spec_default) != "0" or self.tree:
+        print("   speculative decoding needs zero-copy weights (the NPU driver lacks the WBUF / SLOT ioctls, or QWEN_ZC=0): plain decoding", flush=True)
+        os.environ["QWEN_SPEC"], os.environ["QWEN_SPEC_TREE"] = "0", "off"; self.tree, self.leaf, spec_default = None, False, "0"
     self.MTPL = R.NL if have_mtp and os.environ.get("QWEN_SPEC", spec_default) != "0" and os.environ.get("QWEN_DRAFT", "mtp") == "mtp" else None
     natt = self.NATT + (1 if self.MTPL else 0)                                               # the MTP head is attention index NATT
     self.mtpg = {1: Layers(1, self.mtp_cache, fp8=True)} if self.MTPL and self.mtp_x else {}   # the MTP layer's fp8 geometries (rows -> Layers)

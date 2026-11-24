@@ -88,14 +88,21 @@ pip install -r requirements.txt
 
 More detail in [`tinygrad/extra/zhouyi/README.md`](tinygrad/extra/zhouyi/README.md).
 
-- **The Zhouyi NPU kernel driver with its UAPI header `armchina_aipu.h`.** On first use the backend generates its bindings from
-  that header. It looks in the driver's usual install locations; set `ZHOUYI_AIPU_HEADER=/path/to/armchina_aipu.h` otherwise.
+- **The Zhouyi NPU kernel driver with its UAPI header `armchina_aipu.h`.** The examples are developed and measured on
+  [sky1-zhouyi-v3-driver](https://github.com/Reonarudo/sky1-zhouyi-v3-driver), CIX's 6.2.0-1 driver with our changes, on the vendor kernel `7.0.0-41-cix`; the backend's job
+  shapes also run on CIX's unmodified 6.2.0-1. The 5.11.x / 6.0.1 drivers of the vendor 6.6 images are untested. On first use the
+  backend generates its bindings from the header. It looks in the driver's usual install locations; set
+  `ZHOUYI_AIPU_HEADER=/path/to/armchina_aipu.h` otherwise.
 - **libclang**, for that one-time generation. Distributions that ship only a versioned library (e.g. Debian / Ubuntu
   `libclang-NN-dev`) need `LIBCLANG_PATH=/usr/lib/llvm-NN/lib/libclang-NN.so` for the first run.
 - **The vendor's AIPU compiler toolchain library** (`libaiputoolchain.so`). Default location `/usr/share/cix/lib/onnxruntime`;
   set `ZHOUYI_TOOLCHAIN_DIR` otherwise.
-- **For the 27B models and Gemma 4:** the driver's zero-copy weight buffers (the WBUF / SLOT ioctls). Without them the weights
-  are copied every token (~2-3 s a token on the 27B).
+- **Zero-copy weight buffers** (the WBUF / SLOT ioctls of [sky1-zhouyi-v3-driver](https://github.com/Reonarudo/sky1-zhouyi-v3-driver); CIX's drivers do not have them). The
+  backend detects them on first use. Every example needs them except **Qwen3.8-27B**, which without them copies each layer every
+  token (~2-3 s a token) and decodes plainly (speculative decoding needs zero-copy). The others stop at load with a message naming
+  the driver: copied, their weights and graphs do not fit the NPU's window, or their caches carry only the zero-copy heads.
+
+  `ZHOUYI_ZC=0` takes the copy paths on a driver that has the ioctls.
 - **NPU clocks at their defaults** (`npuclk` 1.2 GHz, `npu_memclk` 750 MHz) to reproduce the numbers above.
 - **Disk:** Qwen3-30B-A3B 17.3 GB of checkpoint + 26 GB packed (and ~27 GB of free RAM for its pinned weights); Qwen3.8 about 27 GB of checkpoint + 27 GB of packed layers; Bonsai 2 about 6.4 GB of downloads + 8.7 GB packed; Gemma 4 E2B 5.0 GB + 2.4 GB packed; Ideogram 4 about 45 GB, plus ~16 GB of repacked panels
   (set `P48_DIR` / `W13I_DIR` to a disk with room).
@@ -128,6 +135,7 @@ client set-up are in [bonsai2-27b/README.md](bonsai2-27b/README.md#serve-openai-
 | `failed to load library libclang: try setting LIBCLANG_PATH?` | set `LIBCLANG_PATH` to your versioned `libclang-NN.so` for the first run |
 | an error about the AIPU toolchain library | install the vendor toolchain package, or set `ZHOUYI_TOOLCHAIN_DIR` |
 | `QWEN_CPU_LATENCY: no PM QoS request` | optional: allow access to `/dev/cpu_dma_latency` ([how](bonsai2-27b/README.md#the-cpu-latency-request)) |
+| `… needs the zero-copy WBUF / SLOT ioctls` | the example streams its layers through slots: install [sky1-zhouyi-v3-driver](https://github.com/Reonarudo/sky1-zhouyi-v3-driver) |
 | a job reports `EXCEPTION` after ~30 s | the NPU did not finish a job; `ZHOUYI_HANG_ID=1` names the kernel, its tasks and buffers |
 
 ## Layout
@@ -194,7 +202,7 @@ The three text examples run the same modules (`bonsai2-27b/` sets `QWEN_MODEL=bo
 
 | variable | default | what it does |
 | --- | --- | --- |
-| `QWEN_ZC` | `1` | zero-copy weights; `0` copies each layer (needed when the driver lacks the WBUF / SLOT ioctls) |
+| `QWEN_ZC` | `1` | zero-copy weights; `0` copies each layer (automatic when the driver lacks the WBUF / SLOT ioctls) |
 | `QWEN_NOPREFETCH` | unset | no read-ahead of layers that are not pinned in RAM |
 | `QWEN_PREFILL` | unset | `chunked`: prefill the FP8 model through the verify path (Ornith always does; the server does by default) |
 

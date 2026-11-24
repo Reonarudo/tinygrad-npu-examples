@@ -77,6 +77,10 @@ class Weights:
     self.c, self.cache = c, cache; t0 = time.perf_counter()
     from tinygrad import Device
     self.raw = Device[GN.DEV].raw; self.zc = os.environ.get("GEMMA_ZC", "1") != "0"; self.held = []
+    # without zero-copy (a driver without the WBUF / SLOT ioctls, or ZHOUYI_ZC=0) the weights would be copied into the NPU's window,
+    # and with them the graphs no longer fit it (E2B: 2.43 GB copied, then out of device memory capturing the decode graph, even at
+    # --tmax 256); GEMMA_ZC=0 still tries the copy
+    if self.zc: self.raw.require_zero_copy("Gemma 4")
     self.layers = []; self.block = block
     pk = lambda files: sum(-(-(os.path.getsize(f) + 16) // (2 << 20)) * (2 << 20) for f in files.values())
     lfiles, metas = [], []
@@ -84,7 +88,8 @@ class Weights:
       z = np.load(os.path.join(cache, f"L{l}_small.npz")); names = [str(k) for k in z["meta_names"]]; metas.append(z)
       lfiles.append({k: os.path.join(cache, f"L{l}_{k}.bin") for k in names})
     tot = sum(pk(f) for f in lfiles) + sum(os.path.getsize(os.path.join(cache, f)) for f in ("head_q8.bin", "ple_proj_q8.bin") if os.path.exists(os.path.join(cache, f)))
-    rm = os.environ.get("GEMMA_REMAP", "auto"); self.remap = self.zc and (rm == "1" or (rm == "auto" and tot > float(os.environ.get("GEMMA_WINDOW_GB", "2.6")) * 1e9))
+    rm, win = os.environ.get("GEMMA_REMAP", "auto"), float(os.environ.get("GEMMA_WINDOW_GB", "2.6")) * 1e9
+    self.remap = self.zc and (rm == "1" or (rm == "auto" and tot > win))
     if self.remap:
       big = max(pk(f) for f in lfiles); self.bslots = {(bp, j): self.raw.slot_alloc(big) for bp in range(2) for j in range(block)}; self.lbuf = {}
     for l in range(c.NL):

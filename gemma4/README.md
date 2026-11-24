@@ -44,7 +44,8 @@ speculative decoding uses.
 
 The backend's requirements, listed in the [root README](../README.md#requirements-on-the-board):
 
-- the Zhouyi NPU kernel driver with its header `armchina_aipu.h` and its zero-copy weight buffers (the WBUF / SLOT ioctls),
+- the Zhouyi NPU kernel driver with its header `armchina_aipu.h` and its zero-copy weight buffers (the WBUF / SLOT ioctls of
+  [sky1-zhouyi-v3-driver](https://github.com/Reonarudo/sky1-zhouyi-v3-driver)): copied, the weights and the graphs do not fit the NPU's window,
 - libclang for the first run (`LIBCLANG_PATH` if your distribution ships only a versioned library),
 - the vendor's AIPU toolchain library,
 - Python 3.12 or newer with `numpy`.
@@ -291,7 +292,7 @@ residual adds) ~8 ms; the launches inside the jobs ~4 ms; the host and the 9 job
 | `GEMMA_HEAD` | `dev` | `host`: read the logits back and take the argmax on the host |
 | `GEMMA_PLE` | `dev` | `host`: compute the per-layer inputs on the host |
 | `GEMMA_PN_DMA`, `GEMMA_ATT_DMA` | `1` | `0`: the plain-load post-norm and attention kernels (the attention then grows with the context) |
-| `GEMMA_ZC` | `1` | `0`: copy the weights into ordinary device buffers instead of zero-copy slots |
+| `GEMMA_ZC` | `1` | `0`: copy the weights into ordinary device buffers instead of zero-copy slots (they and the graphs no longer fit the NPU's window: a debugging switch) |
 | `GEMMA_CPUS`, `GEMMA_CPU_LATENCY` | `auto`, `0` | the host's CPUs and its CPU-latency request, as `QWEN_CPUS` / `QWEN_CPU_LATENCY` in the [root README](../README.md#common-settings) |
 
 ## Files

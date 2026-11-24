@@ -189,6 +189,7 @@ class Layers:
     # the head's parts map into these slots too: the larger of a layer and a part (Bonsai 2 9B: a part 67.7 MB, a layer 63)
     heads = [os.path.join(self.cache, f) for f in os.listdir(self.cache) if f.startswith(f"{R.HEAD}_") and f.endswith(".bin")]
     slot = max([big] + [os.path.getsize(f) for f in heads])
+    if not raw.zero_copy: print("   zero-copy unavailable (the NPU driver lacks the WBUF / SLOT ioctls, or ZHOUYI_ZC=0); copying the weights", flush=True); return False
     try: slots = [raw.slot_alloc(slot) for _ in range(2)]
     except OSError as e: print(f"   zero-copy unavailable ({e}); copying the weights", flush=True); return False
     budget = gb * 1e9 - 2 * big                                                   # the two staging buffers are inside the budget
