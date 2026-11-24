@@ -9,26 +9,40 @@ maps each layer's weights into the NPU's window (an ioctl a layer: 21.5 GB of we
 generated ids from a ring on the device every 8 tokens. Nothing is read back or computed on the host inside a prompt chunk or a token.
 
 **Status: it generates the reference's tokens.** *"What is the capital of Portugal? Answer in one sentence."* ->
-`The capital of Portugal is Lisbon.<|im_end|>` (greedy). On the board: **prefill 62.4 tok/s** in chunks of 512 tokens (llama.cpp
-on the same board's 8 big cores: 31.3), **decode 9.6 tok/s** (llama.cpp: 17.4; ~10 with one int8 activation level, `QWEN3MOE_QLEV=1`).
+`The capital of Portugal is Lisbon.<|im_end|>` (greedy). On the board: **prefill 62.2 tok/s** in chunks of 512 tokens (llama.cpp
+on the same board's 8 big cores: 29.6), **decode 9.5 tok/s** (llama.cpp: 17.1; 9.9 with one int8 activation level, `QWEN3MOE_QLEV=1`).
 Set-up ~30 s (26 GB of weights pinned: the prefill's streams and the decode-only copies -- 6.6-bit Q6_K linears, 4.75-bit attention).
 
 ## Speed against the CPU
 
 Measured on this board, back to back, the board otherwise idle, CPU governor `schedutil` (as found), NPU clocks at their defaults.
+Last measured 2026-11-24: llama.cpp build `4fc4ec5`, `llama-bench -t 8` pinned to the eight A720s (`taskset -c 0,1,6-11`); the NPU's
+decode the mean of two runs (9.50, 9.56).
 The NPU column is `qwen3moe_prefill.py --bench` (512-token chunks of random ids from position 0, as `llama-bench`'s pp512) and the
 decode of `qwen3moe_generate.py` (120 tokens, greedy, after the first).
 
 | | llama.cpp, CPU (8 x A720, `llama-bench -t 8`) | this example, NPU |
 | --- | ---: | ---: |
-| prefill (pp512) | 31.3 tok/s | **62.4 tok/s** |
-| decode (tg128) | **17.4 tok/s** | 9.6 tok/s |
+| prefill (pp512) | 29.6 tok/s | **62.2 tok/s** |
+| decode (tg128) | **17.1 tok/s** | 9.5 tok/s |
 
 (The forum's numbers for this file, on another O6 board: pp512 34.0, tg128 21.1 with llama.cpp; ik_llama 75.4 / 14.8.)
 
-Prefill 62.4 tok/s since the routing moved to the device (58.7 before, with a host read-back a layer). Decode 9.6 tok/s since it runs
+Prefill 62.2 tok/s since the routing moved to the device (58.7 before, with a host read-back a layer). Decode 9.5 tok/s since it runs
 on integer dot products (`qdot`, below; 6.5 on the matrix unit's rows mode) over decode-only streams for the Q6_K linears (6.6 bits)
 and the attention (4.75); 8.9 over the prefill's streams alone.
+
+**Where decode's gap to llama.cpp goes** (2026-11-24): a token takes 104.9 ms here and 58.5 ms on the CPU. llama.cpp reads 1.92 GB a
+token (the GGUF's own Q4_K / Q6_K and its fp32 router) at an effective 32.8 GB/s; this example reads 2.03 GB through the NPU's DDR
+port at ~23 GB/s. The 46.4 ms between them:
+
+| | ms a token | share |
+| --- | ---: | ---: |
+| the memory path: llama.cpp's 1.92 GB at 23 GB/s instead of 32.8 | 25.0 | 54 % |
+| the extra bytes: 0.11 GB, mostly the experts' gate / up in the prefill's 5.0-bit stream (native Q4_K: 4.5 bits) | 4.8 | 10 % |
+| the fixed cost above the port: launches, the small kernels, the router, the head's reduce (~0.35 ms a layer) | 16.6 | 36 % |
+
+Even with no fixed cost and llama.cpp's own bytes the port caps decode at 1.92 GB / 23 GB/s = 12.0 tok/s, under the CPU's 17.1.
 
 **Prefill is the NPU's**: a chunk of 512 tokens reads each expert's weights about twice (a slot of 24 tokens a read), and the work is
 GEMMs on the matrix unit. **Decode is the CPU's, and stays so**: a decode token reads ~2.1 GB of weights in the streams the prefill
@@ -91,7 +105,7 @@ columns x 4 k a 32-byte register, so the lanes are output columns and nothing is
   offset LSRAM load and its 4 quads replicated there, so ~28 vectors are live and nothing spills (a fully unrolled sub-block had ~54
   live and ~56 spills: 18-20 GB/s; a per-slice replica scratch in LSRAM: 18.9). The head runs at 23.6 GB/s, the down experts at 19.7.
 - The activation in **two int8 levels a 32** (q1 = rint(x / sx1), then the residual): 2e-5 - 8e-5 on the model's q / k / v
-  (`check/act_quant.py`; one level: 0.4-2 %, llama.cpp's Q8_K 1-5 %). One level (`QWEN3MOE_QLEV=1`) is 9.6 tok/s (+6 %) with the
+  (`check/act_quant.py`; one level: 0.4-2 %, llama.cpp's Q8_K 1-5 %). One level (`QWEN3MOE_QLEV=1`) is 9.9 tok/s (+4 %) with the
   same ids on the Fibonacci and Portugal prompts and an earlier near-tie flip on the lighthouse one; the default keeps two.
 - A layer is 8 launches (9 where v is Q6_K): the q | k | v GEMV builds its activation package from rms(x) itself and writes q and
   k | v straight into the attention's rows; `gpart` (gemma4's `gattn_part` with 8-position blocks and vector reductions, and
@@ -163,7 +177,7 @@ python3 qwen3moe_generate.py "Write a Python function that returns the n-th Fibo
 python3 qwen3moe_prefill.py --bench 3        # the pp512-style prefill benchmark
 ```
 
-Needs ~22 GB of free RAM for the pinned weights (the board has 29 GB) and the driver's zero-copy weight buffers (the WBUF / SLOT
+Needs ~27 GB of free RAM for the pinned weights (the board has 29 GB) and the driver's zero-copy weight buffers (the WBUF / SLOT
 ioctls of [sky1-zhouyi-v3-driver](https://github.com/Reonarudo/sky1-zhouyi-v3-driver)). The first prompt of a process captures the prefill's graphs (a few seconds). Options: `--max-new`, `--thinking` (Qwen3's
 thinking block; off by default), `--tmax` (cache positions, 1024). Environment: `QWEN3MOE_GGUF` (the checkpoint: the embedding and the
 reference read it), `QWEN3MOE_NPU` (the packed cache), `QWEN3MOE_TOK` (tokenizer.json's folder), `QWEN3MOE_PREFILL=step` (the
